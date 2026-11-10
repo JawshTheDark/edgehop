@@ -694,7 +694,7 @@ impl Gui {
                 ui.label(RichText::new(t).small().color(p.muted));
                 ui.add_space(8.0);
             };
-            swatch(ui, p.monitor, "This PC's monitors");
+            swatch(ui, p.monitor, "This computer's monitors");
             swatch(ui, ACCENT, "Online");
             swatch(ui, if dark { Color32::from_rgb(74, 81, 98) } else { Color32::from_rgb(132, 140, 156) }, "Offline");
             let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), Sense::hover());
@@ -733,7 +733,7 @@ impl Gui {
                 ui.add_space(4.0);
                 for (n, step) in [
                     "Install Edgehop on the other computer.",
-                    "Open it and choose “Use a shared keyboard & mouse”. It finds this PC on its own.",
+                    "Open it and choose “Use a shared keyboard & mouse”. It finds this computer on its own.",
                     "Approve the pairing request that pops up here (check that the codes match).",
                 ]
                 .iter()

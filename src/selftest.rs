@@ -97,9 +97,12 @@ fn copy_everything(inj: &mut dyn crate::inject::Injector) -> Option<String> {
     select_all_and_copy(inj, 125);
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        let got = crate::clipboard::get();
-        if got.as_deref() != Some(NOTHING) || Instant::now() > deadline {
-            return got.filter(|t| t != NOTHING);
+        // While an app is copying, the clipboard is briefly empty: keep waiting.
+        if let Some(t) = crate::clipboard::get().filter(|t| t != NOTHING) {
+            return Some(t);
+        }
+        if Instant::now() > deadline {
+            return None;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
