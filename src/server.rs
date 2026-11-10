@@ -4,6 +4,7 @@ use crate::config::{Config, Peer};
 use crate::layout::{Monitor, Rect, ScreenPos};
 use crate::net::{self, Announce};
 use crate::files;
+use crate::recovery::{self, now_ms};
 use crate::proto::*;
 use crate::state::{lk, AppState, ConnectedInfo, PairRequest};
 use std::collections::{HashMap, VecDeque};
@@ -119,6 +120,8 @@ pub struct Slot {
     pub id: u64,
     pub tx: mpsc::Sender<ToClient>,
     pub bulk: Arc<Bulk>,
+    /// When we last heard anything from this client (`recovery::now_ms`).
+    pub last_seen: Arc<AtomicU64>,
     pub w: i32,
     pub h: i32,
     pub clip_gen: u64,
@@ -169,6 +172,8 @@ pub struct Core {
 }
 
 const VK_SCROLL: u32 = 0x91;
+/// A client silent for this long is treated as unresponsive (pinged every second).
+const UNRESPONSIVE_MS: u64 = 3000;
 
 impl Core {
     pub fn new(cfg: &Config, desk: Box<dyn Desktop>, app: Option<Arc<AppState>>) -> Core {
@@ -253,7 +258,7 @@ impl Core {
             }
             for p in &self.screens {
                 if Some(p.name.as_str()) != from_client
-                    && self.clients.contains_key(&p.name)
+                    && self.responsive(&p.name)
                     && p.rect().contains(px, py)
                 {
                     return Some(Hit::Client(p.name.clone(), px, py));
@@ -753,6 +758,21 @@ impl Core {
         }
     }
 
+    /// Connected and answering within the last few seconds?
+    fn responsive(&self, name: &str) -> bool {
+        self.clients
+            .get(name)
+            .map_or(false, |s| now_ms().saturating_sub(s.last_seen.load(Ordering::Relaxed)) < UNRESPONSIVE_MS)
+    }
+
+    /// If the computer the mouse is on stops answering, take the mouse back.
+    pub fn check_responsive(&mut self) {
+        if self.is_remote() && !self.responsive(&self.active.clone()) {
+            log::warn!("{} isn't responding; bringing the mouse back to {}", self.active, self.me);
+            self.go_home();
+        }
+    }
+
     pub fn ping_all(&self) {
         for s in self.clients.values() {
             let _ = s.tx.send(ToClient::Ping);
@@ -790,8 +810,19 @@ impl ServerEngine {
         #[cfg(windows)]
         {
             let cfg = app.cfg();
-            let listener = TcpListener::bind(("0.0.0.0", cfg.port))
-                .map_err(|e| format!("Can't listen on port {}: {e}", cfg.port))?;
+            let listener = {
+                let mut tries = 0;
+                loop {
+                    match TcpListener::bind(("0.0.0.0", cfg.port)) {
+                        Ok(l) => break l,
+                        Err(_) if tries < 20 => {
+                            tries += 1;
+                            thread::sleep(Duration::from_millis(250));
+                        }
+                        Err(e) => return Err(format!("Can't listen on port {}: {e}", cfg.port)),
+                    }
+                }
+            };
             let stop = Arc::new(AtomicBool::new(false));
             let (clip_tx, clip_rx) = mpsc::channel();
             let mut core = Core::new(&cfg, Box::new(hooks::WinDesktop), Some(app.clone()));
@@ -812,7 +843,7 @@ impl ServerEngine {
             let s = shared.clone();
             thread::spawn(move || {
                 for files in drag_rx {
-                    lk(&s.core).local_grab_result(files);
+                    recovery::guard("drag handler", || lk(&s.core).local_grab_result(files));
                 }
             });
 
@@ -834,9 +865,9 @@ impl ServerEngine {
             let s = shared.clone();
             thread::spawn(move || {
                 for job in file_rx {
-                    match job {
+                    recovery::guard("file worker", || match job {
                         FileJob::SendToClient { name, paths } => send_files(&s, name, paths),
-                    }
+                    });
                 }
             });
 
@@ -844,14 +875,14 @@ impl ServerEngine {
             let s = shared.clone();
             thread::spawn(move || {
                 for job in clip_rx {
-                    match job {
+                    recovery::guard("clipboard worker", || match job {
                         ClipJob::ReadLocal => {
                             if let Some(t) = crate::clipboard::get() {
                                 lk(&s.core).local_clipboard(t);
                             }
                         }
                         ClipJob::SetLocal(t) => crate::clipboard::set(&t),
-                    }
+                    });
                 }
             });
 
@@ -866,9 +897,11 @@ impl ServerEngine {
                     let s2 = s.clone();
                     thread::spawn(move || {
                         let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-                        if let Err(e) = handle_client(&s2, stream) {
-                            log::info!("client {peer}: {e}");
-                        }
+                        recovery::guard("connection handler", || {
+                            if let Err(e) = handle_client(&s2, stream) {
+                                log::info!("client {peer}: {e}");
+                            }
+                        });
                     });
                 }
             });
@@ -878,17 +911,43 @@ impl ServerEngine {
             let st = stop.clone();
             thread::spawn(move || net::run_discovery_responder(st, announce));
 
-            // Keepalive.
+            // Watchdog + keepalive, every second:
+            // - ping clients; take the mouse back from one that stops answering;
+            // - if the switching state stays locked (a bug), restart cleanly;
+            // - if Windows silently dropped our input hooks, reinstall them.
             let s = shared.clone();
-            thread::spawn(move || {
-                while !s.stop.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_secs(3));
-                    let mons = crate::platform::monitor_rects();
-                    let mut core = lk(&s.core);
-                    core.set_monitors(mons);
-                    core.ping_all();
-                }
-            });
+            thread::Builder::new()
+                .name("watchdog".into())
+                .spawn(move || {
+                    let mut last_rehook: Option<Instant> = None;
+                    while !s.stop.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_secs(1));
+                        let mons = crate::platform::monitor_rects();
+                        let start = Instant::now();
+                        let mut core = loop {
+                            match s.core.try_lock() {
+                                Ok(g) => break g,
+                                Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+                                Err(std::sync::TryLockError::WouldBlock) if start.elapsed() < Duration::from_secs(5) => {
+                                    thread::sleep(Duration::from_millis(20))
+                                }
+                                Err(std::sync::TryLockError::WouldBlock) => {
+                                    recovery::restart_self("switching state stuck for 5 s")
+                                }
+                            }
+                        };
+                        core.set_monitors(mons);
+                        core.ping_all();
+                        core.check_responsive();
+                        drop(core);
+                        if hooks::look_lost() && last_rehook.map_or(true, |t| t.elapsed() > Duration::from_secs(10)) {
+                            log::warn!("Windows dropped our input hooks; reinstalling them");
+                            hooks::reinstall(hook_thread);
+                            last_rehook = Some(Instant::now());
+                        }
+                    }
+                })
+                .map_err(|e| e.to_string())?;
 
             *lk(&app.active_screen) = cfg.name.clone();
             app.set_status(format!("Sharing on port {} — waiting for computers", cfg.port), true);
@@ -994,8 +1053,9 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     let (mtx, mrx) = mpsc::channel::<ToClient>();
     lk(&s.streams).insert(id, raw.try_clone()?);
     let bulk = Bulk::new();
-    let replaced =
-        lk(&s.core).add_client(&name, Slot { id, tx: mtx, bulk: bulk.clone(), w: width, h: height, clip_gen: 0 });
+    let last_seen = Arc::new(AtomicU64::new(now_ms()));
+    let slot = Slot { id, tx: mtx, bulk: bulk.clone(), last_seen: last_seen.clone(), w: width, h: height, clip_gen: 0 };
+    let replaced = lk(&s.core).add_client(&name, slot);
     let placed = lk(&s.core).ensure_placed(&name);
     if let Some(pos) = placed {
         log::info!("{name} placed at ({}, {}) scale {:.3}", pos.x, pos.y, pos.scale);
@@ -1063,7 +1123,11 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     rx.set_read_timeout(Some(Duration::from_secs(12)))?;
     let mut sink: Option<files::Sink> = None;
     let result = loop {
-        match rx.recv::<ToServer>() {
+        let msg = rx.recv::<ToServer>();
+        if msg.is_ok() {
+            last_seen.store(now_ms(), Ordering::Relaxed);
+        }
+        match msg {
             Ok(ToServer::Clipboard { text }) => lk(&s.core).client_clipboard(&name, text),
             Ok(ToServer::FilesGrabbed { files }) => lk(&s.core).client_grab_result(&name, files),
             Ok(ToServer::File { m }) => receive_files(s, &mut sink, m),
@@ -1265,7 +1329,36 @@ mod hooks {
         core.on_key(kb.vkCode, kb.scanCode, kb.flags & LLKHF_EXTENDED != 0, down)
     }
 
+    /// Tick of the last event our hooks saw (to notice if Windows drops them).
+    static LAST_HOOK_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    const WM_APP_REHOOK: u32 = 0x8000 + 1;
+
+    /// Windows saw recent input that our hooks never got: they were removed.
+    pub fn look_lost() -> bool {
+        let last_hook = LAST_HOOK_TICK.load(Ordering::Relaxed);
+        if last_hook == 0 {
+            return false;
+        }
+        let input = last_input_tick();
+        let now = unsafe { GetTickCount() };
+        let recent_input = now.wrapping_sub(input) < 3000;
+        let missed = input.wrapping_sub(last_hook) as i32 > 1500;
+        recent_input && missed
+    }
+
+    pub fn reinstall(thread_id: u32) {
+        unsafe {
+            PostThreadMessageW(thread_id, WM_APP_REHOOK, 0, 0);
+        }
+    }
+
+    unsafe fn install() -> (HANDLE, HANDLE) {
+        let hmod = GetModuleHandleW(std::ptr::null());
+        (SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, hmod, 0), SetWindowsHookExW(WH_KEYBOARD_LL, key_proc, hmod, 0))
+    }
+
     unsafe extern "system" fn mouse_proc(code: i32, w: usize, l: isize) -> isize {
+        LAST_HOOK_TICK.store(GetTickCount(), Ordering::Relaxed);
         if code >= 0 {
             let ms = &*(l as *const MSLLHOOKSTRUCT);
             if ms.flags & LLMHF_INJECTED == 0 {
@@ -1279,6 +1372,7 @@ mod hooks {
     }
 
     unsafe extern "system" fn key_proc(code: i32, w: usize, l: isize) -> isize {
+        LAST_HOOK_TICK.store(GetTickCount(), Ordering::Relaxed);
         if code >= 0 {
             let kb = &*(l as *const KBDLLHOOKSTRUCT);
             if kb.flags & LLKHF_INJECTED == 0 {
@@ -1296,9 +1390,7 @@ mod hooks {
         // The drop target lives on this thread: it needs the message loop below.
         crate::dragdrop::init(drags);
         unsafe {
-            let hmod = GetModuleHandleW(std::ptr::null());
-            let mh = SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, hmod, 0);
-            let kh = SetWindowsHookExW(WH_KEYBOARD_LL, key_proc, hmod, 0);
+            let (mut mh, mut kh) = install();
             if mh.is_null() || kh.is_null() {
                 log::error!("SetWindowsHookEx failed");
                 if !mh.is_null() {
@@ -1314,6 +1406,15 @@ mod hooks {
             let _ = ready.send(GetCurrentThreadId());
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                if msg.message == WM_APP_REHOOK {
+                    UnhookWindowsHookEx(mh);
+                    UnhookWindowsHookEx(kh);
+                    (mh, kh) = install();
+                    if mh.is_null() || kh.is_null() {
+                        log::error!("reinstalling input hooks failed");
+                    }
+                    continue;
+                }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
@@ -1380,7 +1481,7 @@ mod tests {
         let cursor = Arc::new(Mutex::new((0, 0)));
         let mut core = Core::new(&cfg, Box::new(FakeDesk { mons, cursor: cursor.clone() }), None);
         let (tx, rx) = mpsc::channel();
-        core.add_client("surface", Slot { id: 1, tx, bulk: Bulk::new(), w: 1520, h: 1014, clip_gen: 0 });
+        core.add_client("surface", Slot { id: 1, tx, bulk: Bulk::new(), last_seen: Arc::new(AtomicU64::new(now_ms())), w: 1520, h: 1014, clip_gen: 0 });
         (core, rx, cursor)
     }
 
@@ -1520,7 +1621,7 @@ mod tests {
         let cursor = Arc::new(Mutex::new((0, 0)));
         let mut core = Core::new(&cfg, Box::new(FakeDesk { mons: user_monitors(), cursor }), None);
         let (tx, _rx) = mpsc::channel();
-        core.add_client("surface", Slot { id: 1, tx, bulk: Bulk::new(), w: 1520, h: 1014, clip_gen: 0 });
+        core.add_client("surface", Slot { id: 1, tx, bulk: Bulk::new(), last_seen: Arc::new(AtomicU64::new(now_ms())), w: 1520, h: 1014, clip_gen: 0 });
         let p = core.ensure_placed("surface").expect("placed");
         assert_eq!((p.x, p.y), (0.0, 1080.0));
         assert!(core.ensure_placed("surface").is_none(), "unchanged second time");
@@ -1703,5 +1804,23 @@ mod tests {
         // Then normal small moves work.
         assert!(core.on_mouse_move(965, 545));
         assert!(rx.try_iter().any(|m| matches!(m, ToClient::Move { .. })));
+    }
+
+    #[test]
+    fn unresponsive_client_gives_the_mouse_back() {
+        let (mut core, _rx, cursor) = setup(true);
+        core.on_mouse_move(500, 1079);
+        assert_eq!(core.active, "surface");
+        core.check_responsive();
+        assert_eq!(core.active, "surface", "answering: stays");
+        // Silent for 5 s.
+        core.clients["surface"].last_seen.store(now_ms().saturating_sub(5000), Ordering::Relaxed);
+        core.check_responsive();
+        assert_eq!(core.active, "pc", "mouse comes back");
+        assert_eq!(*cursor.lock().unwrap(), (960, 540));
+        assert!(!core.on_mouse_move(500, 1079), "won't cross into a computer that isn't answering");
+        assert_eq!(core.active, "pc");
+        core.clients["surface"].last_seen.store(now_ms(), Ordering::Relaxed);
+        assert!(core.on_mouse_move(500, 1079), "answering again: crossing works");
     }
 }

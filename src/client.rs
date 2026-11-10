@@ -1,5 +1,6 @@
 //! Client: connects to the server and replays keyboard/mouse events locally.
 use crate::files;
+use crate::recovery::now_ms;
 use crate::inject::{self, Injector};
 use crate::net;
 use crate::proto::*;
@@ -7,7 +8,7 @@ use crate::state::{lk, AppState};
 use std::collections::HashSet;
 use std::io;
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -17,15 +18,29 @@ pub struct ClientEngine {
     current: Arc<Mutex<Option<TcpStream>>>,
 }
 
+/// Lets the watchdog see whether the connection loop is still making progress.
+struct Liveness {
+    /// `recovery::now_ms()` when the loop last handled a message.
+    progress: AtomicU64,
+    /// Paired and receiving pings (so silence means something is stuck).
+    connected: AtomicBool,
+}
+
 impl ClientEngine {
     pub fn start(app: Arc<AppState>) -> ClientEngine {
         let stop = Arc::new(AtomicBool::new(false));
         let current = Arc::new(Mutex::new(None));
-        let (st, cur) = (stop.clone(), current.clone());
+        let live = Arc::new(Liveness { progress: AtomicU64::new(now_ms()), connected: AtomicBool::new(false) });
+        let (st, cur, lv) = (stop.clone(), current.clone(), live.clone());
         thread::Builder::new()
             .name("client".into())
-            .spawn(move || run(app, st, cur))
+            .spawn(move || run(app, st, cur, lv))
             .expect("spawn client thread");
+        let (st, cur) = (stop.clone(), current.clone());
+        thread::Builder::new()
+            .name("client-watchdog".into())
+            .spawn(move || watchdog(st, cur, live))
+            .expect("spawn watchdog");
         ClientEngine { stop, current }
     }
 
@@ -33,6 +48,31 @@ impl ClientEngine {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(s) = lk(&self.current).take() {
             let _ = s.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// The server pings every second. If the connection loop stops handling
+/// messages, first clear stuck helper processes and force a reconnect; if it
+/// is still stuck after that, restart kvmlink.
+fn watchdog(stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpStream>>>, live: Arc<Liveness>) {
+    let mut nudged = false;
+    while !stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_secs(1));
+        let stuck_ms = now_ms().saturating_sub(live.progress.load(Ordering::Relaxed));
+        if !live.connected.load(Ordering::Relaxed) || stuck_ms < 8000 {
+            nudged = false;
+            continue;
+        }
+        if !nudged {
+            log::warn!("connection loop stuck for {} s; clearing stuck helpers and reconnecting", stuck_ms / 1000);
+            crate::recovery::kill_child_helpers();
+            if let Some(s) = lk(&current).as_ref() {
+                let _ = s.shutdown(Shutdown::Both);
+            }
+            nudged = true;
+        } else if stuck_ms > 25_000 {
+            crate::recovery::restart_self("client connection loop stuck");
         }
     }
 }
@@ -46,7 +86,7 @@ fn sleep_unless_stopped(stop: &AtomicBool, d: Duration) {
     }
 }
 
-fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpStream>>>) {
+fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpStream>>>, live: Arc<Liveness>) {
     // Desktop integration: KDE/KWin on Linux, Explorer + cursor on Windows.
     // Away/back (D-Bus calls that can be slow) run in order on their own
     // thread so they never hold up input or the connection.
@@ -55,10 +95,10 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
     if let Some(h) = hooks.clone() {
         thread::spawn(move || {
             for cmd in away_rx {
-                match cmd {
+                crate::recovery::guard("desktop hooks", || match cmd {
                     Some((hide, dim)) => h.away(hide, dim),
                     None => h.back(),
-                }
+                });
             }
         });
     }
@@ -70,8 +110,19 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
             return;
         }
     };
+    // Keys and buttons we pressed on this computer; released whenever a
+    // connection ends, however it ended, so nothing stays stuck down.
+    let mut held = Held::default();
     while !stop.load(Ordering::Relaxed) {
-        let wait = match session(&app, &stop, &current, injector.as_mut(), hooks.as_deref(), &away_tx) {
+        let result = session(&app, &stop, &current, injector.as_mut(), hooks.as_deref(), &away_tx, &mut held, &live);
+        live.connected.store(false, Ordering::Relaxed);
+        for k in held.keys.drain() {
+            injector.key(k, false);
+        }
+        for b in held.buttons.drain() {
+            injector.button(b, false);
+        }
+        let wait = match result {
             Ok(wait) => wait,
             Err(e) => {
                 if !stop.load(Ordering::Relaxed) {
@@ -89,6 +140,12 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
         let _ = away_tx.send(None);
         sleep_unless_stopped(&stop, wait);
     }
+}
+
+#[derive(Default)]
+struct Held {
+    keys: HashSet<u16>,
+    buttons: HashSet<u8>,
 }
 
 fn resolve(addr: &str) -> io::Result<SocketAddr> {
@@ -114,6 +171,8 @@ fn session(
     inj: &mut dyn Injector,
     hooks: Option<&dyn crate::platform::DesktopHooks>,
     away_tx: &std::sync::mpsc::Sender<Option<(bool, Option<u8>)>>,
+    held: &mut Held,
+    live: &Liveness,
 ) -> io::Result<Duration> {
     let cfg = app.cfg();
 
@@ -184,14 +243,14 @@ fn session(
     rx.set_read_timeout(None)?;
     let mut sink: Option<files::Sink> = None;
     let mut drop_into: Option<std::path::PathBuf> = None;
-    let mut keys: HashSet<u16> = HashSet::new();
-    let mut buttons: HashSet<u8> = HashSet::new();
+    let Held { keys, buttons } = held;
     // Shared with the background clipboard threads.
     let last_clip: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut server_name = String::from("server");
 
     loop {
         let msg = rx.recv::<ToClient>()?;
+        live.progress.store(now_ms(), Ordering::Relaxed);
         match msg {
             ToClient::PairPending { code: c } => {
                 *lk(&app.pairing_code) = Some(c.clone());
@@ -211,6 +270,7 @@ fn session(
                     log::info!("paired with server {n} (code {code})");
                 }
                 rx.set_read_timeout(Some(Duration::from_secs(12)))?;
+                live.connected.store(true, Ordering::Relaxed);
                 app.set_status(format!("Connected to {n} ({w}×{h})"), true);
             }
             ToClient::Enter { x, y } => {

@@ -14,16 +14,21 @@ pub fn create(app: Arc<AppState>) -> Option<Tray> {
 
     let menu = Menu::new();
     let open = MenuItem::new("Open kvmlink", true, None);
+    let restart = MenuItem::new("Restart kvmlink", true, None);
     let quit = MenuItem::new("Quit kvmlink", true, None);
     menu.append(&open).ok()?;
     menu.append(&PredefinedMenuItem::separator()).ok()?;
+    menu.append(&restart).ok()?;
     menu.append(&quit).ok()?;
-    let (open_id, quit_id) = (open.id().clone(), quit.id().clone());
+    let (open_id, quit_id, restart_id) = (open.id().clone(), quit.id().clone(), restart.id().clone());
 
     let a = app.clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         if e.id == open_id {
             crate::platform::show_window(&a);
+        } else if e.id == restart_id {
+            a.stop_engine();
+            crate::recovery::restart_self("restart requested from the tray");
         } else if e.id == quit_id {
             a.quit();
         }
@@ -80,6 +85,15 @@ impl ksni::Tray for KTray {
             }
             .into(),
             MenuItem::Separator,
+            StandardItem {
+                label: "Restart kvmlink".into(),
+                activate: Box::new(|t: &mut Self| {
+                    t.app.stop_engine();
+                    crate::recovery::restart_self("restart requested from the tray")
+                }),
+                ..Default::default()
+            }
+            .into(),
             StandardItem {
                 label: "Quit kvmlink".into(),
                 activate: Box::new(|t: &mut Self| t.app.quit()),

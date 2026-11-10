@@ -83,10 +83,12 @@ impl Kde {
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("kde-dbus".into())
-            .spawn(move || {
-                if let Err(e) = serve(tx) {
-                    log::warn!("KDE hooks: can't publish {SERVICE}: {e}");
+            .spawn(move || loop {
+                // If the session bus drops us (e.g. after a Plasma restart), publish again.
+                if let Err(e) = serve(tx.clone()) {
+                    log::warn!("KDE hooks: can't publish {SERVICE}: {e}; retrying");
                 }
+                std::thread::sleep(Duration::from_secs(3));
             })
             .ok()?;
 
@@ -136,9 +138,25 @@ impl Kde {
 }
 
 impl Inner {
+    /// The session bus connection, reconnected if it went away.
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        let mut c = lk(&self.conn);
+        let alive = c
+            .with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", Duration::from_millis(500))
+            .method_call::<(), _, _, _>("org.freedesktop.DBus.Peer", "Ping", ())
+            .is_ok();
+        if !alive {
+            if let Ok(fresh) = Connection::new_session() {
+                log::warn!("KDE hooks: lost the session bus; reconnected");
+                *c = fresh;
+            }
+        }
+        c
+    }
+
     /// Ask KWin which window is under the pointer right now.
     fn window_under_pointer(&self) -> Option<WinInfo> {
-        let conn = lk(&self.conn);
+        let conn = self.conn();
         let rx = lk(&self.replies);
         while rx.try_recv().is_ok() {}
         let scripting = conn.with_proxy("org.kde.KWin", "/Scripting", TIMEOUT);
@@ -165,7 +183,7 @@ impl Inner {
     /// The mouse went to another computer: hide the pointer, dim the screen
     /// (unless something is playing).
     fn away(&self, hide_pointer: bool, dim_percent: Option<u8>) {
-        let conn = lk(&self.conn);
+        let conn = self.conn();
         let mut st = lk(&self.away);
         st.is_away = true;
         st.dim_percent = dim_percent;
@@ -191,7 +209,7 @@ impl Inner {
 
     /// Called every couple of seconds: undim while media plays, dim again after.
     fn follow_media(&self) {
-        let conn = lk(&self.conn);
+        let conn = self.conn();
         let mut st = lk(&self.away);
         if !st.is_away || st.dim_percent.is_none() {
             return;
@@ -207,7 +225,7 @@ impl Inner {
 
     /// The mouse is back: show the pointer, restore brightness.
     fn back(&self) {
-        let conn = lk(&self.conn);
+        let conn = self.conn();
         let mut st = lk(&self.away);
         st.is_away = false;
         if st.hid_pointer {

@@ -212,11 +212,22 @@ pub struct Discovered {
 
 /// Server side: answer discovery broadcasts until `stop` is set.
 pub fn run_discovery_responder(stop: Arc<AtomicBool>, info: Announce) {
-    let sock = match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("discovery disabled: cannot bind UDP {DISCOVERY_PORT}: {e}");
-            return;
+    let mut warned = false;
+    let sock = loop {
+        match UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)) {
+            Ok(s) => break s,
+            Err(e) => {
+                if !warned {
+                    log::warn!("discovery paused: can't use UDP port {DISCOVERY_PORT} ({e}); retrying");
+                    warned = true;
+                }
+                for _ in 0..20 {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
         }
     };
     let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));

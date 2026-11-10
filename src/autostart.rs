@@ -34,7 +34,8 @@ fn imp(enabled: bool, exe: &str) -> Result<(), String> {
     if enabled {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let body = format!(
-            "[Desktop Entry]\nType=Application\nName=kvmlink\nExec={exe} --minimized\nIcon=kvmlink\nX-GNOME-Autostart-enabled=true\n"
+            // Run as a systemd user service so it's restarted if it ever dies.
+            "[Desktop Entry]\nType=Application\nName=kvmlink\nExec=systemd-run --user --collect --unit=kvmlink-app -p Restart=on-failure -p RestartSec=2 {exe} --minimized\nIcon=kvmlink\nX-GNOME-Autostart-enabled=true\n"
         );
         std::fs::write(&file, body).map_err(|e| e.to_string())
     } else {

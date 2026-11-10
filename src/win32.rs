@@ -706,3 +706,29 @@ impl DragSource {
         !self.moving_window && !self.is_terminal()
     }
 }
+
+
+#[repr(C)]
+struct LASTINPUTINFO {
+    cbSize: u32,
+    dwTime: u32,
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn GetLastInputInfo(info: *mut LASTINPUTINFO) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    pub fn GetTickCount() -> u32;
+}
+
+/// Tick count of the last keyboard/mouse input anywhere in this session.
+pub fn last_input_tick() -> u32 {
+    let mut li = LASTINPUTINFO { cbSize: 8, dwTime: 0 };
+    unsafe {
+        GetLastInputInfo(&mut li);
+    }
+    li.dwTime
+}

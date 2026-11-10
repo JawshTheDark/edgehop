@@ -17,6 +17,7 @@ mod layout;
 mod net;
 mod platform;
 mod proto;
+mod recovery;
 mod server;
 mod state;
 mod tray;
@@ -27,11 +28,7 @@ fn main() {
     platform::init_dpi();
     // If a previous run died while the cursor was hidden, bring it back.
     platform::restore_cursor();
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        platform::restore_cursor();
-        prev(info);
-    }));
+    recovery::install_panic_hook();
     let args: Vec<String> = std::env::args().collect();
     let minimized = args.iter().any(|a| a == "--minimized");
     let headless = args.iter().any(|a| a == "--headless");

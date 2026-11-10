@@ -82,6 +82,27 @@ Settings live in `%APPDATA%\kvmlink\config\config.json` (Windows),
   (Task Manager, an admin terminal) is focused, run kvmlink as administrator.
 - Ports: TCP **24800** (connections) and UDP **24801** (discovery).
 
+## Self-healing
+
+kvmlink recovers from failures without you having to step in:
+
+| Problem | What kvmlink does |
+|---|---|
+| The computer your mouse is on stops answering | Mouse returns to the server after 3 s; it won't cross into a silent computer until it answers again |
+| Connection drops | Both sides reconnect automatically (dead connections are detected within 12 s) |
+| Something inside kvmlink gets stuck | The Windows input hook passes input straight through after 100 ms (it can never freeze your mouse); a stuck switching state for 5 s restarts kvmlink |
+| Windows silently removes the input hooks | Noticed (Windows saw input the hooks didn't) and reinstalled |
+| The client's connection loop stalls | Stuck helper processes are killed and it reconnects; if still stuck, kvmlink restarts |
+| Clipboard tools hang (e.g. on a locked screen) | Given up on after 2 s, off the input path |
+| A connection ends with keys or buttons held | They're released |
+| A background worker crashes | Logged with its location; the worker keeps running |
+| KDE's D-Bus connection drops | Reconnected |
+| kvmlink crashes or is killed | Cursor is restored; on Linux, systemd restarts it (autostart runs it with `Restart=on-failure`) |
+
+You can also restart it from the tray icon (**Restart kvmlink**). Everything is
+logged to `kvmlink.log` (`%LOCALAPPDATA%\kvmlink\cache\` on Windows,
+`~/.cache/kvmlink/` on Linux).
+
 ## How it works
 
 ```
