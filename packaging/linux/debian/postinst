@@ -5,6 +5,7 @@ if [ "$1" = "configure" ]; then
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload-rules 2>/dev/null || true
         udevadm trigger --name-match=uinput 2>/dev/null || true
+        udevadm trigger --subsystem-match=input 2>/dev/null || true
     fi
     command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
 fi

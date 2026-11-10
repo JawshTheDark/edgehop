@@ -64,6 +64,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
       - run: cargo test --release
       - run: cargo build --release
+      - name: Sharing self-test (virtual keyboard + mouse)
+        run: |
+          sudo modprobe uinput || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe uinput; }
+          if grep -q sharing-only src/selftest.rs; then sudo ./target/release/edgehop --self-test --sharing-only; fi
       - name: Package (.deb and tarball)
         run: |
           ./target/release/edgehop --write-icon packaging/linux/edgehop.png
@@ -73,7 +77,7 @@ jobs:
           cp target/debian/*.deb "dist/edgehop_${TAG#v}_amd64.deb"
           name="edgehop-$TAG-linux-x86_64"
           mkdir -p "$name"
-          cp target/release/edgehop packaging/linux/60-edgehop-uinput.rules packaging/linux/edgehop-uinput.conf \
+          cp target/release/edgehop packaging/linux/60-edgehop-uinput.rules packaging/linux/70-edgehop-input.rules packaging/linux/edgehop-uinput.conf \
              packaging/linux/edgehop.desktop packaging/linux/edgehop.png README.md "$name/"
           tar czf "dist/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v4

@@ -72,8 +72,24 @@ pub fn monitors() -> Vec<crate::layout::Monitor> {
 }
 
 /// Monitor rectangles only: fast, used by the switching logic.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub fn monitor_rects() -> Vec<crate::layout::Monitor> {
+    #[cfg(target_os = "linux")]
+    {
+        // Asking the desktop runs a program: reuse the answer for a few seconds.
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        static CACHE: Mutex<Option<(Instant, Vec<crate::layout::Monitor>)>> = Mutex::new(None);
+        let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, v)) = c.as_ref() {
+            if at.elapsed() < Duration::from_secs(3) {
+                return v.clone();
+            }
+        }
+        let v = enumerate(false);
+        *c = Some((Instant::now(), v.clone()));
+        v
+    }
+    #[cfg(not(target_os = "linux"))]
     enumerate(false)
 }
 
@@ -92,11 +108,177 @@ fn enumerate(with_names: bool) -> Vec<crate::layout::Monitor> {
         v.sort_by(|a, b| a.rect.l.partial_cmp(&b.rect.l).unwrap_or(std::cmp::Ordering::Equal));
         v
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = with_names;
+        mac_monitors()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = with_names;
+        let mut v = linux_monitors();
+        v.sort_by(|a, b| a.rect.l.partial_cmp(&b.rect.l).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         let _ = with_names;
         Vec::new()
     }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_monitors() -> Vec<crate::layout::Monitor> {
+    use crate::layout::{Monitor, Rect};
+    #[repr(C)]
+    struct P {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    struct S {
+        w: f64,
+        h: f64,
+    }
+    #[repr(C)]
+    struct R {
+        o: P,
+        s: S,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+        fn CGDisplayBounds(display: u32) -> R;
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayIsBuiltin(display: u32) -> u32;
+    }
+    let mut ids = [0u32; 16];
+    let mut n = 0u32;
+    if unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) } != 0 {
+        return Vec::new();
+    }
+    let main = unsafe { CGMainDisplayID() };
+    let mut v: Vec<Monitor> = ids[..n as usize]
+        .iter()
+        .map(|&id| {
+            let b = unsafe { CGDisplayBounds(id) };
+            Monitor {
+                rect: Rect::xywh(b.o.x, b.o.y, b.s.w, b.s.h),
+                label: if unsafe { CGDisplayIsBuiltin(id) } != 0 { "Built-in".into() } else { String::new() },
+                primary: id == main,
+            }
+        })
+        .collect();
+    v.sort_by(|a, b| a.rect.l.partial_cmp(&b.rect.l).unwrap_or(std::cmp::Ordering::Equal));
+    for (i, m) in v.iter_mut().enumerate() {
+        if m.label.is_empty() {
+            m.label = format!("Display {}", i + 1);
+        }
+    }
+    v
+}
+
+/// Remove terminal colour codes ("ESC [ ... letter").
+#[cfg(target_os = "linux")]
+fn strip_ansi(line: &str) -> String {
+    let mut clean = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            clean.push(c);
+        }
+    }
+    clean
+}
+
+/// Monitors in desktop (logical) coordinates: KDE's kscreen-doctor, else xrandr.
+#[cfg(target_os = "linux")]
+fn linux_monitors() -> Vec<crate::layout::Monitor> {
+    if let Ok(out) = std::process::Command::new("kscreen-doctor").arg("-o").output() {
+        let v = parse_kscreen(&String::from_utf8_lossy(&out.stdout));
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if let Ok(out) = std::process::Command::new("xrandr").arg("--current").output() {
+        return parse_xrandr(&String::from_utf8_lossy(&out.stdout));
+    }
+    Vec::new()
+}
+
+/// `kscreen-doctor -o`: "Output: 1 eDP-1 ..." blocks with "enabled",
+/// "priority 1" and "Geometry: 0,0 1520x1014" lines.
+#[cfg(target_os = "linux")]
+pub fn parse_kscreen(text: &str) -> Vec<crate::layout::Monitor> {
+    use crate::layout::{Monitor, Rect};
+    struct Out {
+        name: String,
+        enabled: bool,
+        primary: bool,
+        rect: Option<Rect>,
+    }
+    let mut outs: Vec<Out> = Vec::new();
+    for raw in text.lines() {
+        let line = strip_ansi(raw);
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if let Some(i) = words.iter().position(|w| *w == "Output:") {
+            outs.push(Out {
+                name: words.get(i + 2).unwrap_or(&"").to_string(),
+                enabled: true,
+                primary: false,
+                rect: None,
+            });
+        }
+        let Some(o) = outs.last_mut() else { continue };
+        for (i, w) in words.iter().enumerate() {
+            match *w {
+                "disabled" => o.enabled = false,
+                "priority" if words.get(i + 1) == Some(&"1") => o.primary = true,
+                "primary" => o.primary = true,
+                _ => {}
+            }
+        }
+        if let Some(g) = line.split("Geometry:").nth(1) {
+            let n: Vec<f64> = g
+                .split(|c: char| !c.is_ascii_digit() && c != '-')
+                .filter_map(|p| p.parse().ok())
+                .collect();
+            if let [x, y, w, h] = n[..] {
+                o.rect = Some(Rect::xywh(x, y, w, h));
+            }
+        }
+    }
+    outs.into_iter()
+        .filter(|o| o.enabled)
+        .filter_map(|o| o.rect.map(|rect| Monitor { rect, label: o.name, primary: o.primary }))
+        .collect()
+}
+
+/// `xrandr --current`: "HDMI-1 connected primary 1920x1080+1920+0 (...)".
+#[cfg(target_os = "linux")]
+pub fn parse_xrandr(text: &str) -> Vec<crate::layout::Monitor> {
+    use crate::layout::{Monitor, Rect};
+    text.lines()
+        .filter(|l| l.contains(" connected"))
+        .filter_map(|l| {
+            let words: Vec<&str> = l.split_whitespace().collect();
+            let geo = words.iter().find(|w| w.contains('x') && w.contains('+'))?;
+            let (size, pos) = geo.split_once('+')?;
+            let (w, h) = size.split_once('x')?;
+            let (x, y) = pos.split_once('+')?;
+            Some(Monitor {
+                rect: Rect::xywh(x.parse().ok()?, y.parse().ok()?, w.parse().ok()?, h.parse().ok()?),
+                label: words[0].to_string(),
+                primary: words.contains(&"primary"),
+            })
+        })
+        .collect()
 }
 
 /// The folder a drop at (x, y) should land in: the desktop or an open
@@ -189,8 +371,30 @@ pub fn client_hooks() -> Option<std::sync::Arc<dyn DesktopHooks>> {
     return crate::kde::Kde::connect().map(|k| std::sync::Arc::new(k) as std::sync::Arc<dyn DesktopHooks>);
     #[cfg(windows)]
     return Some(std::sync::Arc::new(WinHooks));
+    #[cfg(target_os = "macos")]
+    return Some(std::sync::Arc::new(MacHooks(std::sync::atomic::AtomicBool::new(false))));
     #[allow(unreachable_code)]
     None
+}
+
+/// Mac client: hide the pointer while the mouse is on another computer.
+#[cfg(target_os = "macos")]
+struct MacHooks(std::sync::atomic::AtomicBool);
+
+#[cfg(target_os = "macos")]
+impl DesktopHooks for MacHooks {
+    fn away(&self, hide_pointer: bool, _dim: Option<u8>) {
+        use std::sync::atomic::Ordering;
+        if hide_pointer && !self.0.swap(true, Ordering::Relaxed) {
+            crate::server::capture::set_pointer_visible(false);
+        }
+    }
+    fn back(&self) {
+        use std::sync::atomic::Ordering;
+        if self.0.swap(false, Ordering::Relaxed) {
+            crate::server::capture::set_pointer_visible(true);
+        }
+    }
 }
 
 #[cfg(windows)]

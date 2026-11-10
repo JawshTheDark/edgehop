@@ -36,6 +36,37 @@ const SCRIPT: &str = r#"// edgehop: report the window under the pointer.
 })();
 "#;
 
+const POINTER_SCRIPT_NAME: &str = "edgehop-pointer";
+
+/// Sharing from Plasma on Wayland: KWin is the only one who knows where the
+/// pointer is, so it tells us whenever the pointer touches a screen edge.
+const POINTER_SCRIPT: &str = r#"// edgehop: report the pointer when it reaches a screen edge.
+(function () {
+    var last = "";
+    function report() {
+        var p = workspace.cursorPos;
+        var x = Math.floor(p.x), y = Math.floor(p.y);
+        var edge = false;
+        var outs = workspace.screens;
+        for (var i = 0; i < outs.length; i++) {
+            var g = outs[i].geometry;
+            if (x >= g.x && x < g.x + g.width && y >= g.y && y < g.y + g.height) {
+                edge = x <= g.x || y <= g.y || x >= g.x + g.width - 1 || y >= g.y + g.height - 1;
+                break;
+            }
+        }
+        var key = edge ? x + "," + y : "";
+        if (key === last) return;
+        last = key;
+        if (edge) callDBus("org.edgehop.Client", "/", "org.edgehop.Client", "Pointer", String(x), String(y));
+    }
+    workspace.cursorPosChanged.connect(report);
+})();
+"#;
+
+pub type PointerFn = Box<dyn Fn(i32, i32) + Send + Sync>;
+static POINTER: Mutex<Option<PointerFn>> = Mutex::new(None);
+
 #[derive(Debug, Clone)]
 pub struct WinInfo {
     pub class: String,
@@ -134,6 +165,44 @@ impl Kde {
 
     pub fn back(&self) {
         self.inner.back()
+    }
+
+    /// Have KWin call `f` with the pointer position whenever it reaches a
+    /// screen edge (None: stop). Returns whether KWin accepted the script.
+    pub fn report_pointer(&self, f: Option<PointerFn>) -> bool {
+        let on = f.is_some();
+        *lk(&POINTER) = f;
+        let conn = self.inner.conn();
+        let scripting = conn.with_proxy("org.kde.KWin", "/Scripting", TIMEOUT);
+        let _: Result<(bool,), _> = scripting.method_call("org.kde.kwin.Scripting", "unloadScript", (POINTER_SCRIPT_NAME,));
+        if !on {
+            return true;
+        }
+        let path = self.inner.script.with_file_name("edgehop-pointer.js");
+        if let Err(e) = std::fs::write(&path, POINTER_SCRIPT) {
+            log::warn!("can't write the KWin pointer script: {e}");
+            return false;
+        }
+        let loaded: Result<(i32,), _> = scripting.method_call(
+            "org.kde.kwin.Scripting",
+            "loadScript",
+            (path.to_string_lossy().into_owned(), POINTER_SCRIPT_NAME),
+        );
+        let id = match loaded {
+            Ok((id,)) if id >= 0 => id,
+            other => {
+                log::warn!("KWin loadScript (pointer) failed: {other:?}");
+                return false;
+            }
+        };
+        let script = conn.with_proxy("org.kde.KWin", format!("/Scripting/Script{id}"), TIMEOUT);
+        match script.method_call::<(), _, _, _>("org.kde.kwin.Script", "run", ()) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("KWin pointer script didn't start: {e}");
+                false
+            }
+        }
     }
 }
 
@@ -310,6 +379,12 @@ fn serve(tx: mpsc::Sender<WinInfo>) -> Result<(), dbus::Error> {
                 Ok(())
             },
         );
+        b.method("Pointer", ("x", "y"), (), |_, _, (x, y): (String, String)| {
+            if let (Ok(x), Ok(y), Some(f)) = (x.parse::<i32>(), y.parse::<i32>(), lk(&POINTER).as_ref()) {
+                f(x, y);
+            }
+            Ok(())
+        });
     });
     cr.insert("/", &[iface], tx);
     cr.serve(&c)

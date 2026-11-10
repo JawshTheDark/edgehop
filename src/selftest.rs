@@ -43,6 +43,12 @@ pub fn run(args: &[String]) -> i32 {
         format!("Edgehop {} on {} {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS, std::env::consts::ARCH),
     );
     r.info("log file", crate::state::log_path().display());
+    // Linux CI has no desktop: only the input-device side of sharing can be checked.
+    #[cfg(target_os = "linux")]
+    if args.iter().any(|a| a == "--sharing-only") {
+        sharing_linux(&mut r);
+        return finish(r);
+    }
     clipboard_text(&mut r);
     clipboard_image(&mut r);
 
@@ -68,10 +74,204 @@ pub fn run(args: &[String]) -> i32 {
     r.info("desktop hooks", if crate::platform::client_hooks().is_some() { "available" } else { "none on this system" });
 
     let events_work = pointer(&mut r, inj.as_mut(), w, h, allowed);
-    if args.iter().any(|a| a == "--type") && typing(&mut r, inj.as_mut(), events_work) && cfg!(target_os = "macos") {
+    let typed = args.iter().any(|a| a == "--type") && typing(&mut r, inj.as_mut(), events_work);
+    if typed && cfg!(target_os = "macos") {
         ctrl_as_command(&mut r, inj.as_mut());
     }
+    #[cfg(target_os = "macos")]
+    if args.iter().any(|a| a == "--sharing") {
+        sharing_mac(&mut r, inj.as_mut(), events_work, typed);
+    }
+    #[cfg(target_os = "linux")]
+    if args.iter().any(|a| a == "--sharing") {
+        sharing_linux(&mut r);
+    }
     finish(r)
+}
+
+/// Waits until input capture has reported what `ok` looks for.
+#[cfg(target_os = "macos")]
+fn wait_for<T: Clone>(seen: &std::sync::Mutex<Vec<T>>, ok: impl Fn(&[T]) -> bool) -> (bool, Vec<T>) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let got = crate::state::lk(seen).clone();
+        if ok(&got) || Instant::now() > deadline {
+            return (ok(&got), got);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Sharing this Mac's keyboard and mouse: the event tap sees the pointer,
+/// keys, buttons and wheel, swallows input while "away", and the pointer can
+/// be parked and hidden.
+#[cfg(target_os = "macos")]
+fn sharing_mac(r: &mut Report, inj: &mut dyn crate::inject::Injector, events_work: bool, typed: bool) {
+    use crate::server::capture::{self, Input};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    if !events_work {
+        r.skip("sharing", "injected input isn't reaching the system, so capture can't be checked");
+        return;
+    }
+    let seen: Arc<Mutex<Vec<Input>>> = Arc::default();
+    let swallow = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let (s2, w2, st2) = (seen.clone(), swallow.clone(), stop.clone());
+    let tap = std::thread::spawn(move || {
+        capture::tap_loop(
+            Box::new(move |i| {
+                crate::state::lk(&s2).push(i);
+                w2.load(Ordering::Relaxed)
+            }),
+            tx,
+            st2,
+        )
+    });
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(h) if h != 0 => r.pass("capture", "Quartz event tap installed"),
+        _ => {
+            r.fail("capture", "macOS refused the event tap (Accessibility)");
+            return;
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let clear = || crate::state::lk(&seen).clear();
+
+    clear();
+    inj.move_to(300, 300);
+    let (ok, got) = wait_for(&seen, |v| v.iter().any(|i| matches!(i, Input::Move { x, y, .. } if (x - 300).abs() <= 2 && (y - 300).abs() <= 2)));
+    if ok { r.pass("capture pointer", "saw the pointer arrive at 300,300") } else { r.fail("capture pointer", format!("saw {got:?}")) }
+
+    clear();
+    inj.key(37, true); // K
+    inj.key(37, false);
+    let want = [Input::Key { code: 37, down: true }, Input::Key { code: 37, down: false }];
+    let (ok, got) = wait_for(&seen, |v| want.iter().all(|w| v.contains(w)));
+    if ok { r.pass("capture keys", "K down and up, as key 37") } else { r.fail("capture keys", format!("saw {got:?}")) }
+
+    clear();
+    inj.key(42, true); // Shift
+    inj.key(42, false);
+    let want = [Input::Key { code: 42, down: true }, Input::Key { code: 42, down: false }];
+    let (ok, got) = wait_for(&seen, |v| want.iter().all(|w| v.contains(w)));
+    if ok { r.pass("capture modifiers", "Shift down and up") } else { r.fail("capture modifiers", format!("saw {got:?}")) }
+
+    clear();
+    inj.button(crate::proto::BTN_LEFT, true);
+    inj.button(crate::proto::BTN_LEFT, false);
+    let want = [
+        Input::Button { button: crate::proto::BTN_LEFT, down: true },
+        Input::Button { button: crate::proto::BTN_LEFT, down: false },
+    ];
+    let (ok, got) = wait_for(&seen, |v| want.iter().all(|w| v.contains(w)));
+    if ok { r.pass("capture buttons", "left button down and up") } else { r.fail("capture buttons", format!("saw {got:?}")) }
+
+    clear();
+    inj.wheel(0, 120);
+    let (ok, got) = wait_for(&seen, |v| v.iter().any(|i| matches!(i, Input::Wheel { dy, .. } if *dy > 0)));
+    if ok { r.pass("capture wheel", "one notch up") } else { r.fail("capture wheel", format!("saw {got:?}")) }
+
+    // While the mouse is on another computer, nothing may reach this Mac.
+    if typed {
+        swallow.store(true, Ordering::Relaxed);
+        for _ in 0..3 {
+            inj.key(44, true); // Z
+            inj.key(44, false);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        swallow.store(false, Ordering::Relaxed);
+        crate::clipboard::set("before swallow check");
+        select_all_and_copy(inj, 125);
+        match copied() {
+            Some(t) if t == TYPED => r.pass("swallow while away", "keys typed while away never reached TextEdit"),
+            other => r.fail("swallow while away", format!("TextEdit now holds {other:?}")),
+        }
+    } else {
+        r.skip("swallow while away", "needs --type (a text editor in front)");
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = tap.join();
+
+    capture::warp(200, 200);
+    std::thread::sleep(Duration::from_millis(100));
+    let at = capture::pointer();
+    if at == (200, 200) { r.pass("park pointer", "warped to 200,200") } else { r.fail("park pointer", format!("pointer at {at:?}")) }
+    capture::set_pointer_visible(false);
+    capture::set_pointer_visible(true);
+    r.pass("hide pointer", "hid and showed the pointer");
+    let mons = crate::platform::monitors();
+    if mons.is_empty() {
+        r.fail("monitors", "no displays found");
+    } else {
+        let list: Vec<String> =
+            mons.iter().map(|m| format!("{} {}x{} at {},{}", m.label, m.rect.w(), m.rect.h(), m.rect.l, m.rect.t)).collect();
+        r.pass("monitors", list.join("; "));
+    }
+}
+
+/// Sharing from Linux: a virtual keyboard+mouse made for the test is found,
+/// its events come through translated, and grabbing it is exclusive.
+#[cfg(target_os = "linux")]
+fn sharing_linux(r: &mut Report) {
+    use crate::server::capture::{test_devices, Input};
+    const NAME: &str = "Selftest input";
+    let dev = match crate::inject::test_device(NAME) {
+        Ok(d) => d,
+        Err(e) => {
+            r.fail("test device", e);
+            return;
+        }
+    };
+    std::thread::sleep(Duration::from_millis(800)); // udev creates the node
+    let devs = test_devices();
+    devs.scan();
+    let found = devs.describe();
+    r.info("input devices", found.join("; "));
+    if !found.iter().any(|d| d.starts_with(NAME)) {
+        r.fail("find devices", "the test keyboard+mouse wasn't picked up (permissions?)");
+        return;
+    }
+    r.pass("find devices", "found the test keyboard+mouse");
+    let seen: std::sync::Mutex<Vec<Input>> = Default::default();
+    let check = |r: &mut Report, name: &str, events: &[(u16, u16, i32)], want: &[Input]| {
+        crate::state::lk(&seen).clear();
+        dev.emit(events);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !want.iter().all(|w| crate::state::lk(&seen).contains(w)) {
+            let got = devs.poll(100);
+            crate::state::lk(&seen).extend(got);
+        }
+        let got = crate::state::lk(&seen).clone();
+        if want.iter().all(|w| got.contains(w)) {
+            r.pass(name, format!("{want:?}"));
+        } else {
+            r.fail(name, format!("expected {want:?}, saw {got:?}"));
+        }
+    };
+    check(r, "capture pointer", &[(2, 0, 7), (2, 1, -4)], &[Input::Move { dx: 7, dy: -4 }]);
+    check(r, "capture keys", &[(1, 37, 1)], &[Input::Key { code: 37, down: true }]);
+    check(r, "capture keys up", &[(1, 37, 0)], &[Input::Key { code: 37, down: false }]);
+    check(r, "capture buttons", &[(1, 0x110, 1)], &[Input::Button { button: crate::proto::BTN_LEFT, down: true }]);
+    check(r, "capture buttons up", &[(1, 0x110, 0)], &[Input::Button { button: crate::proto::BTN_LEFT, down: false }]);
+    check(r, "capture wheel", &[(2, 11, 120), (2, 8, 1)], &[Input::Wheel { dx: 0, dy: 120 }]);
+
+    // Grabbing must be exclusive: nobody else can grab the device after us.
+    if !devs.grab_named(NAME, true) {
+        r.fail("grab", "couldn't grab the test device");
+        return;
+    }
+    let other = test_devices();
+    other.scan();
+    let stolen = other.grab_named(NAME, true);
+    check(r, "capture while grabbed", &[(2, 0, 3), (2, 1, 3)], &[Input::Move { dx: 3, dy: 3 }]);
+    devs.grab_named(NAME, false);
+    if stolen {
+        r.fail("grab", "a second reader could grab the device too");
+    } else {
+        r.pass("grab", "exclusive while away, released after");
+    }
 }
 
 fn finish(r: Report) -> i32 {

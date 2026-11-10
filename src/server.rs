@@ -1,5 +1,5 @@
-// The server role is Windows-only for now; elsewhere this code is unused.
-#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
+// Sharing works on Windows, macOS and Linux; elsewhere this code is unused.
+#![cfg_attr(not(any(windows, target_os = "macos", target_os = "linux")), allow(dead_code, unused_imports))]
 //! Server: owns the physical keyboard/mouse, decides which screen is active,
 //! and forwards input to the active client.
 use crate::config::{Config, Peer};
@@ -57,6 +57,9 @@ pub trait Desktop: Send {
     fn hide_drop_strip(&mut self) {}
     /// The drag continues on another computer: end it here without dropping anywhere.
     fn end_os_drag(&mut self) {}
+    /// The mouse moved to a client (true) or came back (false). Linux grabs
+    /// the input devices for itself while a client is active.
+    fn captured(&mut self, _remote: bool) {}
 }
 
 pub enum ClipJob {
@@ -168,9 +171,14 @@ pub struct Core {
     pub drop_point: Option<(i32, i32)>,
     desk: Box<dyn Desktop>,
     app: Option<Arc<AppState>>,
+    /// macOS server: Command is sent as Ctrl (and Ctrl as Command).
+    command_is_ctrl: bool,
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const VK_SCROLL: u32 = 0x91;
+/// Scroll Lock (F14 on a Mac keyboard): always returns the mouse home.
+const KEY_SCROLLLOCK: u16 = 70;
 /// A client silent for this long is treated as unresponsive (pinged every second).
 const UNRESPONSIVE_MS: u64 = 3000;
 
@@ -208,6 +216,7 @@ impl Core {
             drop_point: None,
             desk,
             app,
+            command_is_ctrl: false,
         };
         c.apply_config(cfg);
         c
@@ -219,6 +228,7 @@ impl Core {
         self.hide_cursor = cfg.hide_cursor_when_away;
         self.resistance = cfg.edge_resistance.min(1000) as f64;
         self.clipboard = cfg.clipboard;
+        self.command_is_ctrl = cfg!(target_os = "macos") && cfg.ctrl_is_command;
     }
 
     pub fn is_remote(&self) -> bool {
@@ -620,6 +630,8 @@ impl Core {
         }
     }
 
+    /// A key from a Windows keyboard hook.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn on_key(&mut self, vk: u32, scan: u32, extended: bool, down: bool) -> bool {
         log::trace!(
             "key vk={vk:#04x} scan={scan:#04x}{} {} -> {:?} on {}",
@@ -632,15 +644,40 @@ impl Core {
             return false;
         }
         if vk == VK_SCROLL {
+            return self.on_evdev_key(KEY_SCROLLLOCK, down);
+        }
+        if let Some(code) = crate::keymap::win_to_evdev(scan, extended, vk) {
+            self.on_evdev_key(code, down);
+        }
+        true
+    }
+
+    /// A key as a Linux (evdev) key code: from macOS and Linux capture, and from on_key.
+    pub fn on_evdev_key(&mut self, code: u16, down: bool) -> bool {
+        if !self.is_remote() {
+            return false;
+        }
+        log::trace!("key {code} {} on {}", if down { "down" } else { "up" }, self.active);
+        if code == KEY_SCROLLLOCK {
             if down {
                 log::info!("Scroll Lock pressed: returning to {}", self.me);
                 self.go_home();
             }
             return true;
         }
-        if let Some(code) = crate::keymap::win_to_evdev(scan, extended, vk) {
-            self.send(&self.active, ToClient::Key { code, down });
-        }
+        // A Mac sharing its keyboard: Command does what Ctrl does elsewhere.
+        let code = if self.command_is_ctrl {
+            match code {
+                125 => 29,
+                29 => 125,
+                126 => 97,
+                97 => 126,
+                c => c,
+            }
+        } else {
+            code
+        };
+        self.send(&self.active, ToClient::Key { code, down });
         true
     }
 
@@ -676,6 +713,7 @@ impl Core {
         log::info!("switch {} -> {name} at ({}, {})", self.active, cx as i32, cy as i32);
         self.leave_current();
         if from_server {
+            self.desk.captured(true);
             let (x, y) = self.desk.center();
             self.desk.set_cursor(x, y);
             self.parked = false;
@@ -695,6 +733,7 @@ impl Core {
         log::info!("switch {} -> {} at ({x}, {y})", self.active, self.me);
         self.leave_current();
         self.active = self.me.clone();
+        self.desk.captured(false);
         self.desk.set_cursor(x, y);
         self.desk.set_cursor_visible(true);
         self.desk.hide_drop_strip();
@@ -835,18 +874,19 @@ pub struct Shared {
 pub struct ServerEngine {
     shared: Arc<Shared>,
     port: u16,
+    /// Input capture's handle: thread id (Windows), run loop (macOS).
     #[allow(dead_code)]
-    hook_thread: u32,
+    hook_thread: usize,
 }
 
 impl ServerEngine {
     pub fn start(app: Arc<AppState>) -> Result<ServerEngine, String> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
         {
             let _ = app;
-            Err("Server mode is only available on Windows for now. Use Client mode on this computer.".into())
+            Err("Sharing a keyboard and mouse isn't available on this system. Use the other role.".into())
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         {
             let cfg = app.cfg();
             let listener = {
@@ -878,7 +918,7 @@ impl ServerEngine {
                 log::debug!("screen {} placed at ({}, {}) scale {:.3}{}", p.name, p.x, p.y, p.scale, if p.fit { " stretched" } else { "" });
             }
             let (clip_tx, clip_rx) = mpsc::channel();
-            let mut core = Core::new(&cfg, Box::new(hooks::WinDesktop), Some(app.clone()));
+            let mut core = Core::new(&cfg, capture::desktop(), Some(app.clone()));
             core.clip_jobs = Some(clip_tx);
             let (file_tx, file_rx) = mpsc::channel::<FileJob>();
             core.file_jobs = Some(file_tx);
@@ -906,14 +946,13 @@ impl ServerEngine {
             let s = shared.clone();
             thread::Builder::new()
                 .name("hooks".into())
-                .spawn(move || hooks::run(s, tid_tx, drag_tx))
+                .spawn(move || capture::run(s, tid_tx, drag_tx))
                 .map_err(|e| e.to_string())?;
-            let hook_thread = tid_rx
-                .recv_timeout(Duration::from_secs(5))
-                .map_err(|_| "Input capture failed to start".to_string())?;
-            if hook_thread == 0 {
-                return Err("Could not install keyboard/mouse hooks".into());
-            }
+            let hook_thread = match tid_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(0) => return Err(capture::failure()),
+                Ok(h) => h,
+                Err(_) => return Err("Input capture failed to start".into()),
+            };
 
             // File worker: grabbing a dragged selection and sending files.
             let s = shared.clone();
@@ -1051,9 +1090,9 @@ impl ServerEngine {
                         core.ping_all();
                         core.check_responsive();
                         drop(core);
-                        if hooks::look_lost() && last_rehook.map_or(true, |t| t.elapsed() > Duration::from_secs(10)) {
-                            log::warn!("Windows dropped our input hooks; reinstalling them");
-                            hooks::reinstall(hook_thread);
+                        if capture::look_lost() && last_rehook.map_or(true, |t| t.elapsed() > Duration::from_secs(10)) {
+                            log::warn!("the system dropped our input capture; reinstalling it");
+                            capture::reinstall(hook_thread);
                             last_rehook = Some(Instant::now());
                         }
                     }
@@ -1082,8 +1121,8 @@ impl ServerEngine {
         self.shared.stop.store(true, Ordering::Relaxed);
         lk(&self.shared.core).go_home();
         crate::platform::restore_cursor();
-        #[cfg(windows)]
-        hooks::stop(self.hook_thread);
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+        capture::stop(self.hook_thread);
         let _ = TcpStream::connect_timeout(
             &([127, 0, 0, 1], self.port).into(),
             Duration::from_millis(300),
@@ -1092,6 +1131,29 @@ impl ServerEngine {
             let _ = s.shutdown(Shutdown::Both);
         }
         lk(&self.shared.core).clients.clear();
+    }
+}
+
+/// Fail-safe for input capture: never wait long for the switching state. If
+/// it is stuck (a bug), input goes straight to this computer instead of freezing.
+fn try_core(s: &Shared) -> Option<std::sync::MutexGuard<'_, Core>> {
+    use std::sync::TryLockError;
+    let start = std::time::Instant::now();
+    loop {
+        match s.core.try_lock() {
+            Ok(g) => return Some(g),
+            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) if start.elapsed() < Duration::from_millis(100) => {
+                thread::sleep(Duration::from_millis(1))
+            }
+            Err(TryLockError::WouldBlock) => {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    log::warn!("input capture: switching state busy >100 ms; passing input through");
+                }
+                return None;
+            }
+        }
     }
 }
 
@@ -1433,12 +1495,24 @@ fn send_files(s: &Arc<Shared>, name: String, paths: Vec<String>) {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
+use hooks as capture;
+#[cfg(target_os = "macos")]
+#[path = "server_mac.rs"]
+pub mod capture;
+#[cfg(target_os = "linux")]
+#[path = "server_linux.rs"]
+pub mod capture;
+
+#[cfg(windows)]
 mod hooks {
     use super::*;
     use crate::win32::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     static ACTIVE: Mutex<Option<Arc<Shared>>> = Mutex::new(None);
+    pub fn failure() -> String {
+        "Could not install keyboard/mouse hooks".into()
+    }
 
     pub struct WinDesktop;
 
@@ -1478,27 +1552,8 @@ mod hooks {
         lk(&ACTIVE).clone()
     }
 
-    /// Fail-safe: the hook never waits long for the switching state. If it
-    /// is stuck (a bug), input goes straight to Windows instead of freezing.
-    fn try_core(s: &Shared) -> Option<std::sync::MutexGuard<'_, Core>> {
-        use std::sync::TryLockError;
-        let start = std::time::Instant::now();
-        loop {
-            match s.core.try_lock() {
-                Ok(g) => return Some(g),
-                Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
-                Err(TryLockError::WouldBlock) if start.elapsed() < Duration::from_millis(100) => {
-                    thread::sleep(Duration::from_millis(1))
-                }
-                Err(TryLockError::WouldBlock) => {
-                    static WARNED: AtomicBool = AtomicBool::new(false);
-                    if !WARNED.swap(true, Ordering::Relaxed) {
-                        log::warn!("input hook: switching state busy >100 ms; passing input through");
-                    }
-                    return None;
-                }
-            }
-        }
+    pub fn desktop() -> Box<dyn Desktop> {
+        Box::new(WinDesktop)
     }
 
     fn handle_mouse(msg: u32, ms: &MSLLHOOKSTRUCT) -> bool {
@@ -1551,9 +1606,9 @@ mod hooks {
         recent_input && missed
     }
 
-    pub fn reinstall(thread_id: u32) {
+    pub fn reinstall(thread_id: usize) {
         unsafe {
-            PostThreadMessageW(thread_id, WM_APP_REHOOK, 0, 0);
+            PostThreadMessageW(thread_id as u32, WM_APP_REHOOK, 0, 0);
         }
     }
 
@@ -1590,7 +1645,7 @@ mod hooks {
         CallNextHookEx(std::ptr::null_mut(), code, w, l)
     }
 
-    pub fn run(s: Arc<Shared>, ready: mpsc::Sender<u32>, drags: mpsc::Sender<Vec<String>>) {
+    pub fn run(s: Arc<Shared>, ready: mpsc::Sender<usize>, drags: mpsc::Sender<Vec<String>>) {
         *lk(&ACTIVE) = Some(s);
         // The drop target lives on this thread: it needs the message loop below.
         crate::dragdrop::init(drags);
@@ -1608,7 +1663,7 @@ mod hooks {
                 let _ = ready.send(0);
                 return;
             }
-            let _ = ready.send(GetCurrentThreadId());
+            let _ = ready.send(GetCurrentThreadId() as usize);
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                 if msg.message == WM_APP_REHOOK {
@@ -1630,9 +1685,9 @@ mod hooks {
         log::info!("input capture stopped");
     }
 
-    pub fn stop(thread_id: u32) {
+    pub fn stop(thread_id: usize) {
         unsafe {
-            PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+            PostThreadMessageW(thread_id as u32, WM_QUIT, 0, 0);
         }
     }
 }
@@ -1774,6 +1829,25 @@ mod tests {
             sent.iter().any(|m| matches!(m, ToClient::Move { x: 1519, y: 1013 })),
             "pinned in the bottom-right corner"
         );
+    }
+
+    #[test]
+    fn mac_and_linux_keys_go_to_the_client() {
+        let (mut core, rx, _) = setup(true);
+        assert!(!core.on_evdev_key(30, true), "keys stay here while the mouse is here");
+        core.on_mouse_move(500, 1079);
+        let _ = enter_pos(&rx);
+        assert!(core.on_evdev_key(30, true));
+        assert!(matches!(rx.try_recv().unwrap(), ToClient::Key { code: 30, down: true }));
+        // A Mac sharing its keyboard: Command arrives as Ctrl, and Ctrl as Command.
+        core.command_is_ctrl = true;
+        core.on_evdev_key(125, true);
+        assert!(matches!(rx.try_recv().unwrap(), ToClient::Key { code: 29, down: true }));
+        core.on_evdev_key(29, true);
+        assert!(matches!(rx.try_recv().unwrap(), ToClient::Key { code: 125, down: true }));
+        // Scroll Lock (F14 on a Mac) still brings the mouse home.
+        core.on_evdev_key(KEY_SCROLLLOCK, true);
+        assert_eq!(core.active, core.me);
     }
 
     #[test]

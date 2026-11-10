@@ -27,15 +27,31 @@ lipo -info "$BIN"
 otool -L "$BIN" | sed 1d
 if codesign --verify --deep --strict "$APP"; then echo "signature: valid (ad-hoc)"; else fail "code signature"; fi
 
-step "Self-test (clipboard, pointer, keyboard)"
+step "Self-test (clipboard, pointer, keyboard, sharing)"
 # Something to type into: an empty document in TextEdit, in front.
 : > "$OUT/typing.txt"
 open -a TextEdit "$OUT/typing.txt"
 sleep 5
 shot 1-textedit-ready
-"$BIN" --self-test --type | tee "$OUT/self-test.txt" || fail "self-test"
+"$BIN" --self-test --type --sharing | tee "$OUT/self-test.txt" || fail "self-test"
 shot 2-after-typing
 pkill -x TextEdit
+
+step "Share this Mac's keyboard and mouse (server role)"
+# Run straight from the shell (which may control input here), with its own settings.
+server_cfg="$(mktemp -d)/config.json"
+echo '{"role": "Server", "name": "ci-mac"}' > "$server_cfg"
+EDGEHOP_CONFIG="$server_cfg" "$BIN" > "$OUT/server-output.txt" 2>&1 &
+server=$!
+sleep 12
+if kill -0 "$server" 2> /dev/null; then
+    echo "Edgehop is sharing and still running 12 s later"
+else
+    fail "Edgehop quit or crashed while sharing"
+fi
+shot 3-sharing-screens-tab
+kill "$server" 2> /dev/null
+wait "$server" 2> /dev/null
 
 step "Launch Edgehop.app"
 open "$APP"
@@ -48,7 +64,7 @@ if pgrep -x edgehop > /dev/null; then
 else
     fail "Edgehop quit or crashed within 20 s of launch"
 fi
-shot 3-edgehop-window
+shot 4-edgehop-window
 
 step "Logs"
 log=$(sed -n 's/^info  *log file  *//p' "$OUT/self-test.txt")
@@ -56,6 +72,11 @@ if [ -f "$log" ]; then
     cp "$log" "$OUT/edgehop.log"
     cat "$OUT/edgehop.log"
     if grep -qi 'panicked' "$OUT/edgehop.log"; then fail "panic in the log"; fi
+    if grep -q 'input capture running' "$OUT/edgehop.log"; then
+        echo "sharing: input capture started"
+    else
+        fail "sharing: input capture never started (see edgehop.log)"
+    fi
 else
     echo "no log file at '$log'"
 fi

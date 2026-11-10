@@ -12,8 +12,9 @@ Push the pointer off the edge of a screen and it hops onto the next computer.</p
 </p>
 
 Edgehop is a software KVM in the spirit of Synergy, Barrier and Input Leap:
-a Windows PC shares its keyboard and mouse with Linux, Windows and macOS
-computers over your local network.
+one computer (Windows, macOS or Linux) shares its keyboard and mouse with the
+others over your local network. There's no separate server to set up: the
+computer whose keyboard you're using is the "server".
 
 - **Monitor-level layout**: place each computer against any edge of any monitor,
   like Windows' Display settings. Positions line up across edges, corner to corner.
@@ -27,8 +28,8 @@ computers over your local network.
 - **Edge resistance**, a hidden cursor while you're away, and on KDE Plasma a
   dimmed screen that stays bright while media plays.
 - **Self-healing**: recovers from hangs, dropped connections and crashes on its own.
-- **Clients**: Linux (X11 *and* Wayland via `uinput`), Windows, macOS.
-  **Server**: Windows.
+- **Share from** Windows, macOS, or Linux (X11, or KDE Plasma on Wayland).
+  **Control** Windows, macOS and Linux (X11 *and* Wayland via `uinput`).
 
 <p align="center">
   <img src="docs/settings.png" width="640" alt="Edgehop settings">
@@ -98,10 +99,13 @@ the changelog section as its notes.
 
 ## Using it
 
-1. On Windows, open Edgehop. It starts in **server** mode.
-2. On the other computer, open Edgehop. It starts in **client** mode and finds the server.
-3. A pairing prompt pops up on Windows. Check that the code matches the one on
-   the client, then click **Approve**.
+1. On the computer with the keyboard and mouse you want to use, open Edgehop.
+   Windows starts out sharing; on a Mac or Linux computer, choose **Share this
+   keyboard & mouse** under Settings → Role.
+2. On the other computer, open Edgehop. It starts as **Use a shared keyboard &
+   mouse** and finds the sharing computer by itself.
+3. A pairing prompt pops up on the sharing computer. Check that the code matches
+   the one on the other computer, then click **Approve**.
 4. The new computer shows up to the right of your PC in **Screen layout**. Drag
    it to wherever it physically sits.
 5. Move the mouse off that edge. You're now typing on the other computer.
@@ -112,6 +116,18 @@ the changelog section as its notes.
 | Clipboard | Copy, move to the other screen, paste |
 | Mouse too fast/slow on the client | *Mouse speed on other screens* (server) or *Override screen size* (client) |
 | Keep running | Close the window → it stays in the tray. Tick *Start Edgehop when I log in*. |
+
+**Sharing from a Mac**: allow Edgehop under System Settings → Privacy & Security
+→ **Accessibility** (the app asks). *Command works as Ctrl* (Settings → Keyboard,
+on by default) makes Command+C / Command+V copy and paste on Windows and Linux.
+Mac keyboards have no Scroll Lock: **F14** brings the mouse home instead.
+
+**Sharing from Linux** works on X11 and on KDE Plasma (Wayland). GNOME on Wayland
+doesn't let apps follow the pointer; choose *GNOME on Xorg* at the login screen to
+share from there. The package lets the logged-in user read keyboards, mice and
+touchpads (`70-edgehop-input.rules`); Edgehop takes them over only while the
+mouse is on another computer. From a touchpad, moving, clicking and two-finger
+scrolling reach the other computer; tap-to-click doesn't.
 
 Settings live in `%APPDATA%\edgehop\config\config.json` (Windows),
 `~/.config/edgehop/config.json` (Linux), or
@@ -158,14 +174,15 @@ edgehop recovers from failures without you having to step in:
 |---|---|
 | The computer your mouse is on stops answering | Mouse returns to the server after 3 s; it won't cross into a silent computer until it answers again |
 | Connection drops | Both sides reconnect automatically (dead connections are detected within 12 s) |
-| Something inside edgehop gets stuck | The Windows input hook passes input straight through after 100 ms (it can never freeze your mouse); a stuck switching state for 5 s restarts edgehop |
+| Something inside edgehop gets stuck | Input capture passes input straight through after 100 ms (it can never freeze your mouse); a stuck switching state for 5 s restarts edgehop |
+| macOS pauses the input tap (it does this to slow apps) | Turned straight back on |
 | Windows silently removes the input hooks | Noticed (Windows saw input the hooks didn't) and reinstalled |
 | The client's connection loop stalls | Stuck helper processes are killed and it reconnects; if still stuck, edgehop restarts |
 | Clipboard tools hang (e.g. on a locked screen) | Given up on after 2 s, off the input path |
 | A connection ends with keys or buttons held | They're released |
 | A background worker crashes | Logged with its location; the worker keeps running |
 | KDE's D-Bus connection drops | Reconnected |
-| edgehop crashes or is killed | Cursor is restored; on Linux, systemd restarts it (autostart runs it with `Restart=on-failure`) |
+| edgehop crashes or is killed | Cursor is restored, and on Linux the keyboard and mouse are released by the kernel; systemd restarts it (autostart runs it with `Restart=on-failure`) |
 
 You can also restart it from the tray icon (**Restart edgehop**). Everything is
 logged to `edgehop.log` (`%LOCALAPPDATA%\edgehop\cache\` on Windows,
@@ -182,9 +199,11 @@ logged to `edgehop.log` (`%LOCALAPPDATA%\edgehop\cache\` on Windows,
  └─────────────────────────┘ ◀── clipboard ───── └──────────────────────────┘
 ```
 
-While a client is active, the server parks its own cursor in the middle of the
-screen, turns every motion into a delta, and moves a virtual cursor on the
-client screen. The client gets absolute coordinates, so the pointer lands
+Input is captured with low-level hooks on Windows, a Quartz event tap on macOS,
+and straight from the kernel's input devices (`/dev/input`) on Linux, which are
+grabbed only while the mouse is elsewhere. While a client is active, the
+sharing computer parks its own cursor, turns every motion into a delta, and
+moves a virtual cursor on the client screen. The client gets absolute coordinates, so the pointer lands
 exactly where expected even under Wayland. Keys travel as Linux evdev codes and
 are translated to scancodes on Windows and to virtual key codes on macOS.
 

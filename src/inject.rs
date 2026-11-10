@@ -30,6 +30,14 @@ pub fn permission() -> Option<bool> {
     None
 }
 
+/// Show the system's permission prompt for injecting/capturing input, where
+/// there is one (macOS: Accessibility). Once per run.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn permission_prompt() {
+    #[cfg(target_os = "macos")]
+    macos::ask_for_permission();
+}
+
 /// Mac clients: Ctrl from the server's keyboard acts as Command (and the
 /// Windows key as Control), so Ctrl+C copies and Ctrl+V pastes like on Windows.
 static CTRL_IS_COMMAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -87,9 +95,15 @@ impl WheelAcc {
     }
 }
 
+/// A virtual keyboard + relative mouse for `edgehop --self-test` to drive.
+#[cfg(target_os = "linux")]
+pub fn test_device(name: &str) -> Result<linux::TestDevice, String> {
+    linux::TestDevice::new(name)
+}
+
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "linux")]
-mod linux {
+pub mod linux {
     use super::{Injector, WheelAcc};
     use crate::proto::*;
     use std::ffi::CString;
@@ -203,6 +217,29 @@ mod linux {
                 libc::ioctl(self.fd, UI_DEV_DESTROY as _);
                 libc::close(self.fd);
             }
+        }
+    }
+
+    /// A keyboard + relative mouse, like real hardware (for the self-test).
+    pub struct TestDevice(Device);
+
+    impl TestDevice {
+        pub fn new(name: &str) -> Result<TestDevice, String> {
+            Device::open(name, 3, |fd| unsafe {
+                libc::ioctl(fd, UI_SET_EVBIT as _, EV_KEY as libc::c_int);
+                for k in (1..=255).chain(BTN_LEFT_CODE as libc::c_int..=BTN_LEFT_CODE as libc::c_int + 4) {
+                    libc::ioctl(fd, UI_SET_KEYBIT as _, k);
+                }
+                libc::ioctl(fd, UI_SET_EVBIT as _, EV_REL as libc::c_int);
+                for r in [0u16, 1, REL_WHEEL, REL_WHEEL_HI_RES] {
+                    libc::ioctl(fd, UI_SET_RELBIT as _, r as libc::c_int);
+                }
+            })
+            .map(TestDevice)
+        }
+        /// (type, code, value) events, followed by a sync.
+        pub fn emit(&self, events: &[(u16, u16, i32)]) {
+            self.0.emit(events)
         }
     }
 
@@ -507,7 +544,7 @@ mod macos {
 
     /// Show macOS's "Edgehop would like to control this computer" prompt,
     /// which leads to the Accessibility settings. Once per run.
-    fn ask_for_permission() {
+    pub fn ask_for_permission() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| unsafe {
             let keys = [kAXTrustedCheckOptionPrompt];

@@ -473,12 +473,14 @@ impl Gui {
     // ---------------- server: Screens ----------------
 
     fn screens_tab(&mut self, ui: &mut egui::Ui, cfg: &Config) {
-        if !cfg!(windows) {
-            card(ui, "Sharing from this computer isn't available yet", "", |ui| {
-                ui.label("Sharing a keyboard and mouse is Windows-only for now. Choose “Use a shared keyboard & mouse” in Settings.");
+        if !cfg!(any(windows, target_os = "macos", target_os = "linux")) {
+            card(ui, "Sharing from this computer isn't available", "", |ui| {
+                ui.label("Choose “Use a shared keyboard & mouse” in Settings.");
             });
             return;
         }
+        #[cfg(target_os = "macos")]
+        self.accessibility_card(ui, "read the keyboard and mouse");
         let connected: HashSet<String> = lk(&self.app.connected).iter().map(|c| c.name.clone()).collect();
         let active = lk(&self.app.active_screen).clone();
         let mons = platform::monitors();
@@ -815,6 +817,27 @@ impl Gui {
         ok
     }
 
+    /// Mac: until Accessibility is allowed, explain and link to the setting.
+    #[cfg(target_os = "macos")]
+    fn accessibility_card(&mut self, ui: &mut egui::Ui, what: &str) {
+        if self.input_allowed(ui.ctx()) {
+            return;
+        }
+        ui.add_space(10.0);
+        card(ui, "⚠ Allow Edgehop to control this Mac", "", |ui| {
+            ui.label(format!(
+                "macOS only lets an app {what} once you allow it. Turn on Edgehop under \
+                 System Settings > Privacy & Security > Accessibility; this message goes away by itself."
+            ));
+            ui.add_space(6.0);
+            if ui.button("Open Accessibility settings").clicked() {
+                let _ = std::process::Command::new("open")
+                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                    .spawn();
+            }
+        });
+    }
+
     fn connection_tab(&mut self, ui: &mut egui::Ui, cfg: &Config) {
         let p = palette(ui.visuals().dark_mode);
         let status = lk(&self.app.status).clone();
@@ -860,20 +883,7 @@ impl Gui {
         });
 
         #[cfg(target_os = "macos")]
-        if !self.input_allowed(ui.ctx()) {
-            ui.add_space(10.0);
-            card(ui, "⚠ Allow Edgehop to control this Mac", "", |ui| {
-                ui.label(
-                    "macOS only lets an app move the pointer and type once you allow it. Turn on Edgehop under                      System Settings > Privacy & Security > Accessibility; this message goes away by itself.",
-                );
-                ui.add_space(6.0);
-                if ui.button("Open Accessibility settings").clicked() {
-                    let _ = std::process::Command::new("open")
-                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-                        .spawn();
-                }
-            });
-        }
+        self.accessibility_card(ui, "move the pointer and type");
 
         if let Some(fp) = lk(&self.app.key_mismatch).clone() {
             ui.add_space(10.0);
@@ -981,8 +991,8 @@ impl Gui {
                     self.restart();
                 }
             });
-            if cfg.role == Role::Server && !cfg!(windows) {
-                ui.colored_label(WARN, "Sharing is Windows-only for now; use the other role on this computer.");
+            if cfg.role == Role::Server && !cfg!(any(windows, target_os = "macos", target_os = "linux")) {
+                ui.colored_label(WARN, "Sharing isn't available on this system; use the other role here.");
             }
             ui.add_space(4.0);
             ui.label(RichText::new(format!("Device key {}", net::fingerprint(&cfg.public_key))).small().monospace().color(p.muted));
@@ -1011,9 +1021,25 @@ impl Gui {
                     );
                 });
                 ui.add_space(10.0);
+                if cfg!(target_os = "macos") {
+                    card(ui, "Keyboard", "", |ui| {
+                        row(
+                            ui,
+                            "Command works as Ctrl",
+                            "On Windows and Linux computers, Command+C copies and Command+V pastes, as on this Mac.",
+                            |ui| {
+                                let mut on = cfg.ctrl_is_command;
+                                if toggle(ui, &mut on).changed() {
+                                    self.app.update_config(|c| c.ctrl_is_command = on);
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(10.0);
+                }
                 card(ui, "Sharing", "", |ui| {
                     self.clipboard_row(ui, cfg);
-                    row(ui, "Hide cursor while away", "Hide this PC's cursor while you're on another computer.", |ui| {
+                    row(ui, "Hide cursor while away", "Hide this computer's cursor while you're on another computer.", |ui| {
                         let mut hide = cfg.hide_cursor_when_away;
                         if toggle(ui, &mut hide).changed() {
                             self.app.update_config(|c| c.hide_cursor_when_away = hide);

@@ -113,9 +113,27 @@ pub fn evdev_to_mac(code: u16) -> Option<u16> {
     Some(k)
 }
 
+/// macOS virtual keycode -> evdev code (the inverse of evdev_to_mac).
+#[allow(dead_code)]
+pub fn mac_to_evdev(k: u16) -> Option<u16> {
+    (1..=255u16).find(|&c| evdev_to_mac(c) == Some(k))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mac_keys_round_trip() {
+        for code in 1..=255u16 {
+            if let Some(k) = evdev_to_mac(code) {
+                let back = mac_to_evdev(k).unwrap();
+                assert_eq!(evdev_to_mac(back), Some(k), "evdev {code} -> mac {k:#x} -> evdev {back}");
+            }
+        }
+        assert_eq!(mac_to_evdev(0x00), Some(30)); // A
+        assert_eq!(mac_to_evdev(0x37), Some(125)); // Command
+    }
 
     #[test]
     fn letters_round_trip() {

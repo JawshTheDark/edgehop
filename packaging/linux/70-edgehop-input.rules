@@ -1,0 +1,6 @@
+# Let the logged-in desktop user read keyboards, mice and touchpads, so Edgehop
+# can share them with other computers (it grabs them only while the mouse is on
+# another computer). Remove this file if you only use this computer as a client.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TOUCHPAD}=="1", TAG+="uaccess"

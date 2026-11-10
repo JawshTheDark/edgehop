@@ -3,6 +3,26 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.2.0] - 2026-11-10
+
+### Share from a Mac or Linux computer
+Until now only Windows could share its keyboard and mouse. Now any of them can:
+choose **Share this keyboard & mouse** under Settings → Role.
+
+- **macOS**: a Quartz event tap reads the keyboard and mouse (allow Edgehop under
+  Accessibility). *Command works as Ctrl* (on by default) makes Command+C and
+  Command+V copy and paste on Windows and Linux. F14 brings the mouse home, as
+  Mac keyboards have no Scroll Lock.
+- **Linux**: works on X11 and on KDE Plasma (Wayland), reading keyboards, mice
+  and touchpads straight from the kernel and taking them over only while the
+  mouse is on another computer. The package now includes a udev rule that lets
+  the logged-in user read them. GNOME on Wayland isn't supported yet (use
+  *GNOME on Xorg*).
+- Mac clients hide the pointer while the mouse is on another computer.
+
+### Fixes
+- The Mac's Accessibility message had a run of stray spaces in the middle.
+
 ## [0.1.1] - 2026-11-10
 
 Mac fixes, found by testing on a real Mac in CI.

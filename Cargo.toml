@@ -1,6 +1,6 @@
 [package]
 name = "edgehop"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Share one keyboard and mouse across every computer on your network"
 license = "MIT"
@@ -49,5 +49,6 @@ assets = [
     ["packaging/linux/edgehop.desktop", "usr/share/applications/", "644"],
     ["packaging/linux/edgehop.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["packaging/linux/60-edgehop-uinput.rules", "lib/udev/rules.d/", "644"],
+    ["packaging/linux/70-edgehop-input.rules", "lib/udev/rules.d/", "644"],
     ["packaging/linux/edgehop-uinput.conf", "usr/lib/modules-load.d/", "644"],
 ]

@@ -27,6 +27,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
       - run: cargo build --release
       - run: cargo test --release
+      # Sharing from Linux reads keyboards and mice from the kernel: check that
+      # with a virtual keyboard+mouse (no desktop needed).
+      - name: Linux sharing self-test
+        if: runner.os == 'Linux'
+        run: |
+          sudo modprobe uinput || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe uinput; }
+          sudo ./target/release/edgehop --self-test --sharing-only
       # Nobody on the team has a Mac, so a real one checks the app instead:
       # launch, clipboard, pointer and keyboard (see packaging/macos/smoke-test.sh).
       - name: macOS app smoke test
