@@ -3,6 +3,18 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.2.6] - 2026-11-10
+
+### Windows
+- The input thread now runs at the highest priority, so it answers Windows
+  in time even when the computer is busy. Windows removes an input hook that
+  answers too slowly, letting keys through to this computer as well.
+- When Windows does drop the hooks, the log now says which one went quiet
+  (mouse or keyboard), how long ago each last ran, and which window was in
+  front and whether it runs as administrator (a normal app's hooks don't see
+  input meant for those). The input flight recorder is written to the log
+  too.
+
 ## [0.2.5] - 2026-11-10
 
 ### Fixes

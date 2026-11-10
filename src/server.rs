@@ -1189,6 +1189,7 @@ impl ServerEngine {
                 .name("watchdog".into())
                 .spawn(move || {
                     let mut last_rehook: Option<Instant> = None;
+                    let mut last_dump: Option<Instant> = None;
                     while !s.stop.load(Ordering::Relaxed) {
                         thread::sleep(Duration::from_secs(1));
                         let mons = crate::platform::monitor_rects();
@@ -1210,8 +1211,19 @@ impl ServerEngine {
                         core.check_responsive();
                         drop(core);
                         if capture::look_lost() && last_rehook.map_or(true, |t| t.elapsed() > Duration::from_secs(10)) {
+                            #[cfg(windows)]
+                            log::warn!("the system dropped our input capture; reinstalling it. {}", capture::loss_report());
+                            #[cfg(not(windows))]
                             log::warn!("the system dropped our input capture; reinstalling it");
                             capture::reinstall(hook_thread);
+                            // The minutes before matter: write out the flight recorder
+                            // (at most every 5 minutes, off this thread).
+                            if last_dump.map_or(true, |t: Instant| t.elapsed() > Duration::from_secs(300)) {
+                                last_dump = Some(Instant::now());
+                                let _ = thread::Builder::new()
+                                    .name("flight-dump".into())
+                                    .spawn(|| crate::flight::log_dump("input capture was dropped"));
+                            }
                             last_rehook = Some(Instant::now());
                         }
                     }
@@ -1718,6 +1730,8 @@ mod hooks {
 
     /// Tick of the last event our hooks saw (to notice if Windows drops them).
     static LAST_HOOK_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static LAST_MOUSE_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static LAST_KEY_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     const WM_APP_REHOOK: u32 = 0x8000 + 1;
 
     /// Windows saw recent input that our hooks never got: they were removed.
@@ -1731,6 +1745,19 @@ mod hooks {
         let recent_input = now.wrapping_sub(input) < 3000;
         let missed = input.wrapping_sub(last_hook) as i32 > 1500;
         recent_input && missed
+    }
+
+    /// What the watchdog saw when it decided the hooks were gone, for the log.
+    pub fn loss_report() -> String {
+        let now = unsafe { GetTickCount() };
+        let age = |t: u32| if t == 0 { "never".to_string() } else { format!("{} ms ago", now.wrapping_sub(t)) };
+        format!(
+            "Windows saw input {}; our mouse hook last ran {}, keyboard hook {}; in front: {}",
+            age(last_input_tick()),
+            age(LAST_MOUSE_TICK.load(Ordering::Relaxed)),
+            age(LAST_KEY_TICK.load(Ordering::Relaxed)),
+            crate::win32::foreground_description()
+        )
     }
 
     pub fn reinstall(thread_id: usize) {
@@ -1755,7 +1782,9 @@ mod hooks {
     }
 
     unsafe extern "system" fn mouse_proc(code: i32, w: usize, l: isize) -> isize {
-        LAST_HOOK_TICK.store(GetTickCount(), Ordering::Relaxed);
+        let tick = GetTickCount();
+        LAST_HOOK_TICK.store(tick, Ordering::Relaxed);
+        LAST_MOUSE_TICK.store(tick, Ordering::Relaxed);
         if code >= 0 {
             let ms = &*(l as *const MSLLHOOKSTRUCT);
             if ms.flags & LLMHF_INJECTED == 0 {
@@ -1771,7 +1800,9 @@ mod hooks {
     }
 
     unsafe extern "system" fn key_proc(code: i32, w: usize, l: isize) -> isize {
-        LAST_HOOK_TICK.store(GetTickCount(), Ordering::Relaxed);
+        let tick = GetTickCount();
+        LAST_HOOK_TICK.store(tick, Ordering::Relaxed);
+        LAST_KEY_TICK.store(tick, Ordering::Relaxed);
         if code >= 0 {
             let kb = &*(l as *const KBDLLHOOKSTRUCT);
             if kb.flags & LLKHF_INJECTED == 0 {
@@ -1790,6 +1821,9 @@ mod hooks {
         *lk(&ACTIVE) = Some(s);
         // The drop target lives on this thread: it needs the message loop below.
         crate::dragdrop::init(drags);
+        if !crate::win32::raise_thread_priority() {
+            log::warn!("couldn't raise the input thread's priority");
+        }
         unsafe {
             let (mut mh, mut kh) = install();
             if mh.is_null() || kh.is_null() {

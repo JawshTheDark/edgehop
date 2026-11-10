@@ -602,6 +602,79 @@ pub fn show_cursor() {
 }
 
 
+#[link(name = "user32")]
+extern "system" {
+    fn GetWindowTextW(hwnd: HANDLE, text: *mut u16, max: i32) -> i32;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenProcessToken(process: HANDLE, access: u32, token: *mut HANDLE) -> i32;
+    fn GetTokenInformation(token: HANDLE, class: u32, info: *mut std::ffi::c_void, len: u32, ret: *mut u32) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentThread() -> HANDLE;
+    fn SetThreadPriority(thread: HANDLE, priority: i32) -> i32;
+}
+
+/// Run the calling thread ahead of everything else at normal priority: the
+/// input hooks must answer Windows within its time limit even when the
+/// computer is busy, or Windows lets input through and drops the hooks.
+pub fn raise_thread_priority() -> bool {
+    const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) != 0 }
+}
+
+/// The window in front, for the log: program, title, and whether it runs as
+/// administrator (a normal app's input hooks don't see input meant for those).
+pub fn foreground_description() -> String {
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION: u32 = 20;
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return "nothing (the desktop or a system screen)".into();
+        }
+        let mut title = [0u16; 160];
+        let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32).max(0) as usize;
+        let title = String::from_utf16_lossy(&title[..n]);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return format!("{title:?} (process {pid}, can't open it: probably running as administrator)");
+        }
+        let mut name = [0u16; 520];
+        let mut len = name.len() as u32;
+        let exe = if QueryFullProcessImageNameW(process, 0, name.as_mut_ptr(), &mut len) != 0 {
+            let path = String::from_utf16_lossy(&name[..len as usize]);
+            path.rsplit('\\').next().unwrap_or(&path).to_string()
+        } else {
+            format!("process {pid}")
+        };
+        let mut token: HANDLE = std::ptr::null_mut();
+        let admin = if OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0 {
+            let mut elevated = 0u32;
+            let mut ret = 0u32;
+            let ok = GetTokenInformation(token, TOKEN_ELEVATION, &mut elevated as *mut u32 as *mut _, 4, &mut ret) != 0;
+            CloseHandle(token);
+            if !ok {
+                "elevation unknown"
+            } else if elevated != 0 {
+                "RUNS AS ADMINISTRATOR"
+            } else {
+                "normal"
+            }
+        } else {
+            "can't read its token: probably RUNS AS ADMINISTRATOR"
+        };
+        CloseHandle(process);
+        format!("{exe} {title:?} ({admin})")
+    }
+}
+
 /// Top-level window that currently has focus.
 pub fn foreground_root() -> isize {
     unsafe { GetAncestor(GetForegroundWindow(), 2) as isize }
@@ -758,4 +831,14 @@ pub fn local_time() -> SYSTEMTIME {
         GetLocalTime(&mut t);
     }
     t
+}
+
+#[cfg(test)]
+mod foreground_tests {
+    #[test]
+    fn describes_the_window_in_front() {
+        let d = super::foreground_description();
+        println!("in front: {d}");
+        assert!(!d.is_empty());
+    }
 }
