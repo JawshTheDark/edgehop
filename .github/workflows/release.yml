@@ -93,7 +93,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --release
       - name: Build a universal Edgehop.app
-        run: UNIVERSAL=1 ./packaging/macos/build-app.sh
+        run: UNIVERSAL=1 bash packaging/macos/build-app.sh
       - name: Package
         run: |
           mkdir -p upload
