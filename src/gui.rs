@@ -827,7 +827,10 @@ impl Gui {
         card(ui, "⚠ Allow Edgehop to control this Mac", "", |ui| {
             ui.label(format!(
                 "macOS only lets an app {what} once you allow it. Turn on Edgehop under \
-                 System Settings > Privacy & Security > Accessibility; this message goes away by itself."
+                 System Settings > Privacy & Security > Accessibility (\u{201c}Device Control and Data \
+                 Access\u{201d} on newer macOS); this message goes away by itself.\n\nAlready on? That \
+                 permission belongs to an older copy of Edgehop: select Edgehop there, remove it with \
+                 \u{2212}, add it back with +, and restart Edgehop."
             ));
             ui.add_space(6.0);
             if ui.button("Open Accessibility settings").clicked() {

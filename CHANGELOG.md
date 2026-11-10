@@ -3,6 +3,18 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.2.1] - 2026-11-10
+
+### Mac
+- macOS permissions now carry over to future updates. Until now each update
+  looked like a new app to macOS, which could keep showing Edgehop as allowed
+  while refusing it. **Coming from 0.2.0 or earlier**: once, select Edgehop
+  under Privacy & Security → Accessibility (*Device Control and Data Access* on
+  newer macOS), remove it with −, add it back with +, and restart Edgehop.
+- When macOS refuses to let Edgehop read the keyboard and mouse, Edgehop now
+  checks Accessibility and Input Monitoring separately, asks for the missing
+  one, and says exactly what to do.
+
 ## [0.2.0] - 2026-11-10
 
 ### Share from a Mac or Linux computer

@@ -26,6 +26,12 @@ file "$BIN"
 lipo -info "$BIN"
 otool -L "$BIN" | sed 1d
 if codesign --verify --deep --strict "$APP"; then echo "signature: valid (ad-hoc)"; else fail "code signature"; fi
+requirement=$(codesign -d -r- "$APP" 2>&1 | grep designated)
+echo "$requirement"
+case "$requirement" in
+    *'identifier "com.edgehop.app"'*) echo "permissions survive updates (requirement is the bundle identifier)" ;;
+    *) fail "designated requirement isn't the bundle identifier" ;;
+esac
 
 step "Self-test (clipboard, pointer, keyboard, sharing)"
 # Something to type into: an empty document in TextEdit, in front.

@@ -118,7 +118,11 @@ the changelog section as its notes.
 | Keep running | Close the window → it stays in the tray. Tick *Start Edgehop when I log in*. |
 
 **Sharing from a Mac**: allow Edgehop under System Settings → Privacy & Security
-→ **Accessibility** (the app asks). *Command works as Ctrl* (Settings → Keyboard,
+→ **Accessibility** (*Device Control and Data Access* on newer macOS; the app
+asks), and under **Input Monitoring** if macOS asks for that too. After
+updating Edgehop, macOS can keep showing the old copy as allowed while refusing
+the new one: select Edgehop, remove it with **−**, add it back with **+**, and
+restart Edgehop. *Command works as Ctrl* (Settings → Keyboard,
 on by default) makes Command+C / Command+V copy and paste on Windows and Linux.
 Mac keyboards have no Scroll Lock: **F14** brings the mouse home instead.
 

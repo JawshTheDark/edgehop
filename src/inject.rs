@@ -603,7 +603,7 @@ mod macos {
     impl Quartz {
         pub fn new() -> Result<Quartz, String> {
             if !trusted() {
-                log::warn!("Edgehop needs Accessibility permission: System Settings → Privacy & Security → Accessibility");
+                log::warn!("Edgehop needs Accessibility permission: System Settings → Privacy & Security → Accessibility (Device Control and Data Access on newer macOS)");
                 ask_for_permission();
             }
             let b = unsafe { CGDisplayBounds(CGMainDisplayID()) };

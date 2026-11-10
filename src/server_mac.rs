@@ -98,10 +98,56 @@ const TAP_DEFAULT: u32 = 0;
 
 const CAPS_LOCK_KEYCODE: u16 = 0x39;
 
+static ERROR: Mutex<String> = Mutex::new(String::new());
+
 pub fn failure() -> String {
-    "macOS didn't let Edgehop read the keyboard and mouse. Allow Edgehop under \
-     System Settings > Privacy & Security > Accessibility, then press Start."
-        .into()
+    let e = lk(&ERROR).clone();
+    if e.is_empty() {
+        "macOS didn't let Edgehop read the keyboard and mouse.".into()
+    } else {
+        e
+    }
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPreflightListenEventAccess() -> bool;
+    fn CGRequestListenEventAccess() -> bool;
+    fn CGPreflightPostEventAccess() -> bool;
+}
+
+const ACCESSIBILITY: &str = "System Settings > Privacy & Security > Accessibility \
+     (\u{201c}Device Control and Data Access\u{201d} on newer macOS)";
+
+/// macOS refused the event tap: work out which permission is missing, ask
+/// for it, and say what to do.
+fn explain_refusal() -> String {
+    let trusted = crate::inject::permission() == Some(true);
+    let (listen, post) = unsafe { (CGPreflightListenEventAccess(), CGPreflightPostEventAccess()) };
+    log::error!(
+        "macOS refused the input tap (Accessibility: {}, Input Monitoring: {}, posting events: {})",
+        if trusted { "allowed" } else { "not allowed" },
+        if listen { "allowed" } else { "not allowed" },
+        if post { "allowed" } else { "not allowed" },
+    );
+    let msg = if !trusted {
+        crate::inject::permission_prompt();
+        format!(
+            "Allow Edgehop under {ACCESSIBILITY}, then press Start. If it already looks allowed there, \
+             that permission belongs to an older copy of Edgehop: select Edgehop, remove it with \u{2212}, \
+             add it back with +, and restart Edgehop."
+        )
+    } else if !listen {
+        unsafe { CGRequestListenEventAccess() };
+        "Allow Edgehop under System Settings > Privacy & Security > Input Monitoring too, then restart Edgehop.".into()
+    } else {
+        format!(
+            "macOS lists Edgehop as allowed but still refuses it. Select Edgehop under {ACCESSIBILITY}, \
+             remove it with \u{2212}, add it back with +, then restart Edgehop."
+        )
+    };
+    log::error!("{msg}");
+    msg
 }
 
 /// One input event, translated for the switching logic.
@@ -251,9 +297,8 @@ pub fn tap_loop(sink: Sink, ready: mpsc::Sender<usize>, stop: Arc<AtomicBool>) {
             tap = CGEventTapCreate(SESSION_TAP, HEAD_INSERT, TAP_DEFAULT, mask(), callback, state as *mut c_void);
         }
         if tap.is_null() {
-            log::error!("macOS refused the input tap: Edgehop needs Accessibility permission");
             drop(Box::from_raw(state));
-            crate::inject::permission_prompt();
+            *lk(&ERROR) = explain_refusal();
             let _ = ready.send(0);
             return;
         }

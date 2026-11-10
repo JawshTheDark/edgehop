@@ -54,7 +54,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSLocalNetworkUsageDescription</key><string>Edgehop finds and connects to the computer sharing its keyboard and mouse on your local network.</string>
 </dict></plist>
 PLIST
-# Ad-hoc signature: required to run on Apple silicon at all.
-codesign --force --deep -s - "$APP"
+# Ad-hoc signature: required to run on Apple silicon at all. An ad-hoc
+# signature normally identifies one exact build, so macOS would treat every
+# update as a new app and drop its Accessibility permission. Pinning the
+# designated requirement to the bundle identifier keeps the permission
+# across updates.
+codesign --force --deep -s - --requirements '=designated => identifier "com.edgehop.app"' "$APP"
 echo "Built $APP ($VERSION). Move it to /Applications, open it, then allow it under"
 echo "System Settings → Privacy & Security → Accessibility."
