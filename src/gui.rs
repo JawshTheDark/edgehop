@@ -363,6 +363,7 @@ impl Gui {
                             ui.label(RichText::new(format!("Mouse on {active}")).color(p.muted));
                         }
                     }
+                    self.transfer_progress(ui);
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if running {
@@ -398,6 +399,27 @@ impl Gui {
                 });
                 ui.add_space(2.0);
             });
+    }
+
+    /// Live progress of a file transfer: bar, percent and speed.
+    fn transfer_progress(&self, ui: &mut egui::Ui) {
+        let snap = lk(&self.app.transfer).as_ref().map(|t| {
+            (t.label.clone(), t.total, t.done.load(std::sync::atomic::Ordering::Relaxed), t.started.elapsed().as_secs_f64())
+        });
+        let Some((label, total, done, secs)) = snap else { return };
+        let frac = if total == 0 { 1.0 } else { done as f32 / total as f32 };
+        let rate = done as f64 / secs.max(0.05);
+        ui.add_space(8.0);
+        ui.add(
+            egui::ProgressBar::new(frac)
+                .desired_width(200.0)
+                .corner_radius(CornerRadius::same(255))
+                .fill(ACCENT)
+                .text(RichText::new(format!("{:.0}% · {}/s", frac * 100.0, crate::files::human(rate as u64))).size(12.0)),
+        )
+        .on_hover_text(format!("{label}
+{} of {}", crate::files::human(done), crate::files::human(total)));
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
     }
 
     // ---------------- pairing ----------------
@@ -1051,12 +1073,34 @@ impl Gui {
     }
 
     fn clipboard_row(&mut self, ui: &mut egui::Ui, cfg: &Config) {
-        row(ui, "Shared clipboard", "Copy on one computer, paste on another: text and images.", |ui| {
+        row(ui, "Shared clipboard", "Copy on one computer, paste on another: text, images, files and folders.", |ui| {
             let mut clip = cfg.clipboard;
             if toggle(ui, &mut clip).changed() {
                 self.app.update_config(|c| c.clipboard = clip);
             }
         });
+        row(
+            ui,
+            "Copied files up to",
+            "Copied files are fetched when you move to the other computer. Bigger copies: drag them across instead.",
+            |ui| {
+                let mut gb = cfg.clipboard_files_max_gb;
+                if ui.add(egui::DragValue::new(&mut gb).range(1..=500).suffix(" GB")).changed() {
+                    self.app.update_config(|c| c.clipboard_files_max_gb = gb);
+                }
+            },
+        );
+        row(
+            ui,
+            "Parallel transfer connections",
+            "More connections fill faster networks. 4 saturates gigabit.",
+            |ui| {
+                let mut n = cfg.transfer_conns;
+                if ui.add(egui::Slider::new(&mut n, 1..=16)).changed() {
+                    self.app.update_config(|c| c.transfer_conns = n);
+                }
+            },
+        );
     }
 
     // ---------------- activity ----------------

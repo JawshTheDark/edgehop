@@ -1,8 +1,8 @@
 //! Application messages carried inside the encrypted Noise channel.
-use crate::files::FileMsg;
+use crate::transfer::Manifest;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Shared clipboard content.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -11,6 +11,9 @@ pub enum Clip {
     Text { text: String },
     /// A PNG image, base64-encoded (screenshots, snips, copied pictures).
     Image { png: String },
+    /// Files or folders copied in a file manager. Only the list travels here;
+    /// the contents are pulled over parallel data connections when needed.
+    Files { manifest: Manifest },
 }
 
 /// Mouse buttons on the wire.
@@ -41,8 +44,17 @@ pub enum ToServer {
     FilesGrabbed {
         files: Vec<String>,
     },
-    File {
-        m: FileMsg,
+    /// First message on a file-transfer data connection (instead of Hello).
+    DataHello {
+        id: u64,
+    },
+    /// Files copied on this client (sent when the mouse leaves it).
+    ClipboardFiles {
+        manifest: Manifest,
+    },
+    /// Files dragged from this client and dropped on the server.
+    DropOffer {
+        manifest: Manifest,
     },
 }
 
@@ -67,5 +79,10 @@ pub enum ToClient {
     FilesGrab,
     /// The drag was dropped on another screen: send these files to the server.
     FilesSend { paths: Vec<String> },
-    File { m: FileMsg },
+    /// Files copied on the server: pull them, then put them on the clipboard.
+    ClipboardFiles { manifest: Manifest },
+    /// Files dragged from the server and dropped here: pull them into place.
+    DropOffer { manifest: Manifest },
+    /// Open `count` data connections and serve transfer `id` from the outbox.
+    OpenData { id: u64, count: u8 },
 }

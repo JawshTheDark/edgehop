@@ -42,6 +42,14 @@ impl Engine {
     }
 }
 
+/// A file transfer in progress (shown in the header).
+pub struct TransferStatus {
+    pub label: String,
+    pub total: u64,
+    pub done: Arc<std::sync::atomic::AtomicU64>,
+    pub started: std::time::Instant,
+}
+
 pub struct AppState {
     pub config: Mutex<Config>,
     pub status: Mutex<String>,
@@ -55,6 +63,7 @@ pub struct AppState {
     pub logs: Mutex<VecDeque<String>>,
     pub ctx: Mutex<Option<eframe::egui::Context>>,
     pub engine: Mutex<Option<Engine>>,
+    pub transfer: Mutex<Option<TransferStatus>>,
 }
 
 impl AppState {
@@ -72,6 +81,7 @@ impl AppState {
             logs: Mutex::new(VecDeque::new()),
             ctx: Mutex::new(None),
             engine: Mutex::new(None),
+            transfer: Mutex::new(None),
         })
     }
 
@@ -138,6 +148,30 @@ impl AppState {
         *lk(&self.pairing_code) = None;
         *lk(&self.active_screen) = String::new();
         self.set_status("Stopped", false);
+    }
+
+    /// Start showing a transfer; returns the byte counter to advance.
+    pub fn begin_transfer(&self, label: String, total: u64) -> Arc<std::sync::atomic::AtomicU64> {
+        let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        log::info!("{label} ({})", crate::files::human(total));
+        *lk(&self.transfer) =
+            Some(TransferStatus { label, total, done: done.clone(), started: std::time::Instant::now() });
+        self.repaint();
+        done
+    }
+
+    pub fn end_transfer(&self) {
+        if let Some(t) = lk(&self.transfer).take() {
+            let secs = t.started.elapsed().as_secs_f64().max(0.001);
+            let bytes = t.done.load(std::sync::atomic::Ordering::Relaxed);
+            log::info!(
+                "transfer finished: {} in {:.1} s ({}/s)",
+                crate::files::human(bytes),
+                secs,
+                crate::files::human((bytes as f64 / secs) as u64)
+            );
+        }
+        self.repaint();
     }
 
     pub fn is_running(&self) -> bool {

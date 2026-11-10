@@ -20,6 +20,7 @@ mod proto;
 mod recovery;
 mod server;
 mod state;
+mod transfer;
 mod tray;
 #[cfg(windows)]
 mod win32;
@@ -32,6 +33,24 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let minimized = args.iter().any(|a| a == "--minimized");
     let headless = args.iter().any(|a| a == "--headless");
+    // Transfer speed test between two computers (see transfer.rs).
+    if let Some(i) = args.iter().position(|a| a == "--bench-serve") {
+        let path = std::path::PathBuf::from(args.get(i + 1).expect("--bench-serve <file or folder>"));
+        if let Err(e) = transfer::bench_serve(&path) {
+            eprintln!("bench: {e}");
+        }
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--bench-fetch") {
+        let host = args.get(i + 1).expect("--bench-fetch <host> [connections...]");
+        let counts: Vec<usize> = args[i + 2..].iter().filter_map(|a| a.parse().ok()).collect();
+        for n in if counts.is_empty() { vec![4] } else { counts } {
+            if let Err(e) = transfer::bench_fetch(host, n) {
+                eprintln!("bench with {n} connection(s): {e}");
+            }
+        }
+        return;
+    }
     if let Some(i) = args.iter().position(|a| a == "--write-icon") {
         let path = args.get(i + 1).map(String::as_str).unwrap_or("edgehop.png");
         std::fs::write(path, icon::png(256)).expect("write icon");

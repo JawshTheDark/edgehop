@@ -8,7 +8,7 @@
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use snow::{Builder, HandshakeState, StatelessTransportState};
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -65,7 +65,7 @@ fn write_raw(s: &mut TcpStream, data: &[u8]) -> io::Result<()> {
     s.write_all(&buf)
 }
 
-fn read_raw(s: &mut TcpStream) -> io::Result<Vec<u8>> {
+fn read_raw(s: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut l = [0u8; 2];
     s.read_exact(&mut l)?;
     let mut b = vec![0u8; u16::from_be_bytes(l) as usize];
@@ -81,7 +81,7 @@ pub struct FrameSender {
 }
 
 pub struct FrameReceiver {
-    stream: TcpStream,
+    stream: BufReader<TcpStream>,
     t: Arc<Mutex<StatelessTransportState>>,
     nonce: u64,
     pending: Vec<u8>,
@@ -115,9 +115,43 @@ impl FrameSender {
         }
         self.stream.write_all(&out)
     }
+
+    /// Raw bytes (no JSON framing), split into Noise messages, one socket write.
+    /// Used on file-transfer connections.
+    pub fn send_data(&mut self, data: &[u8]) -> io::Result<()> {
+        let mut out = Vec::with_capacity(data.len() + (data.len() / CHUNK + 1) * 18);
+        {
+            let t = self.t.lock().unwrap_or_else(|e| e.into_inner());
+            for chunk in data.chunks(CHUNK) {
+                let n = t.write_message(self.nonce, chunk, &mut self.buf).map_err(err)?;
+                self.nonce += 1;
+                out.extend_from_slice(&(n as u16).to_be_bytes());
+                out.extend_from_slice(&self.buf[..n]);
+            }
+        }
+        self.stream.write_all(&out)
+    }
 }
 
 impl FrameReceiver {
+    /// Read exactly `len` raw bytes sent with `send_data` (into `out`).
+    pub fn recv_data(&mut self, out: &mut Vec<u8>, len: usize) -> io::Result<()> {
+        out.clear();
+        while out.len() < len {
+            let ct = read_raw(&mut self.stream)?;
+            let n = {
+                let t = self.t.lock().unwrap_or_else(|e| e.into_inner());
+                t.read_message(self.nonce, &ct, &mut self.buf).map_err(err)?
+            };
+            self.nonce += 1;
+            out.extend_from_slice(&self.buf[..n]);
+        }
+        if out.len() != len {
+            return Err(err("transfer framing out of sync"));
+        }
+        Ok(())
+    }
+
     pub fn recv<T: DeserializeOwned>(&mut self) -> io::Result<T> {
         loop {
             if self.pending.len() >= 4 {
@@ -142,7 +176,7 @@ impl FrameReceiver {
     }
 
     pub fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
-        self.stream.set_read_timeout(d)
+        self.stream.get_ref().set_read_timeout(d)
     }
 }
 
@@ -155,7 +189,13 @@ fn finish(s: TcpStream, hs: HandshakeState) -> io::Result<Handshaked> {
     let s2 = s.try_clone()?;
     Ok(Handshaked {
         tx: FrameSender { stream: s, t: t.clone(), nonce: 0, buf: vec![0; MAX_NOISE_MSG] },
-        rx: FrameReceiver { stream: s2, t, nonce: 0, pending: Vec::new(), buf: vec![0; MAX_NOISE_MSG] },
+        rx: FrameReceiver {
+            stream: BufReader::with_capacity(256 * 1024, s2),
+            t,
+            nonce: 0,
+            pending: Vec::new(),
+            buf: vec![0; MAX_NOISE_MSG],
+        },
         remote_key,
         code,
     })

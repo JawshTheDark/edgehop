@@ -4,6 +4,9 @@ use crate::config::{Config, Peer};
 use crate::layout::{Monitor, Rect, ScreenPos};
 use crate::net::{self, Announce};
 use crate::files;
+use crate::net::{FrameReceiver, FrameSender};
+use crate::transfer::{self, Manifest};
+use std::path::{Path, PathBuf};
 use crate::recovery::{self, now_ms};
 use crate::proto::*;
 use crate::state::{lk, AppState, ConnectedInfo, PairRequest};
@@ -65,7 +68,7 @@ pub enum FileJob {
     SendToClient { name: String, paths: Vec<String> },
 }
 
-/// Outgoing file data for one client, sent between input messages.
+/// Large messages (clipboard images) for one client, sent between input messages.
 pub struct Bulk {
     q: Mutex<VecDeque<ToClient>>,
     cv: Condvar,
@@ -75,18 +78,6 @@ pub struct Bulk {
 impl Bulk {
     pub fn new() -> Arc<Bulk> {
         Arc::new(Bulk { q: Mutex::new(VecDeque::new()), cv: Condvar::new(), closed: AtomicBool::new(false) })
-    }
-    /// Queue a message, waiting while the queue is full (backpressure for the file reader).
-    pub fn push(&self, m: ToClient) -> std::io::Result<()> {
-        let mut q = lk(&self.q);
-        while q.len() >= 16 && !self.closed.load(Ordering::Relaxed) {
-            q = self.cv.wait_timeout(q, Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
-        }
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(std::io::Error::other("connection closed"));
-        }
-        q.push_back(m);
-        Ok(())
     }
     /// Queue without waiting for room (rare, single large messages).
     pub fn push_now(&self, m: ToClient) {
@@ -274,6 +265,11 @@ impl Core {
         None
     }
 
+    /// Send to a client; false if it isn't connected.
+    pub fn send_to(&self, name: &str, msg: ToClient) -> bool {
+        self.clients.get(name).map_or(false, |s| s.tx.send(msg).is_ok())
+    }
+
     fn send(&self, name: &str, msg: ToClient) {
         if let Some(s) = self.clients.get(name) {
             let _ = s.tx.send(msg);
@@ -300,6 +296,12 @@ impl Core {
                     }
                     // Images can be megabytes: send them in the gaps between input.
                     Clip::Image { png } => slot.bulk.push_now(ToClient::ClipboardImage { png }),
+                    // Only the file list; the client pulls the contents itself.
+                    Clip::Files { manifest } => {
+                        if manifest.from != name {
+                            let _ = slot.tx.send(ToClient::ClipboardFiles { manifest });
+                        }
+                    }
                 }
             }
         }
@@ -800,6 +802,8 @@ pub struct Shared {
     pub app: Arc<AppState>,
     pub core: Mutex<Core>,
     streams: Mutex<HashMap<u64, TcpStream>>,
+    /// Transfers we're pulling from a client, waiting for its data connections.
+    inbound: Mutex<HashMap<u64, mpsc::Sender<(FrameSender, FrameReceiver)>>>,
     next_id: AtomicU64,
     private_key: Vec<u8>,
     stop: Arc<AtomicBool>,
@@ -845,6 +849,7 @@ impl ServerEngine {
                 app: app.clone(),
                 core: Mutex::new(core),
                 streams: Mutex::new(HashMap::new()),
+                inbound: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
                 private_key: cfg.private_key_bytes(),
                 stop: stop.clone(),
@@ -900,9 +905,24 @@ impl ServerEngine {
                                 }
                                 ours = Some(seq);
                             }
-                            let clip = match crate::clipboard::get().filter(|t| !t.is_empty()) {
-                                Some(text) => Some(Clip::Text { text }),
-                                None => crate::clipboard::get_image_png().map(|p| Clip::Image { png: files::b64(&p) }),
+                            let clip = if let Some(paths) = crate::clipboard::get_files() {
+                                if transfer::is_received(&paths) {
+                                    None // files we just received: nothing new
+                                } else {
+                                    let me = lk(&s.core).me.clone();
+                                    match transfer::outbox().offer(&me, &paths) {
+                                        Ok(manifest) => Some(Clip::Files { manifest }),
+                                        Err(e) => {
+                                            log::warn!("couldn't read the copied files: {e}");
+                                            None
+                                        }
+                                    }
+                                }
+                            } else {
+                                match crate::clipboard::get().filter(|t| !t.is_empty()) {
+                                    Some(text) => Some(Clip::Text { text }),
+                                    None => crate::clipboard::get_image_png().map(|p| Clip::Image { png: files::b64(&p) }),
+                                }
                             };
                             if let Some(c) = clip {
                                 lk(&s.core).local_clipboard(c);
@@ -915,6 +935,11 @@ impl ServerEngine {
                                     if let Some(bytes) = files::unb64(&png) {
                                         crate::clipboard::set_image_png(&bytes);
                                         log::info!("clipboard image received ({})", files::human(bytes.len() as u64));
+                                    }
+                                }
+                                Clip::Files { manifest } => {
+                                    if manifest.from != lk(&s.core).me {
+                                        receive_clipboard_files(s.clone(), manifest);
                                     }
                                 }
                             }
@@ -1033,7 +1058,11 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let raw = stream.try_clone()?;
     let net::Handshaked { mut tx, mut rx, remote_key, code } = net::accept_handshake(stream, &s.private_key)?;
-    let ToServer::Hello { name, width, height, os, .. } = rx.recv::<ToServer>()? else {
+    let first = rx.recv::<ToServer>()?;
+    if let ToServer::DataHello { id } = first {
+        return data_connection(s, tx, rx, &remote_key, id);
+    }
+    let ToServer::Hello { name, width, height, os, .. } = first else {
         return Err(std::io::Error::other("expected hello"));
     };
     let mut name = sanitize_name(&name);
@@ -1163,7 +1192,6 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     });
 
     rx.set_read_timeout(Some(Duration::from_secs(12)))?;
-    let mut sink: Option<files::Sink> = None;
     let result = loop {
         let msg = rx.recv::<ToServer>();
         if msg.is_ok() {
@@ -1173,7 +1201,10 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
             Ok(ToServer::Clipboard { text }) => lk(&s.core).client_clipboard(&name, Clip::Text { text }),
             Ok(ToServer::ClipboardImage { png }) => lk(&s.core).client_clipboard(&name, Clip::Image { png }),
             Ok(ToServer::FilesGrabbed { files }) => lk(&s.core).client_grab_result(&name, files),
-            Ok(ToServer::File { m }) => receive_files(s, &mut sink, m),
+            Ok(ToServer::ClipboardFiles { manifest }) => {
+                lk(&s.core).client_clipboard(&name, Clip::Files { manifest })
+            }
+            Ok(ToServer::DropOffer { manifest }) => receive_drop(s.clone(), manifest),
             Ok(_) => {}
             Err(e) => break e,
         }
@@ -1199,70 +1230,130 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Stream files to a client in the background, between its input messages.
-fn send_files(s: &Arc<Shared>, name: String, paths: Vec<String>) {
-    let (bulk, me) = {
-        let core = lk(&s.core);
-        (core.clients.get(&name).map(|c| c.bulk.clone()), core.me.clone())
-    };
-    let Some(bulk) = bulk else { return };
+/// A client opened a file-transfer connection for transfer `id`.
+fn data_connection(
+    s: &Arc<Shared>,
+    mut tx: FrameSender,
+    mut rx: FrameReceiver,
+    remote_key: &str,
+    id: u64,
+) -> std::io::Result<()> {
+    if !s.app.cfg().trusted_clients.iter().any(|p| p.key == remote_key) {
+        return Err(std::io::Error::other("transfer connection from an unpaired computer"));
+    }
+    rx.set_read_timeout(Some(Duration::from_secs(60)))?;
+    if let Some(offered) = transfer::outbox().get(id) {
+        // We have the files: answer the client's piece requests.
+        transfer::serve(&mut tx, &mut rx, &offered)?;
+        return Ok(());
+    }
+    let waiting = lk(&s.inbound).get(&id).cloned();
+    match waiting {
+        Some(chan) => {
+            let _ = chan.send((tx, rx));
+            Ok(())
+        }
+        None => Err(std::io::Error::other("unknown transfer")),
+    }
+}
+
+/// Pull files from the client that has them, over parallel connections.
+fn fetch_from_client(s: &Arc<Shared>, m: &Manifest, dest: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let n = s.app.cfg().transfer_conns.clamp(1, 16);
+    let (ctx, crx) = mpsc::channel();
+    lk(&s.inbound).insert(m.id, ctx);
+    let asked = lk(&s.core).send_to(&m.from, ToClient::OpenData { id: m.id, count: n });
+    let mut conns = Vec::new();
+    if asked {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while conns.len() < n as usize {
+            match crx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(c) => conns.push(c),
+                Err(_) => break,
+            }
+        }
+    }
+    lk(&s.inbound).remove(&m.id);
+    if conns.is_empty() {
+        return Err(std::io::Error::other(format!("{} didn't open a transfer connection", m.from)));
+    }
+    let done = s.app.begin_transfer(format!("Receiving {} from {}", m.describe(), m.from), m.total);
+    let r = transfer::fetch(m, conns, dest, &done);
+    s.app.end_transfer();
+    r
+}
+
+/// Files copied on a client: pull them here and put them on the clipboard.
+fn receive_clipboard_files(s: Arc<Shared>, m: Manifest) {
     let app = s.app.clone();
+    let limit = app.cfg().clipboard_files_max_gb as u64 * (1 << 30);
+    if m.total > limit {
+        log::info!("{} copied on {} is over the clipboard limit; drag it instead", m.describe(), m.from);
+        app.set_status(format!("{} on {} is too big for the clipboard; drag it instead", m.describe(), m.from), true);
+        return;
+    }
+    if let Some(paths) = transfer::cached(&m) {
+        crate::clipboard::set_files(&paths);
+        transfer::mark_received(&paths);
+        return;
+    }
+    if !transfer::begin_fetch(&m) {
+        return;
+    }
     thread::spawn(move || {
-        let paths: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
-        app.set_status(format!("Sending files to {name}…"), true);
-        match files::stream(&me, &paths, |m| bulk.push(ToClient::File { m })) {
-            Ok(bytes) => {
-                log::info!("sent {} to {name}", files::human(bytes));
-                app.set_status(format!("Sent {} to {name}", files::human(bytes)), true);
+        let r = fetch_from_client(&s, &m, &transfer::new_drop_dir());
+        transfer::end_fetch(&m);
+        match r {
+            Ok(paths) => {
+                transfer::remember(&m, &paths);
+                crate::clipboard::set_files(&paths);
+                transfer::mark_received(&paths);
+                app.set_status(format!("{} from {} is ready to paste", m.describe(), m.from), true);
             }
             Err(e) => {
-                let _ = bulk.push(ToClient::File { m: files::FileMsg::Abort { reason: e.to_string() } });
-                log::warn!("sending files to {name} failed: {e}");
-                app.set_status(format!("Sending files to {name} failed: {e}"), false);
+                log::warn!("copying {} from {} failed: {e}", m.describe(), m.from);
+                app.set_status(format!("Copying files from {} failed: {e}", m.from), false);
             }
         }
     });
 }
 
-/// Files dropped here from a client: copy them into the folder they were
-/// dropped on (desktop or an Explorer window) and put them on the clipboard.
-fn receive_files(s: &Arc<Shared>, sink: &mut Option<files::Sink>, m: files::FileMsg) {
-    let app = &s.app;
-    if let files::FileMsg::Begin { from, total, .. } = &m {
-        app.set_status(format!("Receiving {} from {from}…", files::human(*total)), true);
-    }
-    match files::feed(sink, m) {
-        Ok(Some(done)) => {
-            let what = files::describe(&done.items, done.bytes);
-            log::info!("received {what} from {}", done.from);
-            let point = lk(&s.core).drop_point.take();
-            let folder = point.and_then(|(x, y)| crate::platform::folder_at(x, y));
-            let placed = folder.as_ref().map(|dir| (dir, files::copy_into(&done.items, dir)));
-            match placed {
-                Some((dir, Ok(paths))) => {
-                    log::info!("dropped into {}", dir.display());
-                    crate::clipboard::set_files(&paths);
-                    app.set_status(format!("{what} from {} dropped into {}", done.from, dir.display()), true);
-                }
-                Some((dir, Err(e))) => {
-                    log::warn!("couldn't copy into {}: {e}", dir.display());
-                    crate::clipboard::set_files(&done.items);
-                    app.set_status(format!("{what} from {} copied — paste with Ctrl+V", done.from), true);
-                }
-                None => {
-                    crate::clipboard::set_files(&done.items);
-                    app.set_status(
-                        format!("{what} from {} copied — click a folder, then Ctrl+V", done.from),
-                        true,
-                    );
-                }
+/// Files dragged from a client and dropped here: into the folder under the
+/// drop point (desktop / Explorer window), otherwise onto the clipboard.
+fn receive_drop(s: Arc<Shared>, m: Manifest) {
+    let point = lk(&s.core).drop_point.take();
+    let folder = point.and_then(|(x, y)| crate::platform::folder_at(x, y));
+    thread::spawn(move || {
+        let dest = folder.clone().unwrap_or_else(transfer::new_drop_dir);
+        match fetch_from_client(&s, &m, &dest) {
+            Ok(paths) => {
+                crate::clipboard::set_files(&paths);
+                transfer::mark_received(&paths);
+                let msg = match &folder {
+                    Some(dir) => format!("{} from {} dropped into {}", m.describe(), m.from, dir.display()),
+                    None => format!("{} from {} is ready to paste", m.describe(), m.from),
+                };
+                s.app.set_status(msg, true);
+            }
+            Err(e) => {
+                log::warn!("receiving dropped files failed: {e}");
+                s.app.set_status(format!("Receiving files from {} failed: {e}", m.from), false);
             }
         }
-        Ok(None) => {}
-        Err(e) => {
-            log::warn!("receiving files failed: {e}");
-            app.set_status(format!("Receiving files failed: {e}"), false);
+    });
+}
+
+/// Files dragged from here and dropped on client `name`: offer them; the
+/// client pulls them over parallel connections.
+fn send_files(s: &Arc<Shared>, name: String, paths: Vec<String>) {
+    let me = lk(&s.core).me.clone();
+    let paths: Vec<PathBuf> = paths.into_iter().map(Into::into).collect();
+    match transfer::outbox().offer(&me, &paths) {
+        Ok(manifest) => {
+            log::info!("offering {} to {name}", manifest.describe());
+            lk(&s.core).send_to(&name, ToClient::DropOffer { manifest });
         }
+        Err(e) => log::warn!("couldn't read the dragged files: {e}"),
     }
 }
 

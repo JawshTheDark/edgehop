@@ -1,5 +1,6 @@
 //! Client: connects to the server and replays keyboard/mouse events locally.
 use crate::files;
+use crate::transfer::{self, Manifest};
 use crate::recovery::now_ms;
 use crate::inject::{self, Injector};
 use crate::net;
@@ -148,6 +149,50 @@ struct Held {
     buttons: HashSet<u8>,
 }
 
+/// Opens extra encrypted connections to the server for file transfers.
+#[derive(Clone)]
+struct Dialer {
+    addr: SocketAddr,
+    key: Vec<u8>,
+    server_key: String,
+}
+
+impl Dialer {
+    fn open(&self, id: u64) -> io::Result<(net::FrameSender, net::FrameReceiver)> {
+        let s = TcpStream::connect_timeout(&self.addr, Duration::from_secs(4))?;
+        s.set_read_timeout(Some(Duration::from_secs(60)))?;
+        let net::Handshaked { mut tx, rx, remote_key, .. } = net::connect_handshake(s, &self.key)?;
+        if remote_key != self.server_key {
+            return Err(io::Error::other("server identity changed"));
+        }
+        tx.send(&ToServer::DataHello { id })?;
+        Ok((tx, rx))
+    }
+
+    /// Open up to `n` connections in parallel.
+    fn open_many(&self, id: u64, n: usize) -> Vec<(net::FrameSender, net::FrameReceiver)> {
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let d = self.clone();
+                thread::spawn(move || d.open(id))
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()?.ok()).collect()
+    }
+}
+
+/// Pull files the server offered, over parallel connections.
+fn fetch_from_server(app: &AppState, dialer: &Dialer, m: &Manifest, dest: &std::path::Path) -> io::Result<Vec<std::path::PathBuf>> {
+    let conns = dialer.open_many(m.id, app.cfg().transfer_conns.clamp(1, 16) as usize);
+    if conns.is_empty() {
+        return Err(io::Error::other("couldn't open a transfer connection"));
+    }
+    let done = app.begin_transfer(format!("Receiving {} from {}", m.describe(), m.from), m.total);
+    let r = transfer::fetch(m, conns, dest, &done);
+    app.end_transfer();
+    r
+}
+
 fn resolve(addr: &str) -> io::Result<SocketAddr> {
     let a = addr.trim();
     let with_port = if a.parse::<SocketAddr>().is_ok() || (a.contains(':') && !a.contains("::") && a.rsplit(':').next().map_or(false, |p| p.parse::<u16>().is_ok())) {
@@ -241,8 +286,7 @@ fn session(
     // background threads that answer drags and stream files.
     let tx = Arc::new(Mutex::new(tx));
     rx.set_read_timeout(None)?;
-    let mut sink: Option<files::Sink> = None;
-    let mut drop_into: Option<std::path::PathBuf> = None;
+    let dialer = Dialer { addr, key: cfg.private_key_bytes(), server_key: remote_key.clone() };
     let Held { keys, buttons } = held;
     // Shared with the background clipboard threads.
     let last_clip: Arc<Mutex<Option<Clip>>> = Arc::new(Mutex::new(None));
@@ -318,15 +362,29 @@ fn session(
                     // Clipboard helpers can be slow (or stuck while the screen is
                     // locked): read it off the input thread.
                     let (tx2, last) = (tx.clone(), last_clip.clone());
+                    let me = cfg.name.clone();
                     thread::spawn(move || {
-                        let text = crate::clipboard::get().filter(|t| !t.trim().is_empty());
-                        let clip = match text {
-                            Some(t) if t.contains("edgehop-probe") => return,
-                            Some(text) => Clip::Text { text },
-                            None => match crate::clipboard::get_image_png() {
-                                Some(p) => Clip::Image { png: files::b64(&p) },
-                                None => return,
-                            },
+                        let clip = if let Some(paths) = crate::clipboard::get_files() {
+                            if transfer::is_received(&paths) {
+                                return; // files we received: nothing new to send back
+                            }
+                            match transfer::outbox().offer(&me, &paths) {
+                                Ok(manifest) => Clip::Files { manifest },
+                                Err(e) => {
+                                    log::warn!("couldn't read the copied files: {e}");
+                                    return;
+                                }
+                            }
+                        } else {
+                            let text = crate::clipboard::get().filter(|t| !t.trim().is_empty());
+                            match text {
+                                Some(t) if t.contains("edgehop-probe") => return,
+                                Some(text) => Clip::Text { text },
+                                None => match crate::clipboard::get_image_png() {
+                                    Some(p) => Clip::Image { png: files::b64(&p) },
+                                    None => return,
+                                },
+                            }
                         };
                         let fresh = match (&*lk(&last), &clip) {
                             (Some(Clip::Text { text: a }), Clip::Text { text: b }) => a.trim() != b.trim(),
@@ -337,6 +395,7 @@ fn session(
                             let msg = match clip {
                                 Clip::Text { text } => ToServer::Clipboard { text },
                                 Clip::Image { png } => ToServer::ClipboardImage { png },
+                                Clip::Files { manifest } => ToServer::ClipboardFiles { manifest },
                             };
                             let _ = lk(&tx2).send(&msg);
                         }
@@ -388,57 +447,105 @@ fn session(
                 });
             }
             ToClient::FilesSend { paths } => {
-                let (tx2, app2, me) = (tx.clone(), app.clone(), cfg.name.clone());
-                let to = server_name.clone();
+                // A drag from here was dropped on the server: offer the files.
+                let (tx2, me) = (tx.clone(), cfg.name.clone());
                 thread::spawn(move || {
                     let paths: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
-                    app2.set_status(format!("Sending files to {to}…"), true);
-                    let r = files::stream(&me, &paths, |m| lk(&tx2).send(&ToServer::File { m }));
+                    match transfer::outbox().offer(&me, &paths) {
+                        Ok(manifest) => {
+                            let _ = lk(&tx2).send(&ToServer::DropOffer { manifest });
+                        }
+                        Err(e) => log::warn!("couldn't read the dragged files: {e}"),
+                    }
+                });
+            }
+            ToClient::OpenData { id, count } => {
+                // The server is pulling files from us.
+                match transfer::outbox().get(id) {
+                    Some(offered) => {
+                        for _ in 0..count.clamp(1, 16) {
+                            let (d, o) = (dialer.clone(), offered.clone());
+                            thread::spawn(move || match d.open(id) {
+                                Ok((mut dtx, mut drx)) => {
+                                    if let Err(e) = transfer::serve(&mut dtx, &mut drx, &o) {
+                                        log::warn!("transfer connection: {e}");
+                                    }
+                                }
+                                Err(e) => log::warn!("couldn't open a transfer connection: {e}"),
+                            });
+                        }
+                    }
+                    None => log::warn!("server asked for files we no longer offer"),
+                }
+            }
+            ToClient::ClipboardFiles { manifest } => {
+                let now = app.cfg();
+                if !now.clipboard {
+                    continue;
+                }
+                if manifest.from != server_name {
+                    log::info!("files copied on {} can only be pasted on {} for now", manifest.from, server_name);
+                    continue;
+                }
+                if manifest.total > now.clipboard_files_max_gb as u64 * (1 << 30) {
+                    let msg = format!("{} on {} is too big for the clipboard; drag it instead", manifest.describe(), manifest.from);
+                    files::notify("Edgehop", &msg);
+                    app.set_status(msg, true);
+                    continue;
+                }
+                if let Some(paths) = transfer::cached(&manifest) {
+                    crate::clipboard::set_files(&paths);
+                    transfer::mark_received(&paths);
+                    *lk(&last_clip) = Some(Clip::Files { manifest });
+                    continue;
+                }
+                if !transfer::begin_fetch(&manifest) {
+                    continue;
+                }
+                let (app2, d, last) = (app.clone(), dialer.clone(), last_clip.clone());
+                thread::spawn(move || {
+                    let r = fetch_from_server(&app2, &d, &manifest, &transfer::new_drop_dir());
+                    transfer::end_fetch(&manifest);
                     match r {
-                        Ok(bytes) => app2.set_status(format!("Sent {} to {to}", files::human(bytes)), true),
+                        Ok(paths) => {
+                            transfer::remember(&manifest, &paths);
+                            crate::clipboard::set_files(&paths);
+                            transfer::mark_received(&paths);
+                            let msg = format!("{} from {} is ready to paste", manifest.describe(), manifest.from);
+                            *lk(&last) = Some(Clip::Files { manifest });
+                            files::notify("Files ready", &msg);
+                            app2.set_status(msg, true);
+                        }
                         Err(e) => {
-                            let m = files::FileMsg::Abort { reason: e.to_string() };
-                            let _ = lk(&tx2).send(&ToServer::File { m });
-                            app2.set_status(format!("Sending files failed: {e}"), false);
+                            log::warn!("copying files failed: {e}");
+                            app2.set_status(format!("Copying files failed: {e}"), false);
                         }
                     }
                 });
             }
-            ToClient::File { m } => {
-                if let files::FileMsg::Begin { from, total, .. } = &m {
-                    app.set_status(format!("Receiving {} from {from}…", files::human(*total)), true);
-                    // The drop just happened: remember which folder is under the pointer.
-                    drop_into = hooks.and_then(|h| h.drop_folder());
-                }
-                match files::feed(&mut sink, m) {
-                    Ok(Some(done)) => {
-                        let what = files::describe(&done.items, done.bytes);
-                        log::info!("received {what} from {}", done.from);
-                        let placed = drop_into.take().map(|dir| (files::copy_into(&done.items, &dir), dir));
-                        let (on_clip, msg) = match placed {
-                            Some((Ok(paths), dir)) => {
-                                log::info!("dropped into {}", dir.display());
-                                (paths, format!("{what} dropped into {}", dir.display()))
-                            }
-                            Some((Err(e), dir)) => {
-                                log::warn!("couldn't copy into {}: {e}", dir.display());
-                                (done.items.clone(), format!("{what} is on the clipboard. Paste with Ctrl+V."))
-                            }
-                            None => (done.items.clone(), format!("{what} is on the clipboard. Paste with Ctrl+V.")),
-                        };
-                        if let Some(text) = crate::clipboard::set_files(&on_clip) {
-                            // don't echo the file list back as text
-                            *lk(&last_clip) = Some(Clip::Text { text });
+            ToClient::DropOffer { manifest } => {
+                // The drop just happened: the folder under the pointer is the target.
+                let folder = hooks.and_then(|h| h.drop_folder());
+                let (app2, d) = (app.clone(), dialer.clone());
+                thread::spawn(move || {
+                    let dest = folder.clone().unwrap_or_else(transfer::new_drop_dir);
+                    match fetch_from_server(&app2, &d, &manifest, &dest) {
+                        Ok(paths) => {
+                            crate::clipboard::set_files(&paths);
+                            transfer::mark_received(&paths);
+                            let msg = match &folder {
+                                Some(dir) => format!("{} dropped into {}", manifest.describe(), dir.display()),
+                                None => format!("{} is on the clipboard. Paste with Ctrl+V.", manifest.describe()),
+                            };
+                            files::notify(&format!("Files from {}", manifest.from), &msg);
+                            app2.set_status(msg, true);
                         }
-                        files::notify(&format!("Files from {}", done.from), &msg);
-                        app.set_status(msg, true);
+                        Err(e) => {
+                            log::warn!("receiving dropped files failed: {e}");
+                            app2.set_status(format!("Receiving files failed: {e}"), false);
+                        }
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        log::warn!("receiving files failed: {e}");
-                        app.set_status(format!("Receiving files failed: {e}"), false);
-                    }
-                }
+                });
             }
         }
     }

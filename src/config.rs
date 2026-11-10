@@ -32,6 +32,10 @@ pub struct Config {
     pub dim_when_away: bool,
     /// Percent of the normal brightness while dimmed.
     pub dim_level: u8,
+    /// Parallel connections per file transfer.
+    pub transfer_conns: u8,
+    /// Files copied to the clipboard are pulled automatically up to this size.
+    pub clipboard_files_max_gb: u32,
 
     // --- server ---
     pub port: u16,
@@ -62,6 +66,8 @@ impl Default for Config {
             hide_pointer_when_away: true,
             dim_when_away: true,
             dim_level: 25,
+            transfer_conns: crate::transfer::DEFAULT_CONNS,
+            clipboard_files_max_gb: 20,
             port: net::DEFAULT_PORT,
             screens: Vec::new(),
             trusted_clients: Vec::new(),
