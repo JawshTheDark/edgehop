@@ -133,6 +133,12 @@ kept as `edgehop.1.log`.
 To measure network transfer speed between two computers:
 `edgehop --bench-serve <big file>` on one, `edgehop --bench-fetch <its IP> 1 4 8` on the other.
 
+To check that a computer's clipboard and input work at all, without a server:
+`edgehop --self-test` (it briefly moves the pointer). Add `--type` with an empty
+text editor in front to also type a sentence, copy it and check the result.
+CI runs this on a real Mac for every change (`packaging/macos/smoke-test.sh`);
+its screenshots are in each run's *smoke-macos* artifact.
+
 
 - **Client says "Searching…" forever**: UDP broadcast may be blocked (guest Wi-Fi,
   VPN, or Windows firewall on a *Public* network). Type the server's IP into
