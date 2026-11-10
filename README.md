@@ -42,10 +42,11 @@ Grab the latest build from the
 
 | Computer | File | Install |
 |---|---|---|
-| Windows (the one with the keyboard and mouse) | `Edgehop-<version>-windows-x64.zip` | Unzip, right-click `install.ps1` → *Run with PowerShell* |
-| Ubuntu / Debian | `edgehop_<version>_amd64.deb` | `sudo apt install ./edgehop_*.deb`, then **log out and back in once** |
-| Other Linux | `edgehop-<version>-linux-x86_64.tar.gz` | Run `edgehop`; copy `60-edgehop-uinput.rules` to `/etc/udev/rules.d/` |
+| Windows | `Edgehop-<version>-windows-x64.zip` | Unzip, right-click `install.ps1` → *Run with PowerShell* |
 | macOS (Apple silicon and Intel) | `Edgehop-<version>-macos-universal.zip` | Move `Edgehop.app` to Applications |
+| Ubuntu / Debian | `edgehop_<version>_amd64.deb` (`_arm64` for ARM) | `sudo apt install ./edgehop_*.deb`, then **log out and back in once** |
+| Fedora | `edgehop-<version>-1.x86_64.rpm` (`.aarch64` for ARM, e.g. Asahi Linux on a Mac) | `sudo dnf install ./edgehop-*.rpm`, then **log out and back in once** |
+| Other Linux | `edgehop-<version>-linux-x86_64.tar.gz` (`-aarch64` for ARM) | Unpack, run `./install.sh`, then log out and back in once |
 
 The builds aren't code-signed yet, so the first launch needs one extra click:
 on Windows, SmartScreen's *More info → Run anyway*; on macOS, right-click the
@@ -55,8 +56,10 @@ Edgehop under System Settings → Privacy & Security → **Accessibility**.
 The Windows installer copies the app to `%LOCALAPPDATA%\Programs\Edgehop`, adds a
 Start Menu entry, and asks for admin once to allow it through the firewall on
 **Private** networks. Make sure your Wi-Fi/Ethernet is set to *Private* in
-Windows settings. The Linux package adds a udev rule so your user can create
-virtual input devices (that's why you log out and in once).
+Windows settings. The Linux packages add udev rules so your user can create
+virtual input devices and read keyboards and mice (that's why you log out and
+in once). For clipboard sharing on Linux, install `wl-clipboard` (Wayland) or
+`xclip` (X11); the packages recommend them.
 
 ## Build from source
 

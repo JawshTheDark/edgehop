@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-22.04, macos-latest]
+        os: [windows-latest, ubuntu-22.04, ubuntu-22.04-arm, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -32,8 +32,30 @@ jobs:
       - name: Linux sharing self-test
         if: runner.os == 'Linux'
         run: |
-          sudo modprobe uinput || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe uinput; }
-          sudo ./target/release/edgehop --self-test --sharing-only
+          # The runner needs the uinput module for the virtual test keyboard+mouse.
+          if sudo modprobe uinput || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe uinput; }; then
+            sudo ./target/release/edgehop --self-test --sharing-only
+          elif [ "$(uname -m)" = x86_64 ]; then
+            echo "no uinput module"; exit 1
+          else
+            echo "::warning::no uinput module on this $(uname -m) runner; sharing self-test skipped"
+          fi
+      # The .deb and .rpm build, and the .rpm installs and runs on real Fedora.
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          ./target/release/edgehop --write-icon packaging/linux/edgehop.png
+          cargo install cargo-deb cargo-generate-rpm --locked
+          cargo deb --no-build
+          cargo generate-rpm
+          dpkg-deb -c target/debian/*.deb
+          docker run --rm -v "$PWD/target/generate-rpm:/pkg" fedora:latest bash -c '
+            set -e
+            dnf install -y /pkg/*.rpm
+            rpm -ql edgehop
+            ls -l /usr/lib/udev/rules.d/*edgehop* /usr/lib/modules-load.d/edgehop-uinput.conf
+            edgehop --write-icon /tmp/icon.png && test -s /tmp/icon.png
+            echo "edgehop installs and runs on $(. /etc/os-release; echo $PRETTY_NAME)"'
       # Nobody on the team has a Mac, so a real one checks the app instead:
       # launch, clipboard, pointer and keyboard (see packaging/macos/smoke-test.sh).
       - name: macOS app smoke test

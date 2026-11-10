@@ -53,7 +53,15 @@ jobs:
 
   linux:
     # Older glibc: the binary also runs on newer distributions.
-    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, arch: x86_64, deb_arch: amd64 }
+          - { runner: ubuntu-22.04-arm, arch: aarch64, deb_arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      ARCH: ${{ matrix.arch }}
+      DEB_ARCH: ${{ matrix.deb_arch }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,26 +73,40 @@ jobs:
       - run: cargo test --release
       - run: cargo build --release
       - name: Sharing self-test (virtual keyboard + mouse)
+        if: hashFiles('src/server_linux.rs') != ''
         run: |
-          sudo modprobe uinput || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe uinput; }
-          if grep -q sharing-only src/selftest.rs; then sudo ./target/release/edgehop --self-test --sharing-only; fi
-      - name: Package (.deb and tarball)
+          # The runner needs the uinput module for the virtual test keyboard+mouse.
+          if sudo modprobe uinput || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe uinput; }; then
+            sudo ./target/release/edgehop --self-test --sharing-only
+          elif [ "$(uname -m)" = x86_64 ]; then
+            echo "no uinput module"; exit 1
+          else
+            echo "::warning::no uinput module on this $(uname -m) runner; sharing self-test skipped"
+          fi
+      - name: Package (.deb, .rpm and tarball)
         run: |
           ./target/release/edgehop --write-icon packaging/linux/edgehop.png
-          cargo install cargo-deb --locked
+          cargo install cargo-deb cargo-generate-rpm --locked
           cargo deb --no-build
           mkdir -p dist
-          cp target/debian/*.deb "dist/edgehop_${TAG#v}_amd64.deb"
-          name="edgehop-$TAG-linux-x86_64"
+          cp target/debian/*.deb "dist/edgehop_${TAG#v}_${DEB_ARCH}.deb"
+          if grep -q generate-rpm Cargo.toml; then
+            cargo generate-rpm
+            cp target/generate-rpm/*.rpm "dist/edgehop-${TAG#v}-1.${ARCH}.rpm"
+          fi
+          name="edgehop-$TAG-linux-$ARCH"
           mkdir -p "$name"
           cp target/release/edgehop packaging/linux/60-edgehop-uinput.rules packaging/linux/70-edgehop-input.rules packaging/linux/edgehop-uinput.conf \
              packaging/linux/edgehop.desktop packaging/linux/edgehop.png README.md "$name/"
+          [ -f packaging/linux/install.sh ] && install -m755 packaging/linux/install.sh "$name/"
           tar czf "dist/$name.tar.gz" "$name"
+          ls -la dist
       - uses: actions/upload-artifact@v4
         with:
-          name: release-linux
+          name: release-linux-${{ matrix.arch }}
           path: |
             dist/*.deb
+            dist/*.rpm
             dist/*.tar.gz
 
   macos:
@@ -143,8 +165,9 @@ jobs:
 
           ### Downloads
           - **Windows**: `Edgehop-…-windows-x64.zip`. Unzip, then right-click `install.ps1` → *Run with PowerShell*. (Or run the bare `.exe`.)
-          - **Ubuntu / Debian**: `edgehop_…_amd64.deb`. `sudo apt install ./edgehop_*.deb`, then log out and back in once.
-          - **Other Linux**: the `.tar.gz` (copy `60-edgehop-uinput.rules` to `/etc/udev/rules.d/`).
+          - **Ubuntu / Debian**: `edgehop_…_amd64.deb` (`arm64` for ARM). `sudo apt install ./edgehop_*.deb`, then log out and back in once.
+          - **Fedora**: `edgehop-…x86_64.rpm` (`aarch64` for ARM, e.g. Asahi). `sudo dnf install ./edgehop-*.rpm`, then log out and back in once.
+          - **Other Linux**: the `.tar.gz` for your CPU. Unpack it and run `./install.sh`.
           - **macOS**: unzip `Edgehop.app` into Applications, then allow it under *Privacy & Security → Accessibility*.
 
           The builds aren't code-signed yet, so Windows SmartScreen and macOS Gatekeeper will ask before the first launch.

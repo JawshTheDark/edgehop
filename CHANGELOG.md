@@ -3,6 +3,16 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.2.3] - 2026-11-10
+
+### More Linux downloads
+- **Fedora**: an `.rpm` (`sudo dnf install ./edgehop-*.rpm`). CI installs it in
+  a Fedora container and runs it before every release.
+- **ARM64 Linux** (e.g. Asahi Linux on Apple-silicon Macs, Raspberry Pi 4/5):
+  `.deb`, `.rpm` and a tarball, built and tested on ARM.
+- The tarball now has an `install.sh` that sets everything up on any
+  distribution.
+
 ## [0.2.2] - 2026-11-10
 
 ### Mac
