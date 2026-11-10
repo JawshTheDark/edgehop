@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and install kvmlink on Ubuntu/Debian. Run from the repo root:  ./packaging/linux/build-deb.sh
+# Build and install edgehop on Ubuntu/Debian. Run from the repo root:  ./packaging/linux/build-deb.sh
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -17,11 +17,11 @@ command -v cargo-deb >/dev/null 2>&1 || cargo install cargo-deb --locked
 
 echo "==> Building"
 cargo build --release
-cargo run --release --quiet -- --write-icon packaging/linux/kvmlink.png
+cargo run --release --quiet -- --write-icon packaging/linux/edgehop.png
 cargo deb --no-build
 
-DEB=$(ls -t target/debian/kvmlink_*.deb | head -n1)
+DEB=$(ls -t target/debian/edgehop_*.deb | head -n1)
 echo "==> Installing $DEB"
 sudo apt-get install -y "./$DEB"
 echo
-echo "Done. Launch 'kvmlink' from your app menu (log out/in once so /dev/uinput permissions apply)."
+echo "Done. Launch 'edgehop' from your app menu (log out/in once so /dev/uinput permissions apply)."

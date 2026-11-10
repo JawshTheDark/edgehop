@@ -2,7 +2,8 @@
 use crate::state::{lk, AppState};
 use eframe::egui;
 
-pub const WINDOW_TITLE: &str = "kvmlink — keyboard & mouse sharing";
+/// Distinct enough that no Explorer window (e.g. the "Edgehop" install folder) matches.
+pub const WINDOW_TITLE: &str = "Edgehop — keyboard & mouse sharing";
 
 /// On Windows we can truly hide to the tray and restore via Win32.
 /// Elsewhere the window minimizes instead (restoring a hidden window is unreliable).

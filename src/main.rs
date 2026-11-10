@@ -33,7 +33,7 @@ fn main() {
     let minimized = args.iter().any(|a| a == "--minimized");
     let headless = args.iter().any(|a| a == "--headless");
     if let Some(i) = args.iter().position(|a| a == "--write-icon") {
-        let path = args.get(i + 1).map(String::as_str).unwrap_or("kvmlink.png");
+        let path = args.get(i + 1).map(String::as_str).unwrap_or("edgehop.png");
         std::fs::write(path, icon::png(256)).expect("write icon");
         return;
     }
@@ -42,7 +42,7 @@ fn main() {
     let app = state::AppState::new(cfg);
     state::init_logger(app.clone());
     log::info!(
-        "kvmlink {} starting on {} (config: {})",
+        "Edgehop {} starting on {} (config: {})",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         config::Config::path().display()
@@ -58,6 +58,12 @@ fn main() {
     }
 
     files::cleanup_old();
+    // Keep "start at login" pointing at this copy of the app (after updates, renames, moves).
+    if app.cfg().autostart {
+        if let Err(e) = autostart::set(true) {
+            log::warn!("couldn't refresh start-at-login: {e}");
+        }
+    }
     app.start_engine();
 
     if headless {

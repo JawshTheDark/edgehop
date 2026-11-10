@@ -13,9 +13,9 @@ pub fn create(app: Arc<AppState>) -> Option<Tray> {
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
     let menu = Menu::new();
-    let open = MenuItem::new("Open kvmlink", true, None);
-    let restart = MenuItem::new("Restart kvmlink", true, None);
-    let quit = MenuItem::new("Quit kvmlink", true, None);
+    let open = MenuItem::new("Open Edgehop", true, None);
+    let restart = MenuItem::new("Restart Edgehop", true, None);
+    let quit = MenuItem::new("Quit Edgehop", true, None);
     menu.append(&open).ok()?;
     menu.append(&PredefinedMenuItem::separator()).ok()?;
     menu.append(&restart).ok()?;
@@ -43,7 +43,7 @@ pub fn create(app: Arc<AppState>) -> Option<Tray> {
     let icon = Icon::from_rgba(crate::icon::rgba(32), 32, 32).ok()?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("kvmlink")
+        .with_tooltip("Edgehop")
         .with_icon(icon)
         .build()
         .map_err(|e| log::warn!("tray icon unavailable: {e}"))
@@ -62,10 +62,10 @@ struct KTray {
 #[cfg(target_os = "linux")]
 impl ksni::Tray for KTray {
     fn id(&self) -> String {
-        "kvmlink".into()
+        "Edgehop".into()
     }
     fn title(&self) -> String {
-        "kvmlink".into()
+        "Edgehop".into()
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         let rgba = crate::icon::rgba(32);
@@ -79,14 +79,14 @@ impl ksni::Tray for KTray {
         use ksni::menu::*;
         vec![
             StandardItem {
-                label: "Open kvmlink".into(),
+                label: "Open Edgehop".into(),
                 activate: Box::new(|t: &mut Self| crate::platform::show_window(&t.app)),
                 ..Default::default()
             }
             .into(),
             MenuItem::Separator,
             StandardItem {
-                label: "Restart kvmlink".into(),
+                label: "Restart Edgehop".into(),
                 activate: Box::new(|t: &mut Self| {
                     t.app.stop_engine();
                     crate::recovery::restart_self("restart requested from the tray")
@@ -95,7 +95,7 @@ impl ksni::Tray for KTray {
             }
             .into(),
             StandardItem {
-                label: "Quit kvmlink".into(),
+                label: "Quit Edgehop".into(),
                 activate: Box::new(|t: &mut Self| t.app.quit()),
                 ..Default::default()
             }

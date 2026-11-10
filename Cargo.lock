@@ -1120,6 +1120,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "edgehop"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "base64",
+ "dbus",
+ "dbus-crossroads",
+ "directories",
+ "eframe",
+ "gethostname 0.5.0",
+ "ksni",
+ "libc",
+ "log",
+ "png 0.17.16",
+ "serde",
+ "serde_json",
+ "snow",
+ "tray-icon",
+]
+
+[[package]]
 name = "eframe"
 version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2247,26 +2268,6 @@ dependencies = [
  "dbus-codegen",
  "dbus-tree",
  "thiserror 1.0.69",
-]
-
-[[package]]
-name = "kvmlink"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "base64",
- "dbus",
- "dbus-crossroads",
- "directories",
- "eframe",
- "gethostname 0.5.0",
- "ksni",
- "libc",
- "log",
- "serde",
- "serde_json",
- "snow",
- "tray-icon",
 ]
 
 [[package]]

@@ -238,7 +238,7 @@ pub fn init(sink: Sender<Vec<String>>) {
             return;
         }
         let inst = GetModuleHandleW(std::ptr::null());
-        let class = wide("kvmlinkDropTarget");
+        let class = wide("edgehopDropTarget");
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: 0,
@@ -257,7 +257,7 @@ pub fn init(sink: Sender<Vec<String>>) {
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             class.as_ptr(),
-            wide("kvmlink drop target").as_ptr(),
+            wide("edgehop drop target").as_ptr(),
             WS_POPUP,
             0,
             0,

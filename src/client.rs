@@ -54,7 +54,7 @@ impl ClientEngine {
 
 /// The server pings every second. If the connection loop stops handling
 /// messages, first clear stuck helper processes and force a reconnect; if it
-/// is still stuck after that, restart kvmlink.
+/// is still stuck after that, restart edgehop.
 fn watchdog(stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpStream>>>, live: Arc<Liveness>) {
     let mut nudged = false;
     while !stop.load(Ordering::Relaxed) {
@@ -245,7 +245,7 @@ fn session(
     let mut drop_into: Option<std::path::PathBuf> = None;
     let Held { keys, buttons } = held;
     // Shared with the background clipboard threads.
-    let last_clip: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_clip: Arc<Mutex<Option<Clip>>> = Arc::new(Mutex::new(None));
     let mut server_name = String::from("server");
 
     loop {
@@ -319,20 +319,45 @@ fn session(
                     // locked): read it off the input thread.
                     let (tx2, last) = (tx.clone(), last_clip.clone());
                     thread::spawn(move || {
-                        if let Some(t) = crate::clipboard::get() {
-                            let fresh = lk(&last).as_deref().map(str::trim) != Some(t.trim());
-                            if fresh && !t.is_empty() && !t.contains("kvmlink-probe") {
-                                *lk(&last) = Some(t.clone());
-                                let _ = lk(&tx2).send(&ToServer::Clipboard { text: t });
-                            }
+                        let text = crate::clipboard::get().filter(|t| !t.trim().is_empty());
+                        let clip = match text {
+                            Some(t) if t.contains("edgehop-probe") => return,
+                            Some(text) => Clip::Text { text },
+                            None => match crate::clipboard::get_image_png() {
+                                Some(p) => Clip::Image { png: files::b64(&p) },
+                                None => return,
+                            },
+                        };
+                        let fresh = match (&*lk(&last), &clip) {
+                            (Some(Clip::Text { text: a }), Clip::Text { text: b }) => a.trim() != b.trim(),
+                            (prev, now) => prev.as_ref() != Some(now),
+                        };
+                        if fresh {
+                            *lk(&last) = Some(clip.clone());
+                            let msg = match clip {
+                                Clip::Text { text } => ToServer::Clipboard { text },
+                                Clip::Image { png } => ToServer::ClipboardImage { png },
+                            };
+                            let _ = lk(&tx2).send(&msg);
                         }
                     });
                 }
             }
             ToClient::Clipboard { text } => {
                 if app.cfg().clipboard {
-                    *lk(&last_clip) = Some(text.clone());
+                    *lk(&last_clip) = Some(Clip::Text { text: text.clone() });
                     thread::spawn(move || crate::clipboard::set(&text));
+                }
+            }
+            ToClient::ClipboardImage { png } => {
+                if app.cfg().clipboard {
+                    *lk(&last_clip) = Some(Clip::Image { png: png.clone() });
+                    thread::spawn(move || {
+                        if let Some(bytes) = files::unb64(&png) {
+                            crate::clipboard::set_image_png(&bytes);
+                            log::info!("clipboard image received ({})", files::human(bytes.len() as u64));
+                        }
+                    });
                 }
             }
             ToClient::Ping => lk(&tx).send(&ToServer::Pong)?,
@@ -402,7 +427,8 @@ fn session(
                             None => (done.items.clone(), format!("{what} is on the clipboard. Paste with Ctrl+V.")),
                         };
                         if let Some(text) = crate::clipboard::set_files(&on_clip) {
-                            *lk(&last_clip) = Some(text); // don't echo the file list back as text
+                            // don't echo the file list back as text
+                            *lk(&last_clip) = Some(Clip::Text { text });
                         }
                         files::notify(&format!("Files from {}", done.from), &msg);
                         app.set_status(msg, true);

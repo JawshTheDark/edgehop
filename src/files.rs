@@ -89,9 +89,9 @@ pub fn safe_rel(rel: &str) -> Option<PathBuf> {
 
 /// Where received files go: a per-app cache folder (not /tmp, which may be RAM).
 pub fn received_root() -> PathBuf {
-    directories::ProjectDirs::from("", "", "kvmlink")
+    directories::ProjectDirs::from("", "", "edgehop")
         .map(|d| d.cache_dir().join("received"))
-        .unwrap_or_else(|| std::env::temp_dir().join("kvmlink-received"))
+        .unwrap_or_else(|| std::env::temp_dir().join("edgehop-received"))
 }
 
 /// Delete drops older than a day.
@@ -188,7 +188,7 @@ pub fn notify(title: &str, body: &str) {
     #[cfg(target_os = "linux")]
     {
         let _ = std::process::Command::new("notify-send")
-            .args(["--app-name=kvmlink", "--icon=kvmlink", title, body])
+            .args(["--app-name=Edgehop", "--icon=edgehop", title, body])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
@@ -233,6 +233,14 @@ fn unique_path(p: &Path) -> PathBuf {
         .unwrap()
 }
 
+pub fn b64(bytes: &[u8]) -> String {
+    B64.encode(bytes)
+}
+
+pub fn unb64(s: &str) -> Option<Vec<u8>> {
+    B64.decode(s.as_bytes()).ok()
+}
+
 pub fn describe(items: &[PathBuf], bytes: u64) -> String {
     let what = match items {
         [one] => format!("\"{}\"", one.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
@@ -264,7 +272,7 @@ mod tests {
 
     #[test]
     fn folder_round_trip() {
-        let src = std::env::temp_dir().join(format!("kvmlink-test-src-{}", std::process::id()));
+        let src = std::env::temp_dir().join(format!("edgehop-test-src-{}", std::process::id()));
         let _ = fs::remove_dir_all(&src);
         fs::create_dir_all(src.join("photos/nested")).unwrap();
         fs::write(src.join("photos/a.txt"), b"hello").unwrap();
@@ -307,7 +315,7 @@ mod tests {
 
     #[test]
     fn copy_into_never_overwrites() {
-        let base = std::env::temp_dir().join(format!("kvmlink-test-copy-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("edgehop-test-copy-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let (src, dest) = (base.join("src"), base.join("dest"));
         fs::create_dir_all(src.join("folder")).unwrap();

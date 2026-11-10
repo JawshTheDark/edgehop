@@ -1,5 +1,5 @@
 //! Self-healing: contain crashes in background workers, notice when parts of
-//! kvmlink get stuck, and recover without the user having to step in.
+//! edgehop get stuck, and recover without the user having to step in.
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -24,7 +24,7 @@ pub fn guard<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
     }
 }
 
-/// Log panics (with thread and location) into kvmlink.log, and put the
+/// Log panics (with thread and location) into edgehop.log, and put the
 /// cursor back if we had hidden it.
 pub fn install_panic_hook() {
     let prev = std::panic::take_hook();
@@ -63,9 +63,9 @@ pub fn kill_child_helpers() {
     }
 }
 
-/// Last resort: start a fresh kvmlink and exit this one.
+/// Last resort: start a fresh edgehop and exit this one.
 pub fn restart_self(reason: &str) -> ! {
-    log::error!("restarting kvmlink: {reason}");
+    log::error!("restarting Edgehop: {reason}");
     crate::platform::restore_cursor();
     // Under a systemd service (Restart=on-failure) systemd starts us again;
     // otherwise launch the new copy ourselves.

@@ -5,6 +5,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 const MAX_LEN: usize = 4 * 1024 * 1024;
+/// Largest image we'll move (PNG bytes): a 4K screenshot fits comfortably.
+const MAX_IMAGE: usize = 12 * 1024 * 1024;
 
 thread_local! {
     // Kept alive per thread: on X11 the clipboard owner must outlive the copy.
@@ -60,6 +62,87 @@ pub fn set(text: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Images (as PNG)
+// ---------------------------------------------------------------------------
+
+/// The clipboard image as PNG bytes, if the clipboard holds an image.
+pub fn get_image_png() -> Option<Vec<u8>> {
+    #[cfg(target_os = "linux")]
+    if wayland() {
+        let types = linux::capture("wl-paste", &["--list-types"])?;
+        if !String::from_utf8_lossy(&types).lines().any(|l| l.trim() == "image/png") {
+            return None;
+        }
+        let png = linux::capture_max("wl-paste", &["--type", "image/png"], MAX_IMAGE)?;
+        return (!png.is_empty() && png.len() < MAX_IMAGE).then_some(png);
+    }
+    let img = with_board(|b| b.get_image().ok()).flatten()?;
+    let png = encode_png(img.width as u32, img.height as u32, &img.bytes)?;
+    (png.len() < MAX_IMAGE).then_some(png)
+}
+
+pub fn set_image_png(png: &[u8]) {
+    #[cfg(target_os = "linux")]
+    if wayland() {
+        linux::feed("wl-copy", &["--type", "image/png"], png);
+        return;
+    }
+    let Some((w, h, rgba)) = decode_png(png) else { return };
+    let img = arboard::ImageData { width: w as usize, height: h as usize, bytes: rgba.into() };
+    if with_board(|b| b.set_image(img.clone())).map(|r| r.is_err()).unwrap_or(true) {
+        BOARD.with(|b| *b.borrow_mut() = None);
+        let _ = with_board(|b| b.set_image(img));
+    }
+}
+
+#[allow(dead_code)]
+fn encode_png(w: u32, h: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(png::Compression::Fast);
+        let mut wr = enc.write_header().ok()?;
+        wr.write_image_data(rgba).ok()?;
+    }
+    Some(out)
+}
+
+/// PNG -> (width, height, RGBA8).
+#[allow(dead_code)]
+fn decode_png(png: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(png));
+    dec.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = dec.read_info().ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => buf.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
+        png::ColorType::GrayscaleAlpha => buf.chunks(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+        png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        _ => return None,
+    };
+    Some((info.width, info.height, rgba))
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn png_round_trip() {
+        let (w, h) = (3u32, 2u32);
+        let rgba: Vec<u8> = (0..w * h * 4).map(|i| (i * 7 % 256) as u8).collect();
+        let png = encode_png(w, h, &rgba).unwrap();
+        assert_eq!(&png[1..4], b"PNG");
+        assert_eq!(decode_png(&png).unwrap(), (w, h, rgba));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // File lists
 // ---------------------------------------------------------------------------
 
@@ -98,7 +181,7 @@ pub struct Probe {
 }
 
 #[cfg(not(windows))]
-const SENTINEL: &str = "\u{2063}kvmlink-probe";
+const SENTINEL: &str = "\u{2063}edgehop-probe";
 
 impl Probe {
     /// Call just before injecting Ctrl+C.
@@ -158,11 +241,15 @@ mod linux {
 
     /// Run a command and capture stdout (read concurrently so big output can't stall it).
     pub fn capture(cmd: &str, args: &[&str]) -> Option<Vec<u8>> {
+        capture_max(cmd, args, MAX_LEN)
+    }
+
+    pub fn capture_max(cmd: &str, args: &[&str], max: usize) -> Option<Vec<u8>> {
         let mut child = Command::new(cmd).args(args).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
         let mut out = child.stdout.take()?;
         let reader = std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = out.by_ref().take(MAX_LEN as u64).read_to_end(&mut buf);
+            let _ = out.by_ref().take(max as u64).read_to_end(&mut buf);
             buf
         });
         let start = Instant::now();

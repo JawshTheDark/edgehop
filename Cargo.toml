@@ -1,10 +1,10 @@
 [package]
-name = "kvmlink"
+name = "edgehop"
 version = "0.1.0"
 edition = "2021"
 description = "Share one keyboard and mouse across every computer on your network"
 license = "MIT"
-authors = ["kvmlink"]
+authors = ["edgehop"]
 
 [dependencies]
 eframe = "0.31"
@@ -16,6 +16,7 @@ directories = "5"
 gethostname = "0.5"
 log = "0.4"
 base64 = "0.22"
+png = "0.17"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -36,7 +37,7 @@ strip = true
 
 # `cargo deb` (https://github.com/kornelski/cargo-deb) builds the Ubuntu package.
 [package.metadata.deb]
-maintainer = "kvmlink"
+maintainer = "edgehop"
 section = "utils"
 priority = "optional"
 depends = "$auto, libdbus-1-3"
@@ -44,9 +45,9 @@ recommends = "wl-clipboard, xclip, x11-xserver-utils, libnotify-bin"
 extended-description = "Synergy-style software KVM: move your mouse off the edge of one screen and onto another computer."
 maintainer-scripts = "packaging/linux/debian"
 assets = [
-    ["target/release/kvmlink", "usr/bin/", "755"],
-    ["packaging/linux/kvmlink.desktop", "usr/share/applications/", "644"],
-    ["packaging/linux/kvmlink.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
-    ["packaging/linux/60-kvmlink-uinput.rules", "lib/udev/rules.d/", "644"],
-    ["packaging/linux/kvmlink-uinput.conf", "usr/lib/modules-load.d/", "644"],
+    ["target/release/edgehop", "usr/bin/", "755"],
+    ["packaging/linux/edgehop.desktop", "usr/share/applications/", "644"],
+    ["packaging/linux/edgehop.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["packaging/linux/60-edgehop-uinput.rules", "lib/udev/rules.d/", "644"],
+    ["packaging/linux/edgehop-uinput.conf", "usr/lib/modules-load.d/", "644"],
 ]

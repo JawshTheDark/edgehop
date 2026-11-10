@@ -162,16 +162,16 @@ impl AppState {
 static SINK: OnceLock<Arc<AppState>> = OnceLock::new();
 static LOGFILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
 
-/// kvmlink.log next to the received-files cache (truncated when it grows past 5 MB).
+/// edgehop.log next to the received-files cache (truncated when it grows past 5 MB).
 pub fn log_path() -> std::path::PathBuf {
-    crate::files::received_root().with_file_name("kvmlink.log")
+    crate::files::received_root().with_file_name("edgehop.log")
 }
 
 struct Logger;
 
 impl log::Log for Logger {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        m.level() <= log::Level::Info && m.target().starts_with("kvmlink")
+        m.level() <= log::Level::Info && m.target().starts_with("edgehop")
     }
     fn log(&self, r: &log::Record) {
         if !self.enabled(r.metadata()) {

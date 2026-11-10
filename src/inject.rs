@@ -115,7 +115,7 @@ mod linux {
             let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
             if fd < 0 {
                 return Err(format!(
-                    "Can't open /dev/uinput ({}). Install the kvmlink package (it adds a udev rule), \
+                    "Can't open /dev/uinput ({}). Install the edgehop package (it adds a udev rule), \
                      or run: sudo modprobe uinput && sudo setfacl -m u:$USER:rw /dev/uinput",
                     std::io::Error::last_os_error()
                 ));
@@ -170,7 +170,7 @@ mod linux {
 
     impl Uinput {
         pub fn new() -> Result<Uinput, String> {
-            let kbd = Device::open("kvmlink keyboard", 1, |fd| unsafe {
+            let kbd = Device::open("edgehop keyboard", 1, |fd| unsafe {
                 libc::ioctl(fd, UI_SET_EVBIT as _, EV_KEY as libc::c_int);
                 for k in 1..=255 {
                     libc::ioctl(fd, UI_SET_KEYBIT as _, k as libc::c_int);
@@ -178,7 +178,7 @@ mod linux {
             })?;
             // Absolute pointer + buttons (classified as a mouse, like a VM tablet),
             // so the cursor lands exactly where the server says.
-            let mouse = Device::open("kvmlink pointer", 2, |fd| unsafe {
+            let mouse = Device::open("edgehop pointer", 2, |fd| unsafe {
                 libc::ioctl(fd, UI_SET_EVBIT as _, EV_KEY as libc::c_int);
                 for b in BTN_LEFT_CODE..=BTN_LEFT_CODE + 4 {
                     libc::ioctl(fd, UI_SET_KEYBIT as _, b as libc::c_int);
@@ -480,7 +480,7 @@ mod macos {
     impl Quartz {
         pub fn new() -> Result<Quartz, String> {
             if !unsafe { AXIsProcessTrusted() } {
-                log::warn!("kvmlink needs Accessibility permission: System Settings → Privacy & Security → Accessibility");
+                log::warn!("Edgehop needs Accessibility permission: System Settings → Privacy & Security → Accessibility");
             }
             let b = unsafe { CGDisplayBounds(CGMainDisplayID()) };
             Ok(Quartz {

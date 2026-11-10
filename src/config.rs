@@ -76,16 +76,32 @@ impl Default for Config {
 
 impl Config {
     pub fn path() -> PathBuf {
-        if let Some(p) = std::env::var_os("KVMLINK_CONFIG") {
+        if let Some(p) = std::env::var_os("EDGEHOP_CONFIG") {
             return PathBuf::from(p);
         }
-        directories::ProjectDirs::from("", "", "kvmlink")
+        directories::ProjectDirs::from("", "", "edgehop")
             .map(|d| d.config_dir().join("config.json"))
-            .unwrap_or_else(|| PathBuf::from("kvmlink-config.json"))
+            .unwrap_or_else(|| PathBuf::from("edgehop-config.json"))
+    }
+
+    /// Where the app kept its settings before it was renamed to Edgehop.
+    fn legacy_path() -> Option<PathBuf> {
+        directories::ProjectDirs::from("", "", "kvmlink").map(|d| d.config_dir().join("config.json"))
     }
 
     pub fn load() -> Config {
         let path = Self::path();
+        // Carry identity, pairings and layout over from the old name.
+        if !path.exists() && std::env::var_os("EDGEHOP_CONFIG").is_none() {
+            if let Some(old) = Self::legacy_path().filter(|p| p.exists()) {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                if std::fs::copy(&old, &path).is_ok() {
+                    eprintln!("migrated settings from {}", old.display());
+                }
+            }
+        }
         let mut cfg: Config = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())

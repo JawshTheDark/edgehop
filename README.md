@@ -1,16 +1,36 @@
-# kvmlink
+<p align="center">
+  <img src="docs/icon.png" width="96" alt="Edgehop icon">
+</p>
 
-Share one keyboard and mouse across every computer on your network — push the
-pointer off the edge of your Windows screen and it appears on your Ubuntu
-Surface (or a laptop, or a Mac). Same idea as Synergy / Barrier / Input Leap.
+<h1 align="center">Edgehop</h1>
 
-- **GUI + tray app**: drag screens into place, approve new computers, see who's connected.
-- **Encrypted & paired**: traffic uses the Noise protocol (X25519 + ChaCha20-Poly1305).
-  A new computer must be approved on the server, and both sides show the same 6-digit code.
-- **Auto-discovery**: clients find the server on the LAN by themselves; no IP typing.
-- **Shared clipboard**: copy on one machine, paste on another (text).
-- **Clients**: Ubuntu/Linux (X11 *and* Wayland via `uinput`), Windows, macOS.
-- **Server**: Windows (captures input with low-level hooks).
+<p align="center"><b>One keyboard and mouse for every computer on your desk.</b><br>
+Push the pointer off the edge of a screen and it hops onto the next computer.</p>
+
+<p align="center">
+  <img src="docs/screens.png" width="720" alt="Edgehop screen layout">
+</p>
+
+Edgehop is a software KVM in the spirit of Synergy, Barrier and Input Leap:
+a Windows PC shares its keyboard and mouse with Linux, Windows and macOS
+computers over your local network.
+
+- **Monitor-level layout**: place each computer against any edge of any monitor,
+  like Windows' Display settings. Positions line up across edges, corner to corner.
+- **Clipboard sharing**: text *and images* (snip on one computer, paste on another).
+- **Drag files across screens**, in both directions.
+- **Encrypted and paired**: Noise protocol (X25519 + ChaCha20-Poly1305). A new
+  computer must be approved, and both sides show the same 6-digit code.
+- **Finds itself**: clients discover the server on the LAN; no IP typing.
+- **Edge resistance**, a hidden cursor while you're away, and on KDE Plasma a
+  dimmed screen that stays bright while media plays.
+- **Self-healing**: recovers from hangs, dropped connections and crashes on its own.
+- **Clients**: Linux (X11 *and* Wayland via `uinput`), Windows, macOS.
+  **Server**: Windows.
+
+<p align="center">
+  <img src="docs/settings.png" width="640" alt="Edgehop settings">
+</p>
 
 ## Install
 
@@ -23,7 +43,7 @@ cargo build --release
 powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
 ```
 
-The installer copies the app to `%LOCALAPPDATA%\Programs\kvmlink`, adds a Start
+The installer copies the app to `%LOCALAPPDATA%\Programs\Edgehop`, adds a Start
 Menu entry, and asks for admin once to allow it through the firewall on
 **Private** networks. Make sure your Wi-Fi/Ethernet is set to *Private* in
 Windows settings.
@@ -38,7 +58,7 @@ Copy this folder over (or `git clone` it), then:
 
 This installs build tools and Rust if needed, builds a `.deb`, and installs it.
 The package adds a udev rule so your user can create virtual input devices.
-**Log out and back in once** afterwards, then open *kvmlink* from the app menu.
+**Log out and back in once** afterwards, then open *Edgehop* from the app menu.
 
 ### macOS
 
@@ -46,13 +66,13 @@ The package adds a udev rule so your user can create virtual input devices.
 ./packaging/macos/build-app.sh
 ```
 
-Move `dist/kvmlink.app` to Applications, open it, and allow it under
+Move `dist/edgehop.app` to Applications, open it, and allow it under
 System Settings → Privacy & Security → **Accessibility**.
 
 ## Using it
 
-1. On Windows, open kvmlink. It starts in **server** mode.
-2. On the other computer, open kvmlink. It starts in **client** mode and finds the server.
+1. On Windows, open Edgehop. It starts in **server** mode.
+2. On the other computer, open Edgehop. It starts in **client** mode and finds the server.
 3. A pairing prompt pops up on Windows. Check that the code matches the one on
    the client, then click **Approve**.
 4. The new computer shows up to the right of your PC in **Screen layout**. Drag
@@ -64,11 +84,11 @@ System Settings → Privacy & Security → **Accessibility**.
 | Come back | Move the mouse off the opposite edge, or press **Scroll Lock** |
 | Clipboard | Copy, move to the other screen, paste |
 | Mouse too fast/slow on the client | *Mouse speed on other screens* (server) or *Override screen size* (client) |
-| Keep running | Close the window → it stays in the tray. Tick *Start kvmlink when I log in*. |
+| Keep running | Close the window → it stays in the tray. Tick *Start Edgehop when I log in*. |
 
-Settings live in `%APPDATA%\kvmlink\config\config.json` (Windows),
-`~/.config/kvmlink/config.json` (Linux), or
-`~/Library/Application Support/kvmlink/config.json` (macOS).
+Settings live in `%APPDATA%\edgehop\config\config.json` (Windows),
+`~/.config/edgehop/config.json` (Linux), or
+`~/Library/Application Support/edgehop/config.json` (macOS).
 
 ## Troubleshooting
 
@@ -79,29 +99,29 @@ Settings live in `%APPDATA%\kvmlink\config\config.json` (Windows),
   `sudo modprobe uinput && sudo setfacl -m u:$USER:rw /dev/uinput` for a quick test.
 - **Clipboard on Ubuntu Wayland** needs `wl-clipboard` (installed by the build script).
 - **Admin windows on Windows**: if the mouse won't leave while an elevated window
-  (Task Manager, an admin terminal) is focused, run kvmlink as administrator.
+  (Task Manager, an admin terminal) is focused, run Edgehop as administrator.
 - Ports: TCP **24800** (connections) and UDP **24801** (discovery).
 
 ## Self-healing
 
-kvmlink recovers from failures without you having to step in:
+edgehop recovers from failures without you having to step in:
 
-| Problem | What kvmlink does |
+| Problem | What edgehop does |
 |---|---|
 | The computer your mouse is on stops answering | Mouse returns to the server after 3 s; it won't cross into a silent computer until it answers again |
 | Connection drops | Both sides reconnect automatically (dead connections are detected within 12 s) |
-| Something inside kvmlink gets stuck | The Windows input hook passes input straight through after 100 ms (it can never freeze your mouse); a stuck switching state for 5 s restarts kvmlink |
+| Something inside edgehop gets stuck | The Windows input hook passes input straight through after 100 ms (it can never freeze your mouse); a stuck switching state for 5 s restarts edgehop |
 | Windows silently removes the input hooks | Noticed (Windows saw input the hooks didn't) and reinstalled |
-| The client's connection loop stalls | Stuck helper processes are killed and it reconnects; if still stuck, kvmlink restarts |
+| The client's connection loop stalls | Stuck helper processes are killed and it reconnects; if still stuck, edgehop restarts |
 | Clipboard tools hang (e.g. on a locked screen) | Given up on after 2 s, off the input path |
 | A connection ends with keys or buttons held | They're released |
 | A background worker crashes | Logged with its location; the worker keeps running |
 | KDE's D-Bus connection drops | Reconnected |
-| kvmlink crashes or is killed | Cursor is restored; on Linux, systemd restarts it (autostart runs it with `Restart=on-failure`) |
+| edgehop crashes or is killed | Cursor is restored; on Linux, systemd restarts it (autostart runs it with `Restart=on-failure`) |
 
-You can also restart it from the tray icon (**Restart kvmlink**). Everything is
-logged to `kvmlink.log` (`%LOCALAPPDATA%\kvmlink\cache\` on Windows,
-`~/.cache/kvmlink/` on Linux).
+You can also restart it from the tray icon (**Restart edgehop**). Everything is
+logged to `edgehop.log` (`%LOCALAPPDATA%\edgehop\cache\` on Windows,
+`~/.cache/edgehop/` on Linux).
 
 ## How it works
 

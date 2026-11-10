@@ -20,7 +20,7 @@ const PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
 const MAX_NOISE_MSG: usize = 65535;
 const CHUNK: usize = 60_000;
 const MAX_APP_MSG: usize = 16 * 1024 * 1024;
-const DISCOVER_MAGIC: &[u8] = b"KVMLINK-DISCOVER-1";
+const DISCOVER_MAGIC: &[u8] = b"EDGEHOP-DISCOVER-1";
 
 fn err<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e.to_string())

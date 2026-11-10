@@ -1,0 +1,2 @@
+# Let the logged-in desktop user create virtual input devices (needed by the edgehop client).
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

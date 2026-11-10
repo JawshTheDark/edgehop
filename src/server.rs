@@ -56,7 +56,7 @@ pub trait Desktop: Send {
 
 pub enum ClipJob {
     ReadLocal,
-    SetLocal(String),
+    SetLocal(Clip),
 }
 
 /// Work that must not run inside the input hook.
@@ -87,6 +87,12 @@ impl Bulk {
         }
         q.push_back(m);
         Ok(())
+    }
+    /// Queue without waiting for room (rare, single large messages).
+    pub fn push_now(&self, m: ToClient) {
+        if !self.closed.load(Ordering::Relaxed) {
+            lk(&self.q).push_back(m);
+        }
     }
     fn pop(&self) -> Option<ToClient> {
         let m = lk(&self.q).pop_front();
@@ -154,7 +160,7 @@ pub struct Core {
     /// Until the hook reports a position near the parked spot, deltas are stale.
     parked: bool,
     clipboard: bool,
-    clip: Option<String>,
+    clip: Option<Clip>,
     clip_gen: u64,
     server_clip_gen: u64,
     pub clip_jobs: Option<mpsc::Sender<ClipJob>>,
@@ -285,10 +291,16 @@ impl Core {
             return;
         }
         let gen = self.clip_gen;
-        if let (Some(text), Some(slot)) = (self.clip.clone(), self.clients.get_mut(name)) {
+        if let (Some(clip), Some(slot)) = (self.clip.clone(), self.clients.get_mut(name)) {
             if slot.clip_gen != gen {
                 slot.clip_gen = gen;
-                let _ = slot.tx.send(ToClient::Clipboard { text });
+                match clip {
+                    Clip::Text { text } => {
+                        let _ = slot.tx.send(ToClient::Clipboard { text });
+                    }
+                    // Images can be megabytes: send them in the gaps between input.
+                    Clip::Image { png } => slot.bulk.push_now(ToClient::ClipboardImage { png }),
+                }
             }
         }
     }
@@ -726,12 +738,12 @@ impl Core {
         }
     }
 
-    pub fn client_clipboard(&mut self, name: &str, text: String) {
+    pub fn client_clipboard(&mut self, name: &str, clip: Clip) {
         if !self.clipboard {
             return;
         }
-        if self.clip.as_deref() != Some(text.as_str()) {
-            self.clip = Some(text);
+        if self.clip.as_ref() != Some(&clip) {
+            self.clip = Some(clip);
             self.clip_gen += 1;
         }
         let gen = self.clip_gen;
@@ -746,9 +758,9 @@ impl Core {
         }
     }
 
-    pub fn local_clipboard(&mut self, text: String) {
-        if self.clip.as_deref() != Some(text.as_str()) {
-            self.clip = Some(text);
+    pub fn local_clipboard(&mut self, clip: Clip) {
+        if self.clip.as_ref() != Some(&clip) {
+            self.clip = Some(clip);
             self.clip_gen += 1;
         }
         self.server_clip_gen = self.clip_gen;
@@ -874,15 +886,45 @@ impl ServerEngine {
             // Clipboard worker (keeps clipboard I/O out of the hook callback).
             let s = shared.clone();
             thread::spawn(move || {
+                // Clipboard change counter when we last read or wrote it.
+                let mut ours: Option<u32> = None;
                 for job in clip_rx {
                     recovery::guard("clipboard worker", || match job {
                         ClipJob::ReadLocal => {
-                            if let Some(t) = crate::clipboard::get() {
-                                lk(&s.core).local_clipboard(t);
+                            // Unchanged since we last read or wrote it: nothing new to share.
+                            #[cfg(windows)]
+                            {
+                                let seq = unsafe { crate::win32::GetClipboardSequenceNumber() };
+                                if ours == Some(seq) {
+                                    return;
+                                }
+                                ours = Some(seq);
+                            }
+                            let clip = match crate::clipboard::get().filter(|t| !t.is_empty()) {
+                                Some(text) => Some(Clip::Text { text }),
+                                None => crate::clipboard::get_image_png().map(|p| Clip::Image { png: files::b64(&p) }),
+                            };
+                            if let Some(c) = clip {
+                                lk(&s.core).local_clipboard(c);
                             }
                         }
-                        ClipJob::SetLocal(t) => crate::clipboard::set(&t),
+                        ClipJob::SetLocal(c) => {
+                            match c {
+                                Clip::Text { text } => crate::clipboard::set(&text),
+                                Clip::Image { png } => {
+                                    if let Some(bytes) = files::unb64(&png) {
+                                        crate::clipboard::set_image_png(&bytes);
+                                        log::info!("clipboard image received ({})", files::human(bytes.len() as u64));
+                                    }
+                                }
+                            }
+                            #[cfg(windows)]
+                            {
+                                ours = Some(unsafe { crate::win32::GetClipboardSequenceNumber() });
+                            }
+                        }
                     });
+                    let _ = &mut ours;
                 }
             });
 
@@ -1128,7 +1170,8 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
             last_seen.store(now_ms(), Ordering::Relaxed);
         }
         match msg {
-            Ok(ToServer::Clipboard { text }) => lk(&s.core).client_clipboard(&name, text),
+            Ok(ToServer::Clipboard { text }) => lk(&s.core).client_clipboard(&name, Clip::Text { text }),
+            Ok(ToServer::ClipboardImage { png }) => lk(&s.core).client_clipboard(&name, Clip::Image { png }),
             Ok(ToServer::FilesGrabbed { files }) => lk(&s.core).client_grab_result(&name, files),
             Ok(ToServer::File { m }) => receive_files(s, &mut sink, m),
             Ok(_) => {}
@@ -1609,7 +1652,7 @@ mod tests {
     #[test]
     fn clipboard_follows_focus() {
         let (mut core, rx, _) = setup(true);
-        core.local_clipboard("hello".into());
+        core.local_clipboard(Clip::Text { text: "hello".into() });
         core.on_mouse_move(500, 1079);
         assert!(rx.try_iter().any(|m| matches!(m, ToClient::Clipboard { ref text } if text == "hello")));
     }
@@ -1822,5 +1865,18 @@ mod tests {
         assert_eq!(core.active, "pc");
         core.clients["surface"].last_seen.store(now_ms(), Ordering::Relaxed);
         assert!(core.on_mouse_move(500, 1079), "answering again: crossing works");
+    }
+
+    #[test]
+    fn clipboard_images_follow_focus_without_blocking_input() {
+        let (mut core, rx, _) = setup(true);
+        core.local_clipboard(Clip::Image { png: "iVBORw0KGgo=".into() });
+        core.on_mouse_move(500, 1079);
+        assert!(
+            !rx.try_iter().any(|m| matches!(m, ToClient::ClipboardImage { .. })),
+            "images don't go down the input channel"
+        );
+        let queued = core.clients["surface"].bulk.pop();
+        assert!(matches!(queued, Some(ToClient::ClipboardImage { ref png }) if png == "iVBORw0KGgo="));
     }
 }

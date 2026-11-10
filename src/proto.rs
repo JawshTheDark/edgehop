@@ -2,7 +2,16 @@
 use crate::files::FileMsg;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Shared clipboard content.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind")]
+pub enum Clip {
+    Text { text: String },
+    /// A PNG image, base64-encoded (screenshots, snips, copied pictures).
+    Image { png: String },
+}
 
 /// Mouse buttons on the wire.
 pub const BTN_LEFT: u8 = 1;
@@ -23,6 +32,9 @@ pub enum ToServer {
     },
     Clipboard {
         text: String,
+    },
+    ClipboardImage {
+        png: String,
     },
     Pong,
     /// Reply to `FilesGrab`: what was being dragged here (empty = not files).
@@ -49,6 +61,7 @@ pub enum ToClient {
     Wheel { dx: i32, dy: i32 },
     Key { code: u16, down: bool },
     Clipboard { text: String },
+    ClipboardImage { png: String },
     Ping,
     /// A drag is being pushed off this screen: report which files it carries.
     FilesGrab,

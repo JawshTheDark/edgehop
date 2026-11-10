@@ -12,11 +12,11 @@ use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::Duration;
 
-const SERVICE: &str = "org.kvmlink.Client";
-const SCRIPT_NAME: &str = "kvmlink-window-at";
+const SERVICE: &str = "org.edgehop.Client";
+const SCRIPT_NAME: &str = "edgehop-window-at";
 const TIMEOUT: Duration = Duration::from_millis(1500);
 
-const SCRIPT: &str = r#"// kvmlink: report the window under the pointer.
+const SCRIPT: &str = r#"// edgehop: report the window under the pointer.
 (function () {
     var p = workspace.cursorPos;
     var wins = workspace.stackingOrder;
@@ -26,13 +26,13 @@ const SCRIPT: &str = r#"// kvmlink: report the window under the pointer.
             if (w.minimized || w.hidden || w.dock || w.deleted) continue;
             var g = w.frameGeometry;
             if (p.x >= g.x && p.x < g.x + g.width && p.y >= g.y && p.y < g.y + g.height) {
-                callDBus("org.kvmlink.Client", "/", "org.kvmlink.Client", "WindowAt",
+                callDBus("org.edgehop.Client", "/", "org.edgehop.Client", "WindowAt",
                          String(w.resourceClass), String(w.caption), String(w.pid), w.desktopWindow ? "1" : "0");
                 return;
             }
         } catch (e) {}
     }
-    callDBus("org.kvmlink.Client", "/", "org.kvmlink.Client", "WindowAt", "", "", "0", "0");
+    callDBus("org.edgehop.Client", "/", "org.edgehop.Client", "WindowAt", "", "", "0", "0");
 })();
 "#;
 
@@ -92,7 +92,7 @@ impl Kde {
             })
             .ok()?;
 
-        let script = crate::files::received_root().with_file_name("kvmlink-window-at.js");
+        let script = crate::files::received_root().with_file_name("edgehop-window-at.js");
         if let Some(dir) = script.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -289,7 +289,7 @@ fn displays(conn: &Connection) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Publish org.kvmlink.Client so the KWin script can report back.
+/// Publish org.edgehop.Client so the KWin script can report back.
 fn serve(tx: mpsc::Sender<WinInfo>) -> Result<(), dbus::Error> {
     let c = Connection::new_session()?;
     c.request_name(SERVICE, false, true, false)?;
