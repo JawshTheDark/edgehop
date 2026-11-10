@@ -93,19 +93,20 @@ pub fn run(args: &[String]) -> i32 {
 #[cfg(target_os = "macos")]
 fn copy_everything(inj: &mut dyn crate::inject::Injector) -> Option<String> {
     const NOTHING: &str = "edgehop: nothing copied yet";
-    crate::clipboard::set(NOTHING);
-    select_all_and_copy(inj, 125);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        // While an app is copying, the clipboard is briefly empty: keep waiting.
-        if let Some(t) = crate::clipboard::get().filter(|t| t != NOTHING) {
-            return Some(t);
+    // Twice at most: the first Command+A can go to dismissing a text prediction.
+    for _ in 0..2 {
+        crate::clipboard::set(NOTHING);
+        select_all_and_copy(inj, 125);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            // While an app is copying, the clipboard is briefly empty: keep waiting.
+            if let Some(t) = crate::clipboard::get().filter(|t| t != NOTHING) {
+                return Some(t);
+            }
+            std::thread::sleep(Duration::from_millis(100));
         }
-        if Instant::now() > deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(100));
     }
+    None
 }
 
 /// Waits until input capture has reported what `ok` looks for.
@@ -164,11 +165,12 @@ fn sharing_mac(r: &mut Report, inj: &mut dyn crate::inject::Injector, events_wor
     if ok { r.pass("capture pointer", "saw the pointer arrive at 300,300") } else { r.fail("capture pointer", format!("saw {got:?}")) }
 
     clear();
-    inj.key(37, true); // K
-    inj.key(37, false);
-    let want = [Input::Key { code: 37, down: true }, Input::Key { code: 37, down: false }];
+    // Right arrow: a key that types nothing into TextEdit.
+    inj.key(106, true);
+    inj.key(106, false);
+    let want = [Input::Key { code: 106, down: true }, Input::Key { code: 106, down: false }];
     let (ok, got) = wait_for(&seen, |v| want.iter().all(|w| v.contains(w)));
-    if ok { r.pass("capture keys", "K down and up, as key 37") } else { r.fail("capture keys", format!("saw {got:?}")) }
+    if ok { r.pass("capture keys", "Right arrow down and up, as key 106") } else { r.fail("capture keys", format!("saw {got:?}")) }
 
     clear();
     inj.key(42, true); // Shift
