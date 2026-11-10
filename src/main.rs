@@ -63,6 +63,15 @@ fn main() {
     if args.iter().any(|a| a == "--self-test") {
         std::process::exit(selftest::run(&args));
     }
+    // macOS: forget Edgehop's input permissions so the next launch asks again.
+    #[cfg(target_os = "macos")]
+    if args.iter().any(|a| a == "--reset-permissions") {
+        let done = platform::reset_mac_permissions();
+        for (service, ok) in &done {
+            println!("{service}: {}", if *ok { "reset" } else { "failed" });
+        }
+        std::process::exit(if done.iter().all(|(_, ok)| *ok) { 0 } else { 1 });
+    }
 
     let cfg = config::Config::load();
     let app = state::AppState::new(cfg);

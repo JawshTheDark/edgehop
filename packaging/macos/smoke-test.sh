@@ -93,6 +93,13 @@ if [ -n "$crashes" ]; then
 fi
 pkill -x edgehop
 
+step "Reset permissions (what the button in the app runs)"
+if "$BIN" --reset-permissions; then
+    echo "macOS accepted the permission reset"
+else
+    fail "permission reset (tccutil) failed"
+fi
+
 step "Result"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {

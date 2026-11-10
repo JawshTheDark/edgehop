@@ -377,6 +377,53 @@ pub fn client_hooks() -> Option<std::sync::Arc<dyn DesktopHooks>> {
     None
 }
 
+/// The app's bundle identifier (Info.plist): what macOS files permissions under.
+#[cfg(target_os = "macos")]
+pub const MAC_BUNDLE_ID: &str = "com.edgehop.app";
+
+/// The Edgehop.app this binary runs from, if any.
+#[cfg(target_os = "macos")]
+pub fn mac_app_bundle() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let app = exe.parent()?.parent()?.parent()?.to_path_buf();
+    (app.extension().is_some_and(|e| e == "app")).then_some(app)
+}
+
+/// Forget every input permission macOS holds for Edgehop, so the next launch
+/// asks afresh. Newer macOS has no way to remove an app from those lists, and
+/// a permission granted to an older copy can look "on" while macOS refuses the
+/// new one. Returns (service, succeeded) for each.
+#[cfg(target_os = "macos")]
+pub fn reset_mac_permissions() -> Vec<(&'static str, bool)> {
+    let mut done = Vec::new();
+    for service in ["Accessibility", "ListenEvent", "PostEvent"] {
+        let ok = std::process::Command::new("tccutil")
+            .args(["reset", service, MAC_BUNDLE_ID])
+            .status()
+            .is_ok_and(|s| s.success());
+        log::info!("tccutil reset {service} {MAC_BUNDLE_ID}: {}", if ok { "done" } else { "failed" });
+        done.push((service, ok));
+    }
+    // Downloaded apps can run from a hidden temporary copy, which muddles permissions.
+    if let Some(app) = mac_app_bundle() {
+        let _ = std::process::Command::new("xattr").args(["-dr", "com.apple.quarantine"]).arg(&app).status();
+    }
+    done
+}
+
+/// Quit and open Edgehop.app again (permissions are checked per launch).
+#[cfg(target_os = "macos")]
+pub fn relaunch_mac_app() -> ! {
+    match mac_app_bundle() {
+        Some(app) => {
+            log::info!("relaunching {}", app.display());
+            let _ = std::process::Command::new("sh").args(["-c", "sleep 1; open -n \"$0\""]).arg(&app).spawn();
+            std::process::exit(0);
+        }
+        None => crate::recovery::restart_self("relaunch after resetting permissions"),
+    }
+}
+
 /// Mac client: hide the pointer while the mouse is on another computer.
 #[cfg(target_os = "macos")]
 struct MacHooks(std::sync::atomic::AtomicBool);

@@ -3,6 +3,17 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.2.2] - 2026-11-10
+
+### Mac
+- **Reset permissions** button: when macOS shows Edgehop as allowed but still
+  refuses it (a permission left over from an older copy), one click clears
+  Edgehop's Accessibility, Input Monitoring and input-posting entries and
+  reopens it, so macOS asks again. Newer macOS has no way to remove an app from
+  those lists by hand. Also available as `edgehop --reset-permissions`.
+- Error messages no longer tell you to remove Edgehop with − (newer macOS
+  doesn't offer that); they point at the button instead.
+
 ## [0.2.1] - 2026-11-10
 
 ### Mac

@@ -820,7 +820,10 @@ impl Gui {
     /// Mac: until Accessibility is allowed, explain and link to the setting.
     #[cfg(target_os = "macos")]
     fn accessibility_card(&mut self, ui: &mut egui::Ui, what: &str) {
-        if self.input_allowed(ui.ctx()) {
+        // Shown until macOS allows Edgehop, and also when it says "allowed"
+        // but still refused to let sharing read the keyboard and mouse.
+        let refused = crate::server::capture::refused() && !self.app.is_running();
+        if self.input_allowed(ui.ctx()) && !refused {
             return;
         }
         ui.add_space(10.0);
@@ -828,16 +831,39 @@ impl Gui {
             ui.label(format!(
                 "macOS only lets an app {what} once you allow it. Turn on Edgehop under \
                  System Settings > Privacy & Security > Accessibility (\u{201c}Device Control and Data \
-                 Access\u{201d} on newer macOS); this message goes away by itself.\n\nAlready on? That \
-                 permission belongs to an older copy of Edgehop: select Edgehop there, remove it with \
-                 \u{2212}, add it back with +, and restart Edgehop."
+                 Access\u{201d} on newer macOS); this message goes away by itself."
             ));
+            ui.add_space(4.0);
+            ui.label(
+                "Already on, but Edgehop still can't? macOS is holding a permission for an older copy of \
+                 Edgehop. Reset permissions clears it and reopens Edgehop, and macOS asks again.",
+            );
             ui.add_space(6.0);
-            if ui.button("Open Accessibility settings").clicked() {
-                let _ = std::process::Command::new("open")
-                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-                    .spawn();
-            }
+            ui.horizontal(|ui| {
+                if ui.button("Open Accessibility settings").clicked() {
+                    let _ = std::process::Command::new("open")
+                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                        .spawn();
+                }
+                if ui.button("Reset permissions").clicked() {
+                    let app = self.app.clone();
+                    let _ = std::thread::Builder::new().name("reset-permissions".into()).spawn(move || {
+                        let done = platform::reset_mac_permissions();
+                        if done.iter().all(|(_, ok)| !ok) {
+                            app.set_status(
+                                format!(
+                                    "Couldn't reset permissions. In Terminal, run: tccutil reset Accessibility {}",
+                                    platform::MAC_BUNDLE_ID
+                                ),
+                                false,
+                            );
+                            return;
+                        }
+                        app.stop_engine();
+                        platform::relaunch_mac_app();
+                    });
+                }
+            });
         });
     }
 

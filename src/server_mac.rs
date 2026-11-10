@@ -99,6 +99,12 @@ const TAP_DEFAULT: u32 = 0;
 const CAPS_LOCK_KEYCODE: u16 = 0x39;
 
 static ERROR: Mutex<String> = Mutex::new(String::new());
+static REFUSED: AtomicBool = AtomicBool::new(false);
+
+/// macOS refused the event tap the last time sharing started.
+pub fn refused() -> bool {
+    REFUSED.load(Ordering::Relaxed)
+}
 
 pub fn failure() -> String {
     let e = lk(&ERROR).clone();
@@ -130,21 +136,20 @@ fn explain_refusal() -> String {
         if listen { "allowed" } else { "not allowed" },
         if post { "allowed" } else { "not allowed" },
     );
+    REFUSED.store(true, Ordering::Relaxed);
     let msg = if !trusted {
         crate::inject::permission_prompt();
         format!(
-            "Allow Edgehop under {ACCESSIBILITY}, then press Start. If it already looks allowed there, \
-             that permission belongs to an older copy of Edgehop: select Edgehop, remove it with \u{2212}, \
-             add it back with +, and restart Edgehop."
+            "Allow Edgehop under {ACCESSIBILITY}, then press Start. Already allowed there? macOS is \
+             holding a permission for an older copy: press Reset permissions on the Screens tab."
         )
     } else if !listen {
         unsafe { CGRequestListenEventAccess() };
         "Allow Edgehop under System Settings > Privacy & Security > Input Monitoring too, then restart Edgehop.".into()
     } else {
-        format!(
-            "macOS lists Edgehop as allowed but still refuses it. Select Edgehop under {ACCESSIBILITY}, \
-             remove it with \u{2212}, add it back with +, then restart Edgehop."
-        )
+        "macOS lists Edgehop as allowed but still refuses it, which happens when the permission belongs \
+         to an older copy: press Reset permissions on the Screens tab."
+            .into()
     };
     log::error!("{msg}");
     msg
@@ -307,6 +312,7 @@ pub fn tap_loop(sink: Sink, ready: mpsc::Sender<usize>, stop: Arc<AtomicBool>) {
         let run_loop = CFRunLoopGetCurrent();
         CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
         CGEventTapEnable(tap, true);
+        REFUSED.store(false, Ordering::Relaxed);
         log::info!("input capture running (Quartz event tap)");
         let _ = ready.send(run_loop as usize);
         while !stop.load(Ordering::Relaxed) {
