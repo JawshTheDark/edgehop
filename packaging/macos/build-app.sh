@@ -51,6 +51,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSUIElement</key><false/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSLocalNetworkUsageDescription</key><string>Edgehop finds and connects to the computer sharing its keyboard and mouse on your local network.</string>
 </dict></plist>
 PLIST
 # Ad-hoc signature: required to run on Apple silicon at all.

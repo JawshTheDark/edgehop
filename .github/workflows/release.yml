@@ -46,7 +46,7 @@ jobs:
           Copy-Item target/release/edgehop.exe "dist/edgehop-$env:TAG-windows-x64.exe"
       - uses: actions/upload-artifact@v4
         with:
-          name: windows
+          name: release-windows
           path: |
             dist/*.zip
             dist/*.exe
@@ -78,7 +78,7 @@ jobs:
           tar czf "dist/$name.tar.gz" "$name"
       - uses: actions/upload-artifact@v4
         with:
-          name: linux
+          name: release-linux
           path: |
             dist/*.deb
             dist/*.tar.gz
@@ -96,13 +96,23 @@ jobs:
       - run: cargo test --release
       - name: Build a universal Edgehop.app
         run: UNIVERSAL=1 bash packaging/macos/build-app.sh
+      - name: Smoke test the app (launch, clipboard, pointer, keyboard)
+        run: |
+          if [ -f packaging/macos/smoke-test.sh ]; then bash packaging/macos/smoke-test.sh; fi
+      - name: Upload macOS screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-macos
+          path: smoke/
+          if-no-files-found: ignore
       - name: Package
         run: |
           mkdir -p upload
           ditto -c -k --keepParent dist/Edgehop.app "upload/Edgehop-$TAG-macos-universal.zip"
       - uses: actions/upload-artifact@v4
         with:
-          name: macos
+          name: release-macos
           path: upload/*.zip
 
   publish:
@@ -115,6 +125,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: assets
+          pattern: release-*
           merge-multiple: true
       - name: Release notes from CHANGELOG.md
         run: |

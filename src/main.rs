@@ -19,6 +19,7 @@ mod net;
 mod platform;
 mod proto;
 mod recovery;
+mod selftest;
 mod server;
 mod state;
 mod transfer;
@@ -57,6 +58,10 @@ fn main() {
         let size = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(256).clamp(16, 1024);
         std::fs::write(path, icon::png(size)).expect("write icon");
         return;
+    }
+    // Check clipboard and input injection on this machine (see selftest.rs).
+    if args.iter().any(|a| a == "--self-test") {
+        std::process::exit(selftest::run(&args));
     }
 
     let cfg = config::Config::load();

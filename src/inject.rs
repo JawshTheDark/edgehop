@@ -21,6 +21,15 @@ pub fn create() -> Result<Box<dyn Injector>, String> {
     Err("This operating system is not supported as a client".into())
 }
 
+/// Whether the system lets this process inject input, where it asks
+/// (macOS: Accessibility). None where no permission is involved.
+pub fn permission() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    return Some(macos::trusted());
+    #[allow(unreachable_code)]
+    None
+}
+
 /// Accumulates high-resolution wheel deltas into whole notches.
 #[derive(Default)]
 #[allow(dead_code)]
@@ -465,6 +474,10 @@ mod macos {
     const FLAG_CMD: u64 = 0x100000;
 
     unsafe impl Send for Quartz {}
+
+    pub fn trusted() -> bool {
+        unsafe { AXIsProcessTrusted() }
+    }
 
     pub struct Quartz {
         pos: CGPoint,

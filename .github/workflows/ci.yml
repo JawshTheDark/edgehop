@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,3 +27,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
       - run: cargo build --release
       - run: cargo test --release
+      # Nobody on the team has a Mac, so a real one checks the app instead:
+      # launch, clipboard, pointer and keyboard (see packaging/macos/smoke-test.sh).
+      - name: macOS app smoke test
+        if: runner.os == 'macOS'
+        run: |
+          bash packaging/macos/build-app.sh
+          bash packaging/macos/smoke-test.sh
+      - name: Upload macOS screenshots and logs
+        if: runner.os == 'macOS' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-macos
+          path: smoke/
