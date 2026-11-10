@@ -44,6 +44,7 @@ fn summary(app: &AppState) -> String {
     s.push_str(&format!("Edgehop {}\n", env!("CARGO_PKG_VERSION")));
     s.push_str(&format!("Created: {}\n", crate::platform::local_datetime()));
     s.push_str(&format!("OS: {} {}\n", std::env::consts::OS, std::env::consts::ARCH));
+    s.push_str(&format!("System: {}\n", crate::platform::environment()));
     s.push_str(&format!("Log level: {}\n", crate::state::log_level_name()));
     s.push_str(&format!("Status: {}\n", lk(&app.status)));
     s.push_str(&format!("Mouse on: {}\n", lk(&app.active_screen)));
@@ -89,6 +90,8 @@ pub fn save(app: &Arc<AppState>) -> io::Result<PathBuf> {
     out.push_str(&format!("\n==================== {name} (this computer) log ====================\n"));
     out.push_str(&local_log(6000));
     out.push('\n');
+    out.push_str(&format!("\n==================== {name} (this computer) input ====================\n"));
+    out.push_str(&crate::flight::dump());
     for (other, text) in lk(&app.remote_logs).iter() {
         out.push_str(&format!("\n==================== {other} log ====================\n"));
         out.push_str(text);

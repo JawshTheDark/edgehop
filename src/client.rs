@@ -341,12 +341,16 @@ fn session(
             }
             ToClient::Enter { x, y } => {
                 log::debug!("mouse arrived at ({x}, {y})");
+                crate::flight::rec("enter", "x y", &[x as i64, y as i64]);
                 let _ = away_tx.send(None);
                 inj.move_to(x, y);
                 *lk(&app.active_screen) = cfg.name.clone();
                 app.repaint();
             }
-            ToClient::Move { x, y } => inj.move_to(x, y),
+            ToClient::Move { x, y } => {
+                crate::flight::rec("move", "x y", &[x as i64, y as i64]);
+                inj.move_to(x, y)
+            }
             ToClient::Button { button, down } => {
                 if down {
                     buttons.insert(button);
@@ -366,6 +370,7 @@ fn session(
             }
             ToClient::Leave => {
                 log::debug!("mouse left for {server_name}");
+                crate::flight::note("leave", format!("mouse left for {server_name}"));
                 for k in keys.drain() {
                     inj.key(k, false);
                 }
@@ -457,7 +462,9 @@ fn session(
             ToClient::GetLogs => {
                 let tx2 = tx.clone();
                 thread::spawn(move || {
-                    let text = crate::diag::local_log(6000);
+                    let mut text = crate::diag::local_log(6000);
+                    text.push_str(&format!("\n\n---- system: {} ----\n", crate::platform::environment()));
+                    text.push_str(&crate::flight::dump());
                     log::debug!("sending my log to the server ({} lines)", text.lines().count());
                     let _ = lk(&tx2).send(&ToServer::Logs { text });
                 });

@@ -3,6 +3,23 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.2.4] - 2026-11-10
+
+### Stronger logs
+- **Input flight recorder**: every computer keeps its last 2000 raw input
+  events and switching decisions in memory: exactly what the OS reported
+  (positions, macOS's own deltas, Linux device events, Windows hook messages),
+  whether Edgehop kept or passed each one, the virtual pointer while away, and
+  every switch. **Save diagnostics** now includes it from every computer.
+- **Bounce detector**: if the pointer switches screens 6 times within 3 seconds,
+  Edgehop logs a warning with the full screen layout and writes the flight
+  recorder into the log, no debug mode needed.
+- Every switch says why: which edge, where on the desktop, and, coming back,
+  how hard you pushed and the last movement.
+- The log starts with the system (OS version; on Linux the distribution,
+  kernel, session type and desktop; on macOS whether Accessibility is allowed)
+  and every monitor.
+
 ## [0.2.3] - 2026-11-10
 
 ### Fixes

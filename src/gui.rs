@@ -1225,7 +1225,8 @@ impl Gui {
         card(
             ui,
             "Diagnostics",
-            "Something not working? Turn on debug logging, reproduce the problem, then save a report.",
+            "Something not working? Turn on debug logging, reproduce the problem, then save a report. \
+             It includes every computer's log and its last 2000 raw input events.",
             |ui| {
                 row(
                     ui,

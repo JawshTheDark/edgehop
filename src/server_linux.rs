@@ -588,6 +588,16 @@ fn dispatch(s: &Shared, input: Input, src: &Source) {
         (Input::Move { .. }, Source::X11(x)) => x.pointer(),
         _ => None,
     };
+    let away = s.core.try_lock().map(|c| c.is_remote()).unwrap_or(false) as i64;
+    match input {
+        Input::Move { dx, dy } => {
+            let (px, py) = local.unwrap_or((-1, -1));
+            crate::flight::rec("linux move", "dx dy x y away", &[dx as i64, dy as i64, px as i64, py as i64, away])
+        }
+        Input::Button { button, down } => crate::flight::rec("linux button", "button down away", &[button as i64, down as i64, away]),
+        Input::Wheel { dx, dy } => crate::flight::rec("linux wheel", "dx dy away", &[dx as i64, dy as i64, away]),
+        Input::Key { code, down } => crate::flight::rec("linux key", "code down away", &[code as i64, down as i64, away]),
+    }
     let Some(mut core) = try_core(s) else { return };
     match input {
         Input::Move { dx, dy } => {
@@ -641,6 +651,7 @@ pub fn run(s: Arc<Shared>, ready: mpsc::Sender<usize>, _drags: mpsc::Sender<Vec<
                     if first.swap(false, Ordering::Relaxed) {
                         log::info!("KWin is reporting the pointer at screen edges");
                     }
+                    crate::flight::rec("kwin edge", "x y", &[x as i64, y as i64]);
                     if s2.stop.load(Ordering::Relaxed) {
                         return;
                     }

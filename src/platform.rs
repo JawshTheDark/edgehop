@@ -488,6 +488,64 @@ impl DesktopHooks for crate::kde::Kde {
     }
 }
 
+/// The system in one line (OS version, desktop session), for the log and diagnostics.
+pub fn environment() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let v = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        format!(
+            "macOS {v} · Accessibility {}",
+            match crate::inject::permission() {
+                Some(true) => "allowed",
+                _ => "not allowed",
+            }
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let os = std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|t| t.lines().find_map(|l| l.strip_prefix("PRETTY_NAME=").map(|v| v.trim_matches('"').to_string())))
+            .unwrap_or_else(|| "Linux".into());
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").map(|s| s.trim().to_string()).unwrap_or_default();
+        let var = |k: &str| std::env::var(k).unwrap_or_else(|_| "-".into());
+        format!(
+            "{os} · kernel {kernel} · session {} · desktop {} · WAYLAND_DISPLAY {} · DISPLAY {}",
+            var("XDG_SESSION_TYPE"),
+            var("XDG_CURRENT_DESKTOP"),
+            var("WAYLAND_DISPLAY"),
+            var("DISPLAY")
+        )
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct OsVersionInfo {
+            size: u32,
+            major: u32,
+            minor: u32,
+            build: u32,
+            platform: u32,
+            csd: [u16; 128],
+        }
+        #[link(name = "ntdll")]
+        extern "system" {
+            fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
+        }
+        let mut v = OsVersionInfo { size: std::mem::size_of::<OsVersionInfo>() as u32, major: 0, minor: 0, build: 0, platform: 0, csd: [0; 128] };
+        unsafe { RtlGetVersion(&mut v) };
+        format!("Windows {}.{}.{}", v.major, v.minor, v.build)
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        std::env::consts::OS.to_string()
+    }
+}
+
 /// Local wall-clock time: (hour, minute, second, millisecond).
 pub fn local_clock() -> (u32, u32, u32, u32) {
     let (_, _, _, h, m, s, ms) = local_datetime_parts();

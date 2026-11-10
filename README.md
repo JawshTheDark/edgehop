@@ -149,6 +149,11 @@ Settings live in `%APPDATA%\edgehop\config\config.json` (Windows),
 then click **Save diagnostics**. That writes one file to your Desktop with the
 version, settings (keys shortened to fingerprints), monitors, connections and
 recent logs from *every* connected computer: attach it to a bug report.
+It also holds each computer's **input flight recorder**: the last 2000 raw
+input events exactly as the OS reported them, and every switching decision.
+That's recorded all the time, so it's there even without debug logging. If the
+pointer ever bounces between screens (6 switches in 3 seconds), Edgehop writes
+the recorder and the screen layout to the log on its own.
 **Include every input event** adds trace-level logging of each key and mouse
 push. From a terminal: `edgehop --debug` / `edgehop --trace`, or set
 `EDGEHOP_LOG=debug`. Logs live in `%LOCALAPPDATA%\edgehop\cache\edgehop.log`

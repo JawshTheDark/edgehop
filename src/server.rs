@@ -183,6 +183,9 @@ pub struct Core {
     command_is_ctrl: bool,
     /// Just came back through this edge, at this spot, at this time.
     reentry: Option<(Dir, i32, i32, Instant)>,
+    /// When the pointer last switched screens (to notice it bouncing).
+    switches: VecDeque<Instant>,
+    bounce_reported: Option<Instant>,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -191,6 +194,9 @@ const VK_SCROLL: u32 = 0x91;
 /// this far from it, or for this long.
 const REENTRY_PX: i32 = 6;
 const REENTRY_TIME: Duration = Duration::from_millis(500);
+/// This many switches within the window looks like the pointer bouncing.
+const BOUNCE_SWITCHES: usize = 6;
+const BOUNCE_WINDOW: Duration = Duration::from_secs(3);
 /// Scroll Lock (F14 on a Mac keyboard): always returns the mouse home.
 const KEY_SCROLLLOCK: u16 = 70;
 /// A client silent for this long is treated as unresponsive (pinged every second).
@@ -232,6 +238,8 @@ impl Core {
             app,
             command_is_ctrl: false,
             reentry: None,
+            switches: VecDeque::new(),
+            bounce_reported: None,
         };
         c.apply_config(cfg);
         c
@@ -403,6 +411,57 @@ impl Core {
     /// Just came back through an edge: a touch against that same edge (a
     /// trackpad wobbling as you lift your finger, a late or bogus report) must
     /// not send the pointer straight back out.
+    /// Record a switch; if the pointer keeps flipping between screens, say so
+    /// loudly and write out the input flight recorder.
+    fn note_switch(&mut self, to: &str, what: String) {
+        crate::flight::note("switch", what);
+        let now = Instant::now();
+        self.switches.push_back(now);
+        while self.switches.front().is_some_and(|t| now.duration_since(*t) > BOUNCE_WINDOW) {
+            self.switches.pop_front();
+        }
+        let recently = self.bounce_reported.is_some_and(|t| now.duration_since(t) < Duration::from_secs(60));
+        if self.switches.len() >= BOUNCE_SWITCHES && !recently {
+            self.bounce_reported = Some(now);
+            let mut layout = String::new();
+            for m in &self.mons {
+                layout.push_str(&format!(
+                    "\n  monitor {:?} {}x{} at ({}, {}){}",
+                    m.label,
+                    m.rect.w(),
+                    m.rect.h(),
+                    m.rect.l,
+                    m.rect.t,
+                    if m.primary { " main" } else { "" }
+                ));
+            }
+            for p in &self.screens {
+                let r = p.rect();
+                layout.push_str(&format!(
+                    "\n  screen {} {}x{} placed at ({}, {}) to ({}, {}), scale {:.3}{}",
+                    p.name,
+                    p.w,
+                    p.h,
+                    r.l,
+                    r.t,
+                    r.r,
+                    r.b,
+                    p.scale,
+                    if self.clients.contains_key(&p.name) { "" } else { " (offline)" }
+                ));
+            }
+            log::warn!(
+                "the pointer switched screens {} times in {} s (now to {to}): it may be bouncing. Layout:{layout}",
+                self.switches.len(),
+                BOUNCE_WINDOW.as_secs()
+            );
+            // Off the input path: writing a couple of thousand lines takes a moment.
+            let _ = thread::Builder::new()
+                .name("flight-dump".into())
+                .spawn(|| crate::flight::log_dump("the pointer is bouncing between screens"));
+        }
+    }
+
     /// Called for every pointer position on this computer.
     fn track_reentry(&mut self, x: i32, y: i32) {
         let Some((edge, ex, ey, at)) = self.reentry else { return };
@@ -467,6 +526,8 @@ impl Core {
             }
             if let Some((Hit::Client(name, px, py), dir, _)) = hit {
                 if self.reentry.is_some_and(|(edge, ..)| edge == dir) {
+                    log::debug!("not leaving through the {dir:?} edge at ({x}, {y}): just came back through it");
+                    crate::flight::note("held", format!("{dir:?} edge at ({x}, {y}): just came back through it"));
                     return false;
                 }
                 self.enter_client(name, dir, px, py);
@@ -486,6 +547,7 @@ impl Core {
         let limit = if self.parked { 600 } else { 200 };
         if dx.abs() > limit || dy.abs() > limit {
             log::info!("ignoring stale mouse position ({x}, {y}); parked at ({cx0}, {cy0})");
+            crate::flight::rec("stale", "x y dx dy limit", &[x as i64, y as i64, dx as i64, dy as i64, limit as i64]);
             self.desk.set_cursor(cx0, cy0);
             return true;
         }
@@ -547,6 +609,11 @@ impl Core {
                 let carrying = self.carry.is_some() && self.left_remote && self.remote_buttons == 1;
                 match self.cast(ox, oy, dir, Some(&active)) {
                     Some(hit) if self.remote_buttons == 0 => {
+                        log::info!(
+                            "leaving {active} through its {dir:?} edge at ({ax:.0}, {ay:.0}): pushed {:.0} of {:.0} px, last move ({dx}, {dy})",
+                            self.push,
+                            self.resistance
+                        );
                         self.cross(hit, dir);
                         return true;
                     }
@@ -574,6 +641,11 @@ impl Core {
         }
         self.cx = ax;
         self.cy = ay;
+        crate::flight::rec(
+            "away",
+            "x y dx dy push",
+            &[ax as i64, ay as i64, dx as i64, dy as i64, self.push as i64],
+        );
         self.send(&active, ToClient::Move { x: ax as i32, y: ay as i32 });
         // Keep the real cursor parked so the next delta is measured from the center.
         self.desk.set_cursor(cx0, cy0);
@@ -749,7 +821,13 @@ impl Core {
             Dir::Up => cy = h - 1.0,
         }
         let from_server = !self.is_remote();
-        log::info!("switch {} -> {name} at ({}, {})", self.active, cx as i32, cy as i32);
+        log::info!(
+            "switch {} -> {name} at ({}, {}): through the {dir:?} edge at ({px:.0}, {py:.0}) on the desktop",
+            self.active,
+            cx as i32,
+            cy as i32
+        );
+        self.note_switch(&name, format!("{} -> {name} at ({}, {}) via {dir:?} edge", self.active, cx as i32, cy as i32));
         self.leave_current();
         if from_server {
             self.desk.captured(true);
@@ -770,6 +848,8 @@ impl Core {
 
     fn enter_server(&mut self, x: i32, y: i32) {
         log::info!("switch {} -> {} at ({x}, {y})", self.active, self.me);
+        let me = self.me.clone();
+        self.note_switch(&me, format!("{} -> {me} at ({x}, {y})", self.active));
         self.leave_current();
         self.active = self.me.clone();
         self.desk.captured(false);
@@ -1596,6 +1676,12 @@ mod hooks {
     }
 
     fn handle_mouse(msg: u32, ms: &MSLLHOOKSTRUCT) -> bool {
+        let took = handle_mouse_inner(msg, ms);
+        crate::flight::rec("win mouse", "msg x y data took", &[msg as i64, ms.pt.x as i64, ms.pt.y as i64, (ms.mouseData >> 16) as i16 as i64, took as i64]);
+        took
+    }
+
+    fn handle_mouse_inner(msg: u32, ms: &MSLLHOOKSTRUCT) -> bool {
         let Some(s) = shared() else { return false };
         let Some(mut core) = try_core(&s) else { return false };
         let hi = (ms.mouseData >> 16) as u16;
@@ -1625,7 +1711,9 @@ mod hooks {
             return false;
         }
         let Some(mut core) = try_core(&s) else { return false };
-        core.on_key(kb.vkCode, kb.scanCode, kb.flags & LLKHF_EXTENDED != 0, down)
+        let took = core.on_key(kb.vkCode, kb.scanCode, kb.flags & LLKHF_EXTENDED != 0, down);
+        crate::flight::rec("win key", "vk scan flags down took", &[kb.vkCode as i64, kb.scanCode as i64, kb.flags as i64, down as i64, took as i64]);
+        took
     }
 
     /// Tick of the last event our hooks saw (to notice if Windows drops them).
@@ -1868,6 +1956,17 @@ mod tests {
             sent.iter().any(|m| matches!(m, ToClient::Move { x: 1519, y: 1013 })),
             "pinned in the bottom-right corner"
         );
+    }
+
+    #[test]
+    fn bouncing_between_screens_is_reported() {
+        let (mut core, _rx, _) = setup(true);
+        for i in 0..BOUNCE_SWITCHES - 1 {
+            core.note_switch("x", format!("switch {i}"));
+        }
+        assert!(core.bounce_reported.is_none(), "a few switches are normal");
+        core.note_switch("x", "one too many".into());
+        assert!(core.bounce_reported.is_some(), "this many in a few seconds is a bounce");
     }
 
     #[test]

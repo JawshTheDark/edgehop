@@ -274,6 +274,20 @@ fn translate(etype: u32, e: CGEventRef) -> [Option<Input>; 2] {
     }
 }
 
+/// Into the flight recorder: exactly what macOS reported, and whether we kept it.
+fn record(input: Input, took: bool) {
+    let t = took as i64;
+    match input {
+        Input::Move { x, y, dx, dy } => {
+            crate::flight::rec("mac move", "x y os_dx os_dy took", &[x as i64, y as i64, dx as i64, dy as i64, t])
+        }
+        Input::Button { button, down } => crate::flight::rec("mac button", "button down took", &[button as i64, down as i64, t]),
+        Input::Wheel { dx, dy } => crate::flight::rec("mac wheel", "dx dy took", &[dx as i64, dy as i64, t]),
+        Input::Key { code, down } => crate::flight::rec("mac key", "code down took", &[code as i64, down as i64, t]),
+        Input::Other => crate::flight::rec("mac other", "took", &[t]),
+    }
+}
+
 extern "C" fn callback(_proxy: *mut c_void, etype: u32, event: CGEventRef, info: *mut c_void) -> CGEventRef {
     let st = unsafe { &mut *(info as *mut TapState) };
     if etype == TAP_DISABLED_BY_TIMEOUT || etype == TAP_DISABLED_BY_USER_INPUT {
@@ -283,7 +297,9 @@ extern "C" fn callback(_proxy: *mut c_void, etype: u32, event: CGEventRef, info:
     }
     let mut swallow = false;
     for input in translate(etype, event).into_iter().flatten() {
-        swallow |= std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (st.sink)(input))).unwrap_or(false);
+        let took = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (st.sink)(input))).unwrap_or(false);
+        record(input, took);
+        swallow |= took;
     }
     if swallow {
         std::ptr::null_mut()

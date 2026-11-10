@@ -8,6 +8,7 @@ mod config;
 mod dragdrop;
 mod diag;
 mod files;
+mod flight;
 mod gui;
 mod icon;
 mod inject;
@@ -28,6 +29,7 @@ mod tray;
 mod win32;
 
 fn main() {
+    flight::init();
     platform::init_dpi();
     // If a previous run died while the cursor was hidden, bring it back.
     platform::restore_cursor();
@@ -93,6 +95,18 @@ fn main() {
             c.name,
             state::log_level_name()
         );
+        log::info!("system: {}", platform::environment());
+        for m in platform::monitors() {
+            log::info!(
+                "monitor {:?} {}x{} at ({}, {}){}",
+                m.label,
+                m.rect.w() as i32,
+                m.rect.h() as i32,
+                m.rect.l as i32,
+                m.rect.t as i32,
+                if m.primary { " (main)" } else { "" }
+            );
+        }
     }
 
     if args.iter().any(|a| a == "--which-window") {
