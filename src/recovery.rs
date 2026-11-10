@@ -31,6 +31,7 @@ pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
         log::error!("crash in thread '{thread}': {info}");
+        crate::state::flush_logs();
         crate::platform::restore_cursor();
         prev(info);
     }));
@@ -76,6 +77,7 @@ pub fn restart_self(reason: &str) -> ! {
             let _ = std::process::Command::new(exe).args(&args).spawn();
         }
     }
+    crate::state::flush_logs();
     std::process::exit(75);
 }
 

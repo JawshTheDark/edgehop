@@ -209,6 +209,7 @@ impl AppState {
 
     pub fn quit(&self) -> ! {
         self.stop_engine();
+        flush_logs();
         std::process::exit(0);
     }
 }
@@ -218,8 +219,6 @@ impl AppState {
 // ---------------------------------------------------------------------------
 
 static SINK: OnceLock<Arc<AppState>> = OnceLock::new();
-/// The open log file and how many bytes it holds (for rotation).
-static LOGFILE: OnceLock<Mutex<(Option<std::fs::File>, u64)>> = OnceLock::new();
 const ROTATE_AT: u64 = 8 * 1024 * 1024;
 const KEEP_IN_MEMORY: usize = 3000;
 
@@ -267,6 +266,17 @@ pub fn log_level_name() -> String {
 
 struct Logger;
 
+enum LogMsg {
+    Line(log::Level, String),
+    /// Reply once everything sent before this is written.
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// Lines go to a writer thread: logging never waits on the disk or the
+/// window. That matters most inside the input hooks, where Windows stops
+/// waiting after a moment and lets the key through to this computer too.
+static LOG_TX: OnceLock<std::sync::mpsc::Sender<LogMsg>> = OnceLock::new();
+
 impl log::Log for Logger {
     fn enabled(&self, m: &log::Metadata) -> bool {
         m.level() <= log::max_level() && m.target().starts_with("edgehop")
@@ -284,32 +294,108 @@ impl log::Log for Logger {
             thread.name().unwrap_or("-"),
             r.args()
         );
-        eprintln!("{line}");
-        if let Some(f) = LOGFILE.get() {
-            use std::io::Write;
-            let mut g = lk(f);
-            if g.1 > ROTATE_AT {
-                // Keep one previous file; start a fresh one.
-                g.0 = None;
-                let _ = std::fs::rename(log_path(), previous_log_path());
-                g.0 = std::fs::OpenOptions::new().create(true).append(true).open(log_path()).ok();
-                g.1 = 0;
+        match LOG_TX.get() {
+            Some(tx) => {
+                let _ = tx.send(LogMsg::Line(r.level(), line));
             }
-            if let Some(file) = g.0.as_mut() {
-                if writeln!(file, "{line}").is_ok() {
-                    g.1 += line.len() as u64 + 1;
+            None => eprintln!("{line}"),
+        }
+    }
+    fn flush(&self) {
+        flush_logs();
+    }
+}
+
+/// Wait (briefly) until every line logged so far is on disk. Call before exiting.
+pub fn flush_logs() {
+    if let Some(tx) = LOG_TX.get() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        if tx.send(LogMsg::Flush(done_tx)).is_ok() {
+            let _ = done_rx.recv_timeout(std::time::Duration::from_secs(1));
+        }
+    }
+}
+
+/// The writer thread: file (with rotation), stderr and the in-app activity
+/// log, a batch at a time.
+fn write_logs(rx: std::sync::mpsc::Receiver<LogMsg>, file: Option<std::fs::File>, mut size: u64) {
+    use std::io::Write;
+    let mut out = file.map(std::io::BufWriter::new);
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        while batch.len() < 512 {
+            match rx.try_recv() {
+                Ok(m) => batch.push(m),
+                Err(_) => break,
+            }
+        }
+        let mut lines = Vec::with_capacity(batch.len());
+        let mut waiting = Vec::new();
+        for m in batch {
+            match m {
+                LogMsg::Line(level, text) => lines.push(LogLine { level, text }),
+                LogMsg::Flush(done) => waiting.push(done),
+            }
+        }
+        for l in &lines {
+            eprintln!("{}", l.text);
+            if size > ROTATE_AT {
+                // Keep one previous file; start a fresh one.
+                if let Some(mut w) = out.take() {
+                    let _ = w.flush();
+                }
+                let _ = std::fs::rename(log_path(), previous_log_path());
+                out = std::fs::OpenOptions::new().create(true).append(true).open(log_path()).ok().map(std::io::BufWriter::new);
+                size = 0;
+            }
+            if let Some(w) = out.as_mut() {
+                if writeln!(w, "{}", l.text).is_ok() {
+                    size += l.text.len() as u64 + 1;
                 }
             }
         }
+        if let Some(w) = out.as_mut() {
+            let _ = w.flush();
+        }
         if let Some(app) = SINK.get() {
-            let mut logs = lk(&app.logs);
-            logs.push_back(LogLine { level: r.level(), text: line });
-            while logs.len() > KEEP_IN_MEMORY {
-                logs.pop_front();
+            if !lines.is_empty() {
+                let mut logs = lk(&app.logs);
+                logs.extend(lines);
+                while logs.len() > KEEP_IN_MEMORY {
+                    logs.pop_front();
+                }
             }
         }
+        for done in waiting {
+            let _ = done.send(());
+        }
     }
-    fn flush(&self) {}
+}
+
+#[cfg(test)]
+mod log_writer_tests {
+    use super::*;
+
+    #[test]
+    fn lines_reach_the_file_and_flush_waits_for_them() {
+        let dir = std::env::temp_dir().join(format!("edgehop-log-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.log");
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || write_logs(rx, file, 0));
+        for i in 0..1000 {
+            tx.send(LogMsg::Line(log::Level::Trace, format!("line {i}"))).unwrap();
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        tx.send(LogMsg::Flush(done_tx)).unwrap();
+        done_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("flush answered");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("line 0\n") && text.contains("line 999\n"), "every line written before the flush answers");
+        drop(tx);
+        writer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// Start logging. Level: `--trace`/`--debug` flag, else EDGEHOP_LOG, else the setting.
@@ -322,7 +408,10 @@ pub fn init_logger(app: Arc<AppState>, args: &[String]) {
     }
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
-    let _ = LOGFILE.set(Mutex::new((file, size)));
+    let (tx, rx) = std::sync::mpsc::channel();
+    if std::thread::Builder::new().name("log-writer".into()).spawn(move || write_logs(rx, file, size)).is_ok() {
+        let _ = LOG_TX.set(tx);
+    }
     let _ = log::set_boxed_logger(Box::new(Logger));
     let level = if args.iter().any(|a| a == "--trace") {
         "trace".to_string()

@@ -417,6 +417,7 @@ pub fn relaunch_mac_app() -> ! {
     match mac_app_bundle() {
         Some(app) => {
             log::info!("relaunching {}", app.display());
+            crate::state::flush_logs();
             let _ = std::process::Command::new("sh").args(["-c", "sleep 1; open -n \"$0\""]).arg(&app).spawn();
             std::process::exit(0);
         }

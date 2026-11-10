@@ -115,6 +115,7 @@ fn main() {
             Some(h) => println!("drop folder under pointer: {:?}", h.drop_folder()),
             None => println!("no desktop hooks on this system"),
         }
+        state::flush_logs();
         return;
     }
 
@@ -138,4 +139,5 @@ fn main() {
         eprintln!("GUI failed: {e}");
     }
     app.stop_engine();
+    state::flush_logs();
 }

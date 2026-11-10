@@ -11,6 +11,7 @@ use std::time::Instant;
 
 const CAPACITY: usize = 2000;
 
+#[derive(Clone)]
 struct Entry {
     /// Milliseconds since Edgehop started.
     ms: u64,
@@ -58,7 +59,8 @@ pub fn note(what: &'static str, text: impl Into<String>) {
 
 /// Everything recorded, oldest first, one event per line.
 pub fn dump() -> String {
-    let ring = lk(&RING);
+    // Copy, then format without holding the lock the input hooks record into.
+    let ring: Vec<Entry> = lk(&RING).iter().cloned().collect();
     let mut out = String::with_capacity(ring.len() * 64);
     let _ = writeln!(
         out,

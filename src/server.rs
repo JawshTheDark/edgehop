@@ -1744,12 +1744,24 @@ mod hooks {
         (SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, hmod, 0), SetWindowsHookExW(WH_KEYBOARD_LL, key_proc, hmod, 0))
     }
 
+    /// Windows only waits so long for a hook: past that it delivers the
+    /// event to this computer anyway (a key then reaches both computers).
+    fn note_slow(what: &str, id: u32, start: std::time::Instant) {
+        let ms = start.elapsed().as_millis() as i64;
+        if ms >= 50 {
+            log::warn!("input hook took {ms} ms for a {what} event ({id:#x}); Windows lets input through after about 300 ms");
+            crate::flight::rec("slow hook", "ms id", &[ms, id as i64]);
+        }
+    }
+
     unsafe extern "system" fn mouse_proc(code: i32, w: usize, l: isize) -> isize {
         LAST_HOOK_TICK.store(GetTickCount(), Ordering::Relaxed);
         if code >= 0 {
             let ms = &*(l as *const MSLLHOOKSTRUCT);
             if ms.flags & LLMHF_INJECTED == 0 {
+                let start = std::time::Instant::now();
                 let block = catch_unwind(AssertUnwindSafe(|| handle_mouse(w as u32, ms))).unwrap_or(false);
+                note_slow("mouse", w as u32, start);
                 if block {
                     return 1;
                 }
@@ -1763,7 +1775,9 @@ mod hooks {
         if code >= 0 {
             let kb = &*(l as *const KBDLLHOOKSTRUCT);
             if kb.flags & LLKHF_INJECTED == 0 {
+                let start = std::time::Instant::now();
                 let block = catch_unwind(AssertUnwindSafe(|| handle_key(w as u32, kb))).unwrap_or(false);
+                note_slow("key", kb.vkCode, start);
                 if block {
                     return 1;
                 }

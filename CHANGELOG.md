@@ -3,6 +3,18 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.2.5] - 2026-11-10
+
+### Fixes
+- **Windows key (and other keys) reaching both computers.** With detailed
+  logging on, every key and mouse event was written to disk and to the
+  Activity tab from inside Windows' input hook. When that stalled for a moment
+  (antivirus scanning the log, the log file rotating, the Activity tab
+  drawing), Windows stopped waiting and delivered the key to the sharing
+  computer too. Logging now happens on its own thread; the hooks only hand
+  lines over. Hooks that ever take 50 ms or more are logged as a warning and
+  kept in the flight recorder, so this can't go unnoticed again.
+
 ## [0.2.4] - 2026-11-10
 
 ### Stronger logs
