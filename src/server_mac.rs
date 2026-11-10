@@ -136,16 +136,21 @@ fn mask() -> u64 {
 }
 
 /// Device-specific flag bit for each modifier key (left/right told apart).
-fn modifier_bit(keycode: u16) -> Option<u64> {
+/// For each modifier key: (its own left/right bit, its family flag, both sides' bits).
+fn modifier_bit(keycode: u16) -> Option<(u64, u64, u64)> {
+    const SHIFT: u64 = 0x20000;
+    const CTRL: u64 = 0x40000;
+    const ALT: u64 = 0x80000;
+    const CMD: u64 = 0x100000;
     Some(match keycode {
-        0x38 => 0x02,   // left shift
-        0x3C => 0x04,   // right shift
-        0x3B => 0x01,   // left control
-        0x3E => 0x2000, // right control
-        0x3A => 0x20,   // left option
-        0x3D => 0x40,   // right option
-        0x37 => 0x08,   // left command
-        0x36 => 0x10,   // right command
+        0x38 => (0x02, SHIFT, 0x06),     // left shift
+        0x3C => (0x04, SHIFT, 0x06),     // right shift
+        0x3B => (0x01, CTRL, 0x2001),    // left control
+        0x3E => (0x2000, CTRL, 0x2001),  // right control
+        0x3A => (0x20, ALT, 0x60),       // left option
+        0x3D => (0x40, ALT, 0x60),       // right option
+        0x37 => (0x08, CMD, 0x18),       // left command
+        0x36 => (0x10, CMD, 0x18),       // right command
         _ => return None,
     })
 }
@@ -203,7 +208,13 @@ fn translate(etype: u32, e: CGEventRef) -> [Option<Input>; 2] {
                     return [Some(Input::Key { code, down: true }), Some(Input::Key { code, down: false })];
                 }
                 match modifier_bit(k) {
-                    Some(bit) => [Some(Input::Key { code, down: CGEventGetFlags(e) & bit != 0 }), None],
+                    Some((bit, family, both)) => {
+                        let flags = CGEventGetFlags(e);
+                        // Real keyboards set a left/right bit; synthetic events
+                        // may only set the family flag.
+                        let down = if flags & both != 0 { flags & bit != 0 } else { flags & family != 0 };
+                        [Some(Input::Key { code, down }), None]
+                    }
                     None => [Some(Input::Other), None],
                 }
             }

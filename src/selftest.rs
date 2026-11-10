@@ -89,6 +89,22 @@ pub fn run(args: &[String]) -> i32 {
     finish(r)
 }
 
+/// Command+A, Command+C in the focused window; what it copied.
+#[cfg(target_os = "macos")]
+fn copy_everything(inj: &mut dyn crate::inject::Injector) -> Option<String> {
+    const NOTHING: &str = "edgehop: nothing copied yet";
+    crate::clipboard::set(NOTHING);
+    select_all_and_copy(inj, 125);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let got = crate::clipboard::get();
+        if got.as_deref() != Some(NOTHING) || Instant::now() > deadline {
+            return got.filter(|t| t != NOTHING);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Waits until input capture has reported what `ok` looks for.
 #[cfg(target_os = "macos")]
 fn wait_for<T: Clone>(seen: &std::sync::Mutex<Vec<T>>, ok: impl Fn(&[T]) -> bool) -> (bool, Vec<T>) {
@@ -175,6 +191,8 @@ fn sharing_mac(r: &mut Report, inj: &mut dyn crate::inject::Injector, events_wor
 
     // While the mouse is on another computer, nothing may reach this Mac.
     if typed {
+        // What TextEdit holds now (the checks above typed into it too).
+        let before = copy_everything(inj);
         swallow.store(true, Ordering::Relaxed);
         for _ in 0..3 {
             inj.key(44, true); // Z
@@ -182,11 +200,11 @@ fn sharing_mac(r: &mut Report, inj: &mut dyn crate::inject::Injector, events_wor
         }
         std::thread::sleep(Duration::from_millis(300));
         swallow.store(false, Ordering::Relaxed);
-        crate::clipboard::set("before swallow check");
-        select_all_and_copy(inj, 125);
-        match copied() {
-            Some(t) if t == TYPED => r.pass("swallow while away", "keys typed while away never reached TextEdit"),
-            other => r.fail("swallow while away", format!("TextEdit now holds {other:?}")),
+        let after = copy_everything(inj);
+        if before.is_some() && before == after {
+            r.pass("swallow while away", "keys typed while away never reached TextEdit");
+        } else {
+            r.fail("swallow while away", format!("TextEdit held {before:?}, then {after:?}"));
         }
     } else {
         r.skip("swallow while away", "needs --type (a text editor in front)");

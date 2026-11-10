@@ -686,22 +686,34 @@ mod macos {
 
         fn key(&mut self, code: u16, down: bool) {
             let code = if super::ctrl_is_command() { super::swap_ctrl_meta(code) } else { code };
-            let flag = match code {
-                42 | 54 => FLAG_SHIFT,
-                29 | 97 => FLAG_CTRL,
-                56 | 100 => FLAG_ALT,
-                125 | 126 => FLAG_CMD,
-                58 => FLAG_CAPS,
-                _ => 0,
-            };
-            if flag != 0 && flag != FLAG_CAPS {
+            // Modifiers carry the family flag (Shift...) and, like a real
+            // keyboard, the left/right bit apps use to tell the two apart.
+            const SIDES: [(u16, u64, u64); 8] = [
+                (42, 0x02, FLAG_SHIFT),
+                (54, 0x04, FLAG_SHIFT),
+                (29, 0x01, FLAG_CTRL),
+                (97, 0x2000, FLAG_CTRL),
+                (56, 0x20, FLAG_ALT),
+                (100, 0x40, FLAG_ALT),
+                (125, 0x08, FLAG_CMD),
+                (126, 0x10, FLAG_CMD),
+            ];
+            if let Some(&(_, bit, _)) = SIDES.iter().find(|(c, ..)| *c == code) {
                 if down {
-                    self.flags |= flag;
+                    self.flags |= bit;
                 } else {
-                    self.flags &= !flag;
+                    self.flags &= !bit;
                 }
-            } else if flag == FLAG_CAPS && down {
+            } else if code == 58 && down {
                 self.flags ^= FLAG_CAPS;
+            }
+            for family in [FLAG_SHIFT, FLAG_CTRL, FLAG_ALT, FLAG_CMD] {
+                let held = SIDES.iter().filter(|(_, _, f)| *f == family).any(|(_, bit, _)| self.flags & bit != 0);
+                if held {
+                    self.flags |= family;
+                } else {
+                    self.flags &= !family;
+                }
             }
             let Some(k) = evdev_to_mac(code) else { return };
             let e = unsafe { CGEventCreateKeyboardEvent(std::ptr::null(), k, down) };
