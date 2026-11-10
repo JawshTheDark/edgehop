@@ -16,6 +16,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # macOS builds run on macOS 11 (Big Sur) and later.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
   TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
@@ -82,7 +84,7 @@ jobs:
             dist/*.tar.gz
 
   macos:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
         with:
