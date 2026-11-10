@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=kvmlink
+GenericName=Keyboard & Mouse Sharing
+Comment=Control this computer with another computer's keyboard and mouse
+Exec=kvmlink
+Icon=kvmlink
+Categories=Utility;Network;
+Keywords=kvm;synergy;barrier;mouse;keyboard;share;
+StartupNotify=false
