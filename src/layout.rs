@@ -27,6 +27,7 @@ impl Rect {
     pub fn h(&self) -> f64 {
         self.b - self.t
     }
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.l && x < self.r && y >= self.t && y < self.b
     }

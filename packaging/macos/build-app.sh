@@ -1,25 +1,59 @@
 #!/usr/bin/env bash
-# Build edgehop.app on a Mac:  ./packaging/macos/build-app.sh   (needs Xcode command line tools + rustup)
+# Build Edgehop.app on a Mac:  ./packaging/macos/build-app.sh
+# Needs the Xcode command line tools and rustup.
+# UNIVERSAL=1 builds one app that runs on both Apple silicon and Intel Macs
+# (rustup target add aarch64-apple-darwin x86_64-apple-darwin).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
-cargo build --release
-APP=dist/edgehop.app
-rm -rf "$APP"
+VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+
+if [ "${UNIVERSAL:-0}" = 1 ]; then
+    cargo build --release --target aarch64-apple-darwin
+    cargo build --release --target x86_64-apple-darwin
+    BIN=target/edgehop-universal
+    lipo -create -output "$BIN" \
+        target/aarch64-apple-darwin/release/edgehop \
+        target/x86_64-apple-darwin/release/edgehop
+    RUN=target/aarch64-apple-darwin/release/edgehop
+    [ "$(uname -m)" = arm64 ] || RUN=target/x86_64-apple-darwin/release/edgehop
+else
+    cargo build --release
+    BIN=target/release/edgehop
+    RUN=$BIN
+fi
+
+APP=dist/Edgehop.app
+rm -rf "$APP" dist/edgehop.app
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/edgehop "$APP/Contents/MacOS/edgehop"
+cp "$BIN" "$APP/Contents/MacOS/edgehop"
+
+# App icon, drawn by the binary itself.
+ICONSET=$(mktemp -d)/Edgehop.iconset
+mkdir -p "$ICONSET"
+for s in 16 32 128 256 512; do
+    "$RUN" --write-icon "$ICONSET/icon_${s}x${s}.png" "$s"
+    "$RUN" --write-icon "$ICONSET/icon_${s}x${s}@2x.png" "$((s * 2))"
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/Edgehop.icns"
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleName</key><string>edgehop</string>
+  <key>CFBundleName</key><string>Edgehop</string>
+  <key>CFBundleDisplayName</key><string>Edgehop</string>
   <key>CFBundleIdentifier</key><string>com.edgehop.app</string>
   <key>CFBundleExecutable</key><string>edgehop</string>
-  <key>CFBundleVersion</key><string>0.1.0</string>
+  <key>CFBundleIconFile</key><string>Edgehop</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSUIElement</key><false/>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
-codesign --force --deep -s - "$APP" 2>/dev/null || true
-echo "Built $APP. Move it to /Applications, open it, then allow it under"
+# Ad-hoc signature: required to run on Apple silicon at all.
+codesign --force --deep -s - "$APP"
+echo "Built $APP ($VERSION). Move it to /Applications, open it, then allow it under"
 echo "System Settings → Privacy & Security → Accessibility."

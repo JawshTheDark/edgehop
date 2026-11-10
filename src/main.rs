@@ -54,7 +54,8 @@ fn main() {
     }
     if let Some(i) = args.iter().position(|a| a == "--write-icon") {
         let path = args.get(i + 1).map(String::as_str).unwrap_or("edgehop.png");
-        std::fs::write(path, icon::png(256)).expect("write icon");
+        let size = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(256).clamp(16, 1024);
+        std::fs::write(path, icon::png(size)).expect("write icon");
         return;
     }
 

@@ -251,6 +251,7 @@ pub struct Discovered {
 }
 
 /// Server side: answer discovery broadcasts until `stop` is set.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn run_discovery_responder(stop: Arc<AtomicBool>, info: Announce) {
     let mut warned = false;
     let sock = loop {

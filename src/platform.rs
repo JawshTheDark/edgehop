@@ -72,6 +72,7 @@ pub fn monitors() -> Vec<crate::layout::Monitor> {
 }
 
 /// Monitor rectangles only: fast, used by the switching logic.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn monitor_rects() -> Vec<crate::layout::Monitor> {
     enumerate(false)
 }
@@ -139,6 +140,7 @@ pub fn restore_cursor() {
 }
 
 /// Show/hide this computer's cursor from any thread (Windows).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn set_cursor_visible(visible: bool) {
     #[cfg(windows)]
     {

@@ -17,7 +17,9 @@ computers over your local network.
 
 - **Monitor-level layout**: place each computer against any edge of any monitor,
   like Windows' Display settings. Positions line up across edges, corner to corner.
-- **Clipboard sharing**: text *and images* (snip on one computer, paste on another).
+- **Clipboard sharing**: text, images (snip on one computer, paste on another),
+  and *files and folders*: copy on one computer, paste on the other. Big files
+  stream over several encrypted connections at once to fill your LAN.
 - **Drag files across screens**, in both directions.
 - **Encrypted and paired**: Noise protocol (X25519 + ChaCha20-Poly1305). A new
   computer must be approved, and both sides show the same 6-digit code.
@@ -32,9 +34,32 @@ computers over your local network.
   <img src="docs/settings.png" width="640" alt="Edgehop settings">
 </p>
 
-## Install
+## Download
 
-### Windows (the computer with the keyboard and mouse)
+Grab the latest build from the
+**[Releases page](https://github.com/JawshTheDark/edgehop/releases/latest)**.
+
+| Computer | File | Install |
+|---|---|---|
+| Windows (the one with the keyboard and mouse) | `Edgehop-<version>-windows-x64.zip` | Unzip, right-click `install.ps1` → *Run with PowerShell* |
+| Ubuntu / Debian | `edgehop_<version>_amd64.deb` | `sudo apt install ./edgehop_*.deb`, then **log out and back in once** |
+| Other Linux | `edgehop-<version>-linux-x86_64.tar.gz` | Run `edgehop`; copy `60-edgehop-uinput.rules` to `/etc/udev/rules.d/` |
+| macOS (Apple silicon and Intel) | `Edgehop-<version>-macos-universal.zip` | Move `Edgehop.app` to Applications |
+
+The builds aren't code-signed yet, so the first launch needs one extra click:
+on Windows, SmartScreen's *More info → Run anyway*; on macOS, right-click the
+app → *Open* (or *Open Anyway* under Privacy & Security). On macOS, also allow
+Edgehop under System Settings → Privacy & Security → **Accessibility**.
+
+The Windows installer copies the app to `%LOCALAPPDATA%\Programs\Edgehop`, adds a
+Start Menu entry, and asks for admin once to allow it through the firewall on
+**Private** networks. Make sure your Wi-Fi/Ethernet is set to *Private* in
+Windows settings. The Linux package adds a udev rule so your user can create
+virtual input devices (that's why you log out and in once).
+
+## Build from source
+
+### Windows
 
 Needs Rust (`rustup`) and the Visual Studio C++ Build Tools.
 
@@ -43,22 +68,13 @@ cargo build --release
 powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
 ```
 
-The installer copies the app to `%LOCALAPPDATA%\Programs\Edgehop`, adds a Start
-Menu entry, and asks for admin once to allow it through the firewall on
-**Private** networks. Make sure your Wi-Fi/Ethernet is set to *Private* in
-Windows settings.
-
-### Ubuntu (e.g. Surface running Linux)
-
-Copy this folder over (or `git clone` it), then:
+### Ubuntu
 
 ```bash
 ./packaging/linux/build-deb.sh
 ```
 
 This installs build tools and Rust if needed, builds a `.deb`, and installs it.
-The package adds a udev rule so your user can create virtual input devices.
-**Log out and back in once** afterwards, then open *Edgehop* from the app menu.
 
 ### macOS
 
@@ -66,8 +82,19 @@ The package adds a udev rule so your user can create virtual input devices.
 ./packaging/macos/build-app.sh
 ```
 
-Move `dist/edgehop.app` to Applications, open it, and allow it under
-System Settings → Privacy & Security → **Accessibility**.
+This builds `dist/Edgehop.app` (`UNIVERSAL=1` for an Apple silicon + Intel build).
+
+### Making a release
+
+Bump `version` in `Cargo.toml`, add a section to [CHANGELOG.md](CHANGELOG.md),
+commit, then push a matching tag:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+GitHub Actions tests and builds every platform and publishes the release with
+the changelog section as its notes.
 
 ## Using it
 

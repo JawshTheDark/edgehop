@@ -1,0 +1,146 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching the version in Cargo.toml) to build Edgehop
+# for Windows, Linux and macOS and publish a GitHub Release with the downloads.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "v$v" = "$TAG" ] || { echo "Tag $TAG doesn't match Cargo.toml version $v"; exit 1; }
+      - run: cargo test --release
+      - run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          $dir = "dist/Edgehop"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/release/edgehop.exe, packaging/windows/install.ps1, packaging/windows/uninstall.ps1, README.md $dir
+          Compress-Archive -Path $dir -DestinationPath "dist/Edgehop-$env:TAG-windows-x64.zip"
+          Copy-Item target/release/edgehop.exe "dist/edgehop-$env:TAG-windows-x64.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/*.exe
+
+  linux:
+    # Older glibc: the binary also runs on newer distributions.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev
+      - run: cargo test --release
+      - run: cargo build --release
+      - name: Package (.deb and tarball)
+        run: |
+          ./target/release/edgehop --write-icon packaging/linux/edgehop.png
+          cargo install cargo-deb --locked
+          cargo deb --no-build
+          mkdir -p dist
+          cp target/debian/*.deb "dist/edgehop_${TAG#v}_amd64.deb"
+          name="edgehop-$TAG-linux-x86_64"
+          mkdir -p "$name"
+          cp target/release/edgehop packaging/linux/60-edgehop-uinput.rules packaging/linux/edgehop-uinput.conf \
+             packaging/linux/edgehop.desktop packaging/linux/edgehop.png README.md "$name/"
+          tar czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
+      - name: Build a universal Edgehop.app
+        run: UNIVERSAL=1 ./packaging/macos/build-app.sh
+      - name: Package
+        run: |
+          mkdir -p upload
+          ditto -c -k --keepParent dist/Edgehop.app "upload/Edgehop-$TAG-macos-universal.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: upload/*.zip
+
+  publish:
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v="${TAG#v}"
+          awk -v v="$v" '
+            /^## / { if (found) exit; if (index($0, "[" v "]")) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "Edgehop $TAG" > notes.md
+          cat >> notes.md <<'EOF'
+
+          ### Downloads
+          - **Windows**: `Edgehop-…-windows-x64.zip`. Unzip, then right-click `install.ps1` → *Run with PowerShell*. (Or run the bare `.exe`.)
+          - **Ubuntu / Debian**: `edgehop_…_amd64.deb`. `sudo apt install ./edgehop_*.deb`, then log out and back in once.
+          - **Other Linux**: the `.tar.gz` (copy `60-edgehop-uinput.rules` to `/etc/udev/rules.d/`).
+          - **macOS**: unzip `Edgehop.app` into Applications, then allow it under *Privacy & Security → Accessibility*.
+
+          The builds aren't code-signed yet, so Windows SmartScreen and macOS Gatekeeper will ask before the first launch.
+          EOF
+          cat notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la assets
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" assets/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" assets/* --title "Edgehop ${TAG#v}" --notes-file notes.md
+          fi

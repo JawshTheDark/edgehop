@@ -1,10 +1,15 @@
 # Installs Edgehop for the current user: copies the exe, adds a Start Menu shortcut,
 # and (with one admin prompt) opens the firewall so other computers can connect.
-# Usage (from the repo root, after building):  powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
+# Usage: right-click > Run with PowerShell, or
+#   powershell -ExecutionPolicy Bypass -File install.ps1
+# Works from an unzipped release (edgehop.exe next to this script) or from the
+# source tree after `cargo build --release`.
 $ErrorActionPreference = 'Stop'
-$root = Resolve-Path "$PSScriptRoot\..\.."
-$exe = Join-Path $root 'target\release\edgehop.exe'
-if (-not (Test-Path $exe)) { throw "Build first: cargo build --release  (missing $exe)" }
+$exe = Join-Path $PSScriptRoot 'edgehop.exe'
+if (-not (Test-Path $exe)) {
+    $exe = Join-Path (Resolve-Path "$PSScriptRoot\..\..") 'target\release\edgehop.exe'
+}
+if (-not (Test-Path $exe)) { throw "edgehop.exe not found. Unzip the release first, or build with: cargo build --release" }
 
 # Remove the app's previous incarnation (kvmlink); its settings migrate automatically.
 Get-Process kvmlink -ErrorAction SilentlyContinue | Stop-Process -Force

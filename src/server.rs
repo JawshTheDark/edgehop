@@ -1,3 +1,5 @@
+// The server role is Windows-only for now; elsewhere this code is unused.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 //! Server: owns the physical keyboard/mouse, decides which screen is active,
 //! and forwards input to the active client.
 use crate::config::{Config, Peer};
