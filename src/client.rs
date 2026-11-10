@@ -94,7 +94,7 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
     let hooks = crate::platform::client_hooks();
     let (away_tx, away_rx) = std::sync::mpsc::channel::<Option<(bool, Option<u8>)>>();
     if let Some(h) = hooks.clone() {
-        thread::spawn(move || {
+        let _ = thread::Builder::new().name("desktop".into()).spawn(move || {
             for cmd in away_rx {
                 crate::recovery::guard("desktop hooks", || match cmd {
                     Some((hide, dim)) => h.away(hide, dim),
@@ -171,13 +171,23 @@ impl Dialer {
 
     /// Open up to `n` connections in parallel.
     fn open_many(&self, id: u64, n: usize) -> Vec<(net::FrameSender, net::FrameReceiver)> {
+        let start = std::time::Instant::now();
         let handles: Vec<_> = (0..n)
             .map(|_| {
                 let d = self.clone();
                 thread::spawn(move || d.open(id))
             })
             .collect();
-        handles.into_iter().filter_map(|h| h.join().ok()?.ok()).collect()
+        let mut conns = Vec::new();
+        for h in handles {
+            match h.join() {
+                Ok(Ok(c)) => conns.push(c),
+                Ok(Err(e)) => log::warn!("transfer connection failed: {e}"),
+                Err(_) => log::warn!("transfer connection thread crashed"),
+            }
+        }
+        log::debug!("opened {}/{n} transfer connection(s) in {} ms", conns.len(), start.elapsed().as_millis());
+        conns
     }
 }
 
@@ -230,6 +240,14 @@ fn session(
             app.set_status("Searching for a server on your network…", false);
         }
         let found = net::discover(Duration::from_millis(1500));
+        log::debug!(
+            "discovery: {}",
+            if found.is_empty() {
+                "no servers answered".to_string()
+            } else {
+                found.iter().map(|d| format!("{} at {}", d.info.name, d.addr)).collect::<Vec<_>>().join(", ")
+            }
+        );
         *lk(&app.discovered) = found.clone();
         app.repaint();
         let pick = match &cfg.trusted_server {
@@ -295,6 +313,9 @@ fn session(
     loop {
         let msg = rx.recv::<ToClient>()?;
         live.progress.store(now_ms(), Ordering::Relaxed);
+        if !matches!(msg, ToClient::Ping | ToClient::Move { .. }) {
+            log::trace!("<- {}", crate::proto::brief(&msg));
+        }
         match msg {
             ToClient::PairPending { code: c } => {
                 *lk(&app.pairing_code) = Some(c.clone());
@@ -318,6 +339,7 @@ fn session(
                 app.set_status(format!("Connected to {n} ({w}×{h})"), true);
             }
             ToClient::Enter { x, y } => {
+                log::debug!("mouse arrived at ({x}, {y})");
                 let _ = away_tx.send(None);
                 inj.move_to(x, y);
                 *lk(&app.active_screen) = cfg.name.clone();
@@ -342,6 +364,7 @@ fn session(
                 inj.key(code, down);
             }
             ToClient::Leave => {
+                log::debug!("mouse left for {server_name}");
                 for k in keys.drain() {
                     inj.key(k, false);
                 }
@@ -386,10 +409,14 @@ fn session(
                                 },
                             }
                         };
+                        log::debug!("clipboard here: {}", clip.describe());
                         let fresh = match (&*lk(&last), &clip) {
                             (Some(Clip::Text { text: a }), Clip::Text { text: b }) => a.trim() != b.trim(),
                             (prev, now) => prev.as_ref() != Some(now),
                         };
+                        if !fresh {
+                            log::debug!("clipboard unchanged since last time; not sending");
+                        }
                         if fresh {
                             *lk(&last) = Some(clip.clone());
                             let msg = match clip {
@@ -420,6 +447,20 @@ fn session(
                 }
             }
             ToClient::Ping => lk(&tx).send(&ToServer::Pong)?,
+            ToClient::SetLogLevel { level } => {
+                if level != crate::state::log_level_name() {
+                    crate::state::set_log_level(&level);
+                    app.update_config(|c| c.log_level = level);
+                }
+            }
+            ToClient::GetLogs => {
+                let tx2 = tx.clone();
+                thread::spawn(move || {
+                    let text = crate::diag::local_log(6000);
+                    log::debug!("sending my log to the server ({} lines)", text.lines().count());
+                    let _ = lk(&tx2).send(&ToServer::Logs { text });
+                });
+            }
             ToClient::FilesGrab => {
                 // A drag here was pushed off the edge. Cancel it in the file
                 // manager (Esc) and copy the selection it was dragging (Ctrl+C).

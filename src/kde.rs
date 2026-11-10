@@ -194,13 +194,16 @@ impl Inner {
                 .map(|(b,)| b)
                 .unwrap_or(true);
             if !loaded {
-                let _: Result<(bool,), _> = fx.method_call("org.kde.kwin.Effects", "loadEffect", ("hidecursor",));
+                let r: Result<(bool,), _> = fx.method_call("org.kde.kwin.Effects", "loadEffect", ("hidecursor",));
+                log::debug!("hide pointer: loadEffect(hidecursor) -> {r:?}");
                 st.hid_pointer = true;
+            } else {
+                log::debug!("hide pointer: the effect is already on (left as is)");
             }
         }
         if dim_percent.is_some() && st.dimmed.is_empty() {
             if media_playing(&conn) {
-                log::info!("media is playing: not dimming");
+                log::debug!("media is playing: not dimming");
             } else {
                 dim(&conn, &mut st);
             }
@@ -230,7 +233,8 @@ impl Inner {
         st.is_away = false;
         if st.hid_pointer {
             let fx = conn.with_proxy("org.kde.KWin", "/Effects", TIMEOUT);
-            let _: Result<(), _> = fx.method_call("org.kde.kwin.Effects", "unloadEffect", ("hidecursor",));
+            let r: Result<(), _> = fx.method_call("org.kde.kwin.Effects", "unloadEffect", ("hidecursor",));
+            log::debug!("show pointer: unloadEffect(hidecursor) -> {r:?}");
             st.hid_pointer = false;
         }
         undim(&conn, &mut st);
@@ -266,7 +270,8 @@ fn dim(conn: &Connection, st: &mut Away) {
 fn undim(conn: &Connection, st: &mut Away) {
     for (name, level) in st.dimmed.drain(..) {
         let d = conn.with_proxy("org.kde.ScreenBrightness", format!("/org/kde/ScreenBrightness/{name}"), TIMEOUT);
-        let _: Result<(), _> = d.method_call("org.kde.ScreenBrightness.Display", "SetBrightness", (level, 1u32));
+        let r: Result<(), _> = d.method_call("org.kde.ScreenBrightness.Display", "SetBrightness", (level, 1u32));
+        log::debug!("restore brightness of {name} to {level}: {r:?}");
     }
 }
 
@@ -274,6 +279,7 @@ fn undim(conn: &Connection, st: &mut Away) {
 fn media_playing(conn: &Connection) -> bool {
     let bus = conn.with_proxy("org.freedesktop.DBus", "/org/freedesktop/DBus", TIMEOUT);
     let Ok((names,)) = bus.method_call::<(Vec<String>,), _, _, _>("org.freedesktop.DBus", "ListNames", ()) else {
+        log::debug!("media check: couldn't list D-Bus names");
         return false;
     };
     names.iter().filter(|n| n.starts_with("org.mpris.MediaPlayer2.")).any(|n| {

@@ -276,6 +276,7 @@ pub fn run_discovery_responder(stop: Arc<AtomicBool>, info: Announce) {
     while !stop.load(Ordering::Relaxed) {
         if let Ok((n, src)) = sock.recv_from(&mut buf) {
             if &buf[..n] == DISCOVER_MAGIC {
+                log::debug!("discovery request from {src}; answering");
                 let _ = sock.send_to(&reply, src);
             }
         }

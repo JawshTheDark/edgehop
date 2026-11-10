@@ -732,3 +732,30 @@ pub fn last_input_tick() -> u32 {
     }
     li.dwTime
 }
+
+
+#[repr(C)]
+#[derive(Default)]
+pub struct SYSTEMTIME {
+    pub wYear: u16,
+    pub wMonth: u16,
+    pub wDayOfWeek: u16,
+    pub wDay: u16,
+    pub wHour: u16,
+    pub wMinute: u16,
+    pub wSecond: u16,
+    pub wMilliseconds: u16,
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetLocalTime(t: *mut SYSTEMTIME);
+}
+
+pub fn local_time() -> SYSTEMTIME {
+    let mut t = SYSTEMTIME::default();
+    unsafe {
+        GetLocalTime(&mut t);
+    }
+    t
+}

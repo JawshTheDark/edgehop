@@ -6,6 +6,7 @@ mod client;
 mod config;
 #[cfg(windows)]
 mod dragdrop;
+mod diag;
 mod files;
 mod gui;
 mod icon;
@@ -59,13 +60,25 @@ fn main() {
 
     let cfg = config::Config::load();
     let app = state::AppState::new(cfg);
-    state::init_logger(app.clone());
+    state::init_logger(app.clone(), &args);
     log::info!(
         "Edgehop {} starting on {} (config: {})",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         config::Config::path().display()
     );
+    {
+        let c = app.cfg();
+        log::info!(
+            "{} · {} {} · role {:?} · name {:?} · log level {}",
+            platform::local_datetime(),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            c.role,
+            c.name,
+            state::log_level_name()
+        );
+    }
 
     if args.iter().any(|a| a == "--which-window") {
         // Diagnostic: ask the desktop which window is under the pointer.

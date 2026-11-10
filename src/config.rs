@@ -36,6 +36,8 @@ pub struct Config {
     pub transfer_conns: u8,
     /// Files copied to the clipboard are pulled automatically up to this size.
     pub clipboard_files_max_gb: u32,
+    /// "info" normally; "debug" or "trace" when diagnosing a problem.
+    pub log_level: String,
 
     // --- server ---
     pub port: u16,
@@ -68,6 +70,7 @@ impl Default for Config {
             dim_level: 25,
             transfer_conns: crate::transfer::DEFAULT_CONNS,
             clipboard_files_max_gb: 20,
+            log_level: "info".into(),
             port: net::DEFAULT_PORT,
             screens: Vec::new(),
             trusted_clients: Vec::new(),

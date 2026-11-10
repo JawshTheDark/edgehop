@@ -40,6 +40,10 @@ pub enum ToServer {
         png: String,
     },
     Pong,
+    /// This computer's recent log (answer to `GetLogs`).
+    Logs {
+        text: String,
+    },
     /// Reply to `FilesGrab`: what was being dragged here (empty = not files).
     FilesGrabbed {
         files: Vec<String>,
@@ -75,6 +79,10 @@ pub enum ToClient {
     Clipboard { text: String },
     ClipboardImage { png: String },
     Ping,
+    /// Log this much ("info", "debug", "trace").
+    SetLogLevel { level: String },
+    /// Send your recent log (for a diagnostics report).
+    GetLogs,
     /// A drag is being pushed off this screen: report which files it carries.
     FilesGrab,
     /// The drag was dropped on another screen: send these files to the server.
@@ -85,4 +93,25 @@ pub enum ToClient {
     DropOffer { manifest: Manifest },
     /// Open `count` data connections and serve transfer `id` from the outbox.
     OpenData { id: u64, count: u8 },
+}
+
+impl Clip {
+    /// "text (12 chars)", "image (340 KB)", "files: “movie.mkv” (1.2 GB)".
+    pub fn describe(&self) -> String {
+        match self {
+            Clip::Text { text } => format!("text ({} chars)", text.chars().count()),
+            Clip::Image { png } => format!("image ({})", crate::files::human(png.len() as u64 * 3 / 4)),
+            Clip::Files { manifest } => format!("files: {}", manifest.describe()),
+        }
+    }
+}
+
+/// A message for logs: its Debug form, cut short (images can be megabytes).
+pub fn brief(msg: &impl std::fmt::Debug) -> String {
+    let s = format!("{msg:?}");
+    if s.len() > 160 {
+        format!("{}… ({} bytes)", &s[..s.char_indices().nth(150).map_or(s.len(), |(i, _)| i)], s.len())
+    } else {
+        s
+    }
 }

@@ -224,6 +224,15 @@ pub fn fetch(
             off += len;
         }
     }
+    log::debug!(
+        "fetching {} from {}: {} entries, {} pieces over {} connection(s) into {}",
+        files::human(m.total),
+        m.from,
+        m.entries.len(),
+        queue.len(),
+        conns.len(),
+        dest.display()
+    );
     let queue = Mutex::new(queue);
     let last_err: Mutex<Option<io::Error>> = Mutex::new(None);
 
@@ -233,9 +242,16 @@ pub fn fetch(
             scope.spawn(move || {
                 let mut open: HashMap<u32, File> = HashMap::new();
                 let mut buf = Vec::new();
+                let (start, mut got, mut pieces) = (std::time::Instant::now(), 0u64, 0u32);
                 loop {
                     let Some(job) = lk(queue).pop_front() else {
                         let _ = tx.send_data(&[0u8; 16]);
+                        let secs = start.elapsed().as_secs_f64().max(0.001);
+                        log::debug!(
+                            "connection done: {pieces} pieces, {} at {}/s",
+                            files::human(got),
+                            files::human((got as f64 / secs) as u64)
+                        );
                         return;
                     };
                     let (fi, off, len) = job;
@@ -257,9 +273,12 @@ pub fn fetch(
                     match r {
                         Ok(()) => {
                             done.fetch_add(len as u64, Ordering::Relaxed);
+                            got += len as u64;
+                            pieces += 1;
                         }
                         Err(e) => {
                             // Hand the piece to the remaining connections and drop out.
+                            log::warn!("transfer connection failed on piece {fi}@{off} ({e}); others take over");
                             lk(queue).push_front(job);
                             *lk(last_err) = Some(e);
                             return;

@@ -188,6 +188,7 @@ unsafe fn files_of(data: *mut IDataObject) -> Vec<String> {
 unsafe extern "system" fn drag_enter(_t: *mut DropTarget, data: *mut IDataObject, _k: u32, _p: POINTL, effect: *mut u32) -> i32 {
     let files = files_of(data);
     if files.is_empty() {
+        log::debug!("drag reached the edge but carries no files (text, a link, ...); ignoring");
         *effect = DROPEFFECT_NONE;
         return S_OK;
     }
@@ -209,6 +210,7 @@ unsafe extern "system" fn drag_leave(_t: *mut DropTarget) -> i32 {
 }
 unsafe extern "system" fn drop(_t: *mut DropTarget, _d: *mut IDataObject, _k: u32, _p: POINTL, effect: *mut u32) -> i32 {
     // The drag ended on our invisible window: nothing happens on this computer.
+    log::debug!("drag ended on the catcher window (no drop on this computer)");
     *effect = DROPEFFECT_NONE;
     hide();
     S_OK
@@ -353,6 +355,7 @@ pub fn end_drag_here() {
             std::thread::sleep(Duration::from_millis(10));
         }
         if ready {
+            log::debug!("catcher covers the screen; releasing the button over it");
             left_up();
         } else {
             log::warn!("file drag: catcher didn't cover the screen; cancelling the drag with Esc instead");

@@ -290,6 +290,7 @@ impl Core {
         if let (Some(clip), Some(slot)) = (self.clip.clone(), self.clients.get_mut(name)) {
             if slot.clip_gen != gen {
                 slot.clip_gen = gen;
+                log::debug!("clipboard -> {name}: {}", clip.describe());
                 match clip {
                     Clip::Text { text } => {
                         let _ = slot.tx.send(ToClient::Clipboard { text });
@@ -405,6 +406,7 @@ impl Core {
                             if self.edge_pushes >= 2 {
                                 let strip = self.strip_for(&hit, dir, &m);
                                 self.grab_pending = Some(Pending { from: self.me.clone(), hit, dir });
+                                log::debug!("drag pushed against the {dir:?} edge; drop catcher at {strip:?}");
                                 if let Some(r) = strip {
                                     self.desk.show_drop_strip(r);
                                 }
@@ -470,6 +472,16 @@ impl Core {
         }
         let (ax, ay) = (self.cx.clamp(0.0, w - 1.0), self.cy.clamp(0.0, h - 1.0));
         let pushed_enough = self.push >= self.resistance;
+        if let Some((dir, _)) = out {
+            log::trace!(
+                "pushing {dir:?} at ({:.0}, {:.0}) on {active}: {:.0}/{:.0} px{}",
+                ax,
+                ay,
+                self.push,
+                self.resistance,
+                if self.remote_buttons > 0 { " (button held)" } else { "" }
+            );
+        }
         if let (Some((dir, _)), true) = (out, pushed_enough) {
             if let Some((r, scale)) = self.client_rect(&active) {
                 // The same spot in server pixels, on the edge we're leaving through.
@@ -607,6 +619,13 @@ impl Core {
     }
 
     pub fn on_key(&mut self, vk: u32, scan: u32, extended: bool, down: bool) -> bool {
+        log::trace!(
+            "key vk={vk:#04x} scan={scan:#04x}{} {} -> {:?} on {}",
+            if extended { " ext" } else { "" },
+            if down { "down" } else { "up" },
+            crate::keymap::win_to_evdev(scan, extended, vk),
+            self.active
+        );
         if !self.is_remote() {
             return false;
         }
@@ -741,7 +760,9 @@ impl Core {
     }
 
     pub fn client_clipboard(&mut self, name: &str, clip: Clip) {
+        log::debug!("clipboard from {name}: {}", clip.describe());
         if !self.clipboard {
+            log::debug!("clipboard sharing is off; ignoring it");
             return;
         }
         if self.clip.as_ref() != Some(&clip) {
@@ -840,6 +861,20 @@ impl ServerEngine {
                 }
             };
             let stop = Arc::new(AtomicBool::new(false));
+            for m in crate::platform::monitors() {
+                log::debug!(
+                    "monitor {:?} {}x{} at ({}, {}){}",
+                    m.label,
+                    m.rect.w() as i32,
+                    m.rect.h() as i32,
+                    m.rect.l as i32,
+                    m.rect.t as i32,
+                    if m.primary { " (main)" } else { "" }
+                );
+            }
+            for p in &cfg.screens {
+                log::debug!("screen {} placed at ({}, {}) scale {:.3}{}", p.name, p.x, p.y, p.scale, if p.fit { " stretched" } else { "" });
+            }
             let (clip_tx, clip_rx) = mpsc::channel();
             let mut core = Core::new(&cfg, Box::new(hooks::WinDesktop), Some(app.clone()));
             core.clip_jobs = Some(clip_tx);
@@ -858,11 +893,11 @@ impl ServerEngine {
             // Files a drag carries, reported by the drop target at the screen edge.
             let (drag_tx, drag_rx) = mpsc::channel::<Vec<String>>();
             let s = shared.clone();
-            thread::spawn(move || {
+            thread::Builder::new().name("drag".into()).spawn(move || {
                 for files in drag_rx {
                     recovery::guard("drag handler", || lk(&s.core).local_grab_result(files));
                 }
-            });
+            }).map_err(|e| e.to_string())?;
 
             // Input capture thread (low-level hooks need their own message loop).
             let (tid_tx, tid_rx) = mpsc::channel();
@@ -880,17 +915,17 @@ impl ServerEngine {
 
             // File worker: grabbing a dragged selection and sending files.
             let s = shared.clone();
-            thread::spawn(move || {
+            thread::Builder::new().name("files".into()).spawn(move || {
                 for job in file_rx {
                     recovery::guard("file worker", || match job {
                         FileJob::SendToClient { name, paths } => send_files(&s, name, paths),
                     });
                 }
-            });
+            }).map_err(|e| e.to_string())?;
 
             // Clipboard worker (keeps clipboard I/O out of the hook callback).
             let s = shared.clone();
-            thread::spawn(move || {
+            thread::Builder::new().name("clipboard".into()).spawn(move || {
                 // Clipboard change counter when we last read or wrote it.
                 let mut ours: Option<u32> = None;
                 for job in clip_rx {
@@ -901,12 +936,14 @@ impl ServerEngine {
                             {
                                 let seq = unsafe { crate::win32::GetClipboardSequenceNumber() };
                                 if ours == Some(seq) {
+                                    log::debug!("clipboard unchanged since last read (seq {seq})");
                                     return;
                                 }
                                 ours = Some(seq);
                             }
                             let clip = if let Some(paths) = crate::clipboard::get_files() {
                                 if transfer::is_received(&paths) {
+                                    log::debug!("clipboard holds files we received; not sending them back");
                                     None // files we just received: nothing new
                                 } else {
                                     let me = lk(&s.core).me.clone();
@@ -924,11 +961,16 @@ impl ServerEngine {
                                     None => crate::clipboard::get_image_png().map(|p| Clip::Image { png: files::b64(&p) }),
                                 }
                             };
-                            if let Some(c) = clip {
-                                lk(&s.core).local_clipboard(c);
+                            match clip {
+                                Some(c) => {
+                                    log::debug!("local clipboard: {}", c.describe());
+                                    lk(&s.core).local_clipboard(c);
+                                }
+                                None => log::debug!("local clipboard: nothing to share"),
                             }
                         }
                         ClipJob::SetLocal(c) => {
+                            log::debug!("updating local clipboard: {}", c.describe());
                             match c {
                                 Clip::Text { text } => crate::clipboard::set(&text),
                                 Clip::Image { png } => {
@@ -951,18 +993,18 @@ impl ServerEngine {
                     });
                     let _ = &mut ours;
                 }
-            });
+            }).map_err(|e| e.to_string())?;
 
             // Accept loop.
             let s = shared.clone();
-            thread::spawn(move || {
+            thread::Builder::new().name("accept".into()).spawn(move || {
                 for conn in listener.incoming() {
                     if s.stop.load(Ordering::Relaxed) {
                         break;
                     }
                     let Ok(stream) = conn else { continue };
                     let s2 = s.clone();
-                    thread::spawn(move || {
+                    let _ = thread::Builder::new().name("conn".into()).spawn(move || {
                         let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
                         recovery::guard("connection handler", || {
                             if let Err(e) = handle_client(&s2, stream) {
@@ -971,12 +1013,12 @@ impl ServerEngine {
                         });
                     });
                 }
-            });
+            }).map_err(|e| e.to_string())?;
 
             // LAN discovery.
             let announce = Announce { name: cfg.name.clone(), port: cfg.port, key: cfg.public_key.clone() };
             let st = stop.clone();
-            thread::spawn(move || net::run_discovery_responder(st, announce));
+            let _ = thread::Builder::new().name("discovery".into()).spawn(move || net::run_discovery_responder(st, announce));
 
             // Watchdog + keepalive, every second:
             // - ping clients; take the mouse back from one that stops answering;
@@ -1022,6 +1064,14 @@ impl ServerEngine {
         }
     }
 
+    /// Send a message to every connected client.
+    pub fn broadcast(&self, msg: ToClient) {
+        let core = lk(&self.shared.core);
+        for s in core.clients.values() {
+            let _ = s.tx.send(msg.clone());
+        }
+    }
+
     pub fn apply_config(&self, cfg: &Config) {
         lk(&self.shared.core).apply_config(cfg);
     }
@@ -1058,13 +1108,16 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let raw = stream.try_clone()?;
     let net::Handshaked { mut tx, mut rx, remote_key, code } = net::accept_handshake(stream, &s.private_key)?;
+    log::debug!("handshake with {addr} ok, key {}", net::fingerprint(&remote_key));
     let first = rx.recv::<ToServer>()?;
     if let ToServer::DataHello { id } = first {
+        log::debug!("{addr} opened a transfer connection for {id:#x}");
         return data_connection(s, tx, rx, &remote_key, id);
     }
     let ToServer::Hello { name, width, height, os, .. } = first else {
         return Err(std::io::Error::other("expected hello"));
     };
+    log::debug!("hello from {addr}: name {name:?}, screen {width}x{height}, {os}");
     let mut name = sanitize_name(&name);
     let app = &s.app;
     let cfg = app.cfg();
@@ -1119,6 +1172,8 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     }
 
     tx.send(&ToClient::Welcome { server_name: cfg.name.clone() })?;
+    // Clients log as much as the server does (debug mode is set in one place).
+    tx.send(&ToClient::SetLogLevel { level: crate::state::log_level_name() })?;
 
     let id = s.next_id.fetch_add(1, Ordering::Relaxed);
     let (mtx, mrx) = mpsc::channel::<ToClient>();
@@ -1194,8 +1249,11 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     rx.set_read_timeout(Some(Duration::from_secs(12)))?;
     let result = loop {
         let msg = rx.recv::<ToServer>();
-        if msg.is_ok() {
+        if let Ok(m) = &msg {
             last_seen.store(now_ms(), Ordering::Relaxed);
+            if !matches!(m, ToServer::Pong) {
+                log::trace!("<- {name}: {}", crate::proto::brief(m));
+            }
         }
         match msg {
             Ok(ToServer::Clipboard { text }) => lk(&s.core).client_clipboard(&name, Clip::Text { text }),
@@ -1205,6 +1263,10 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
                 lk(&s.core).client_clipboard(&name, Clip::Files { manifest })
             }
             Ok(ToServer::DropOffer { manifest }) => receive_drop(s.clone(), manifest),
+            Ok(ToServer::Logs { text }) => {
+                log::debug!("received {}'s log ({} lines)", name, text.lines().count());
+                lk(&app.remote_logs).insert(name.clone(), text);
+            }
             Ok(_) => {}
             Err(e) => break e,
         }
@@ -1244,7 +1306,13 @@ fn data_connection(
     rx.set_read_timeout(Some(Duration::from_secs(60)))?;
     if let Some(offered) = transfer::outbox().get(id) {
         // We have the files: answer the client's piece requests.
-        transfer::serve(&mut tx, &mut rx, &offered)?;
+        let start = Instant::now();
+        let sent = transfer::serve(&mut tx, &mut rx, &offered)?;
+        log::debug!(
+            "transfer connection done: sent {} in {:.1} s",
+            files::human(sent),
+            start.elapsed().as_secs_f64()
+        );
         return Ok(());
     }
     let waiting = lk(&s.inbound).get(&id).cloned();
@@ -1274,6 +1342,7 @@ fn fetch_from_client(s: &Arc<Shared>, m: &Manifest, dest: &Path) -> std::io::Res
         }
     }
     lk(&s.inbound).remove(&m.id);
+    log::debug!("{} opened {}/{n} transfer connection(s)", m.from, conns.len());
     if conns.is_empty() {
         return Err(std::io::Error::other(format!("{} didn't open a transfer connection", m.from)));
     }

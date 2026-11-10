@@ -234,3 +234,41 @@ impl DesktopHooks for crate::kde::Kde {
         w.map(|w| crate::kde::is_file_manager(&w))
     }
 }
+
+/// Local wall-clock time: (hour, minute, second, millisecond).
+pub fn local_clock() -> (u32, u32, u32, u32) {
+    let (_, _, _, h, m, s, ms) = local_datetime_parts();
+    (h, m, s, ms)
+}
+
+/// "2026-11-10 14:05:22" in local time.
+pub fn local_datetime() -> String {
+    let (y, mo, d, h, m, s, _) = local_datetime_parts();
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
+}
+
+fn local_datetime_parts() -> (u32, u32, u32, u32, u32, u32, u32) {
+    #[cfg(windows)]
+    {
+        let t = crate::win32::local_time();
+        (t.wYear as u32, t.wMonth as u32, t.wDay as u32, t.wHour as u32, t.wMinute as u32, t.wSecond as u32, t.wMilliseconds as u32)
+    }
+    #[cfg(unix)]
+    {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let secs = now.as_secs() as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::localtime_r(&secs, &mut tm);
+        }
+        (
+            (tm.tm_year + 1900) as u32,
+            (tm.tm_mon + 1) as u32,
+            tm.tm_mday as u32,
+            tm.tm_hour as u32,
+            tm.tm_min as u32,
+            tm.tm_sec as u32,
+            now.subsec_millis(),
+        )
+    }
+}

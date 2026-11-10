@@ -92,6 +92,21 @@ Settings live in `%APPDATA%\edgehop\config\config.json` (Windows),
 
 ## Troubleshooting
 
+**Debug logging and diagnostics.** In the **Activity** tab, switch on **Debug logging**
+(on the server it applies to every connected computer), reproduce the problem,
+then click **Save diagnostics**. That writes one file to your Desktop with the
+version, settings (keys shortened to fingerprints), monitors, connections and
+recent logs from *every* connected computer: attach it to a bug report.
+**Include every input event** adds trace-level logging of each key and mouse
+push. From a terminal: `edgehop --debug` / `edgehop --trace`, or set
+`EDGEHOP_LOG=debug`. Logs live in `%LOCALAPPDATA%\edgehop\cache\edgehop.log`
+(Windows) and `~/.cache/edgehop/edgehop.log` (Linux); the previous file is
+kept as `edgehop.1.log`.
+
+To measure network transfer speed between two computers:
+`edgehop --bench-serve <big file>` on one, `edgehop --bench-fetch <its IP> 1 4 8` on the other.
+
+
 - **Client says "Searching…" forever**: UDP broadcast may be blocked (guest Wi-Fi,
   VPN, or Windows firewall on a *Public* network). Type the server's IP into
   *Address* on the client instead.

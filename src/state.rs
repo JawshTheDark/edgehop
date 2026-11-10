@@ -60,10 +60,12 @@ pub struct AppState {
     pub discovered: Mutex<Vec<Discovered>>,
     pub pairing_code: Mutex<Option<String>>,
     pub key_mismatch: Mutex<Option<String>>,
-    pub logs: Mutex<VecDeque<String>>,
+    pub logs: Mutex<VecDeque<LogLine>>,
     pub ctx: Mutex<Option<eframe::egui::Context>>,
     pub engine: Mutex<Option<Engine>>,
     pub transfer: Mutex<Option<TransferStatus>>,
+    /// Logs sent by other computers for a diagnostics report.
+    pub remote_logs: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl AppState {
@@ -82,6 +84,7 @@ impl AppState {
             ctx: Mutex::new(None),
             engine: Mutex::new(None),
             transfer: Mutex::new(None),
+            remote_logs: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -174,6 +177,27 @@ impl AppState {
         self.repaint();
     }
 
+    /// Change the log level here (and, as the server, on every connected computer).
+    pub fn set_log_level_everywhere(&self, level: &str) {
+        set_log_level(level);
+        let l = level.to_string();
+        self.update_config(|c| c.log_level = l);
+        if let Some(Engine::Server(s)) = lk(&self.engine).as_ref() {
+            s.broadcast(crate::proto::ToClient::SetLogLevel { level: level.to_string() });
+        }
+    }
+
+    /// Ask connected computers for their logs; false if this isn't the server.
+    pub fn request_remote_logs(&self) -> bool {
+        match lk(&self.engine).as_ref() {
+            Some(Engine::Server(s)) => {
+                s.broadcast(crate::proto::ToClient::GetLogs);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn is_running(&self) -> bool {
         lk(&self.engine).is_some()
     }
@@ -194,44 +218,93 @@ impl AppState {
 // ---------------------------------------------------------------------------
 
 static SINK: OnceLock<Arc<AppState>> = OnceLock::new();
-static LOGFILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+/// The open log file and how many bytes it holds (for rotation).
+static LOGFILE: OnceLock<Mutex<(Option<std::fs::File>, u64)>> = OnceLock::new();
+const ROTATE_AT: u64 = 8 * 1024 * 1024;
+const KEEP_IN_MEMORY: usize = 3000;
 
-/// edgehop.log next to the received-files cache (truncated when it grows past 5 MB).
+/// One line in the in-app activity log.
+#[derive(Clone, Debug)]
+pub struct LogLine {
+    pub level: log::Level,
+    pub text: String,
+}
+
+/// edgehop.log next to the received-files cache; the previous one is kept as edgehop.1.log.
 pub fn log_path() -> std::path::PathBuf {
     crate::files::received_root().with_file_name("edgehop.log")
+}
+
+pub fn previous_log_path() -> std::path::PathBuf {
+    log_path().with_file_name("edgehop.1.log")
+}
+
+/// "error" | "warn" | "info" | "debug" | "trace" -> filter.
+pub fn parse_level(name: &str) -> Option<log::LevelFilter> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "error" => Some(log::LevelFilter::Error),
+        "warn" | "warning" => Some(log::LevelFilter::Warn),
+        "info" => Some(log::LevelFilter::Info),
+        "debug" => Some(log::LevelFilter::Debug),
+        "trace" => Some(log::LevelFilter::Trace),
+        _ => None,
+    }
+}
+
+/// Change how much is logged, right away.
+pub fn set_log_level(name: &str) {
+    if let Some(l) = parse_level(name) {
+        if log::max_level() != l {
+            log::set_max_level(l);
+            log::info!("log level is now {}", l.to_string().to_lowercase());
+        }
+    }
+}
+
+pub fn log_level_name() -> String {
+    log::max_level().to_string().to_lowercase()
 }
 
 struct Logger;
 
 impl log::Log for Logger {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        m.level() <= log::Level::Info && m.target().starts_with("edgehop")
+        m.level() <= log::max_level() && m.target().starts_with("edgehop")
     }
     fn log(&self, r: &log::Record) {
         if !self.enabled(r.metadata()) {
             return;
         }
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let (h, m, sec, ms) = crate::platform::local_clock();
+        let thread = std::thread::current();
+        let module = r.target().strip_prefix("edgehop::").unwrap_or(r.target());
         let line = format!(
-            "{:02}:{:02}:{:02} {:5} {}",
-            (secs / 3600) % 24,
-            (secs / 60) % 60,
-            secs % 60,
+            "{h:02}:{m:02}:{sec:02}.{ms:03} {:5} [{}] {module}: {}",
             r.level(),
+            thread.name().unwrap_or("-"),
             r.args()
         );
         eprintln!("{line}");
         if let Some(f) = LOGFILE.get() {
             use std::io::Write;
-            let _ = writeln!(lk(f), "{line}");
+            let mut g = lk(f);
+            if g.1 > ROTATE_AT {
+                // Keep one previous file; start a fresh one.
+                g.0 = None;
+                let _ = std::fs::rename(log_path(), previous_log_path());
+                g.0 = std::fs::OpenOptions::new().create(true).append(true).open(log_path()).ok();
+                g.1 = 0;
+            }
+            if let Some(file) = g.0.as_mut() {
+                if writeln!(file, "{line}").is_ok() {
+                    g.1 += line.len() as u64 + 1;
+                }
+            }
         }
         if let Some(app) = SINK.get() {
             let mut logs = lk(&app.logs);
-            logs.push_back(line);
-            while logs.len() > 400 {
+            logs.push_back(LogLine { level: r.level(), text: line });
+            while logs.len() > KEEP_IN_MEMORY {
                 logs.pop_front();
             }
         }
@@ -239,16 +312,24 @@ impl log::Log for Logger {
     fn flush(&self) {}
 }
 
-pub fn init_logger(app: Arc<AppState>) {
+/// Start logging. Level: `--trace`/`--debug` flag, else EDGEHOP_LOG, else the setting.
+pub fn init_logger(app: Arc<AppState>, args: &[String]) {
+    let configured = app.cfg().log_level;
     let _ = SINK.set(app);
     let path = log_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let big = std::fs::metadata(&path).map(|m| m.len() > 5 * 1024 * 1024).unwrap_or(false);
-    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(!big).write(true).truncate(big).open(&path) {
-        let _ = LOGFILE.set(Mutex::new(f));
-    }
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+    let _ = LOGFILE.set(Mutex::new((file, size)));
     let _ = log::set_boxed_logger(Box::new(Logger));
-    log::set_max_level(log::LevelFilter::Info);
+    let level = if args.iter().any(|a| a == "--trace") {
+        "trace".to_string()
+    } else if args.iter().any(|a| a == "--debug") {
+        "debug".to_string()
+    } else {
+        std::env::var("EDGEHOP_LOG").unwrap_or(configured)
+    };
+    log::set_max_level(parse_level(&level).unwrap_or(log::LevelFilter::Info));
 }

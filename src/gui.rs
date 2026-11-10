@@ -230,6 +230,9 @@ struct Gui {
     start_minimized: bool,
     dragging: Option<ScreenPos>,
     confirm_forget: Option<String>,
+    log_filter: log::Level,
+    log_search: String,
+    diag_msg: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Gui {
@@ -254,6 +257,9 @@ impl Gui {
             start_minimized: minimized && !HIDE_TO_TRAY,
             dragging: None,
             confirm_forget: None,
+            log_filter: log::Level::Info,
+            log_search: String::new(),
+            diag_msg: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -1107,15 +1113,93 @@ impl Gui {
 
     fn activity_tab(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui.visuals().dark_mode);
-        let logs: Vec<String> = lk(&self.app.logs).iter().cloned().collect();
-        card(ui, "Activity", "What Edgehop has been doing, newest at the bottom.", |ui| {
+        let server = self.app.cfg().role == Role::Server;
+        let level = crate::state::log_level_name();
+
+        card(
+            ui,
+            "Diagnostics",
+            "Something not working? Turn on debug logging, reproduce the problem, then save a report.",
+            |ui| {
+                row(
+                    ui,
+                    "Debug logging",
+                    if server {
+                        "Detailed logs on this computer and every connected one."
+                    } else {
+                        "Detailed logs on this computer."
+                    },
+                    |ui| {
+                        let mut on = level == "debug" || level == "trace";
+                        if toggle(ui, &mut on).changed() {
+                            self.app.set_log_level_everywhere(if on { "debug" } else { "info" });
+                        }
+                    },
+                );
+                row(ui, "Include every input event", "Very detailed (trace level). Only for mouse or keyboard problems.", |ui| {
+                    let mut on = level == "trace";
+                    if toggle(ui, &mut on).changed() {
+                        self.app.set_log_level_everywhere(if on { "trace" } else { "debug" });
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let busy = lk(&self.diag_msg).as_deref() == Some("Collecting logs…");
+                    if ui.add_enabled(!busy, egui::Button::new(RichText::new("Save diagnostics").color(Color32::WHITE).strong()).fill(ACCENT).min_size(egui::vec2(96.0, 30.0)))
+                        .on_hover_text(if server {
+                            "Collects settings, monitors and recent logs from this and every connected computer into one file on your Desktop."
+                        } else {
+                            "Saves settings and recent logs into one file on your Desktop."
+                        })
+                        .clicked()
+                    {
+                        *lk(&self.diag_msg) = Some("Collecting logs…".into());
+                        let (app, msg) = (self.app.clone(), self.diag_msg.clone());
+                        std::thread::spawn(move || {
+                            *lk(&msg) = Some(match crate::diag::save(&app) {
+                                Ok(path) => format!("Saved {}", path.display()),
+                                Err(e) => format!("Couldn't save: {e}"),
+                            });
+                        });
+                    }
+                    if ui.button("Open log folder").clicked() {
+                        open_folder(&crate::state::log_path());
+                    }
+                    if let Some(m) = lk(&self.diag_msg).clone() {
+                        ui.label(RichText::new(m).small().color(p.muted));
+                    }
+                });
+            },
+        );
+        ui.add_space(10.0);
+
+        let logs: Vec<crate::state::LogLine> = lk(&self.app.logs).iter().cloned().collect();
+        let needle = self.log_search.trim().to_lowercase();
+        let shown: Vec<&crate::state::LogLine> = logs
+            .iter()
+            .filter(|l| l.level <= self.log_filter)
+            .filter(|l| needle.is_empty() || l.text.to_lowercase().contains(&needle))
+            .collect();
+        card(ui, "Activity", "", |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Copy log").clicked() {
-                    ui.ctx().copy_text(logs.join("\n"));
+                for (lvl, name) in [
+                    (log::Level::Error, "Errors"),
+                    (log::Level::Warn, "Warnings"),
+                    (log::Level::Info, "Info"),
+                    (log::Level::Debug, "Debug"),
+                    (log::Level::Trace, "Everything"),
+                ] {
+                    ui.selectable_value(&mut self.log_filter, lvl, name);
                 }
-                if ui.button("Open log folder").clicked() {
-                    open_folder(&crate::state::log_path());
-                }
+                ui.add_space(8.0);
+                ui.add(egui::TextEdit::singleline(&mut self.log_search).hint_text("Search").desired_width(180.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Copy").on_hover_text("Copy the lines shown").clicked() {
+                        ui.ctx().copy_text(shown.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("
+"));
+                    }
+                    ui.label(RichText::new(format!("{} lines", shown.len())).small().color(p.muted));
+                });
             });
             ui.add_space(6.0);
             egui::Frame::new()
@@ -1124,18 +1208,23 @@ impl Gui {
                 .inner_margin(Margin::same(10))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    egui::ScrollArea::vertical().max_height(420.0).stick_to_bottom(true).show(ui, |ui| {
-                        for l in &logs {
-                            let color = if l.contains(" ERROR ") {
-                                BAD
-                            } else if l.contains(" WARN ") {
-                                WARN
-                            } else {
-                                p.text
-                            };
-                            ui.label(RichText::new(l).monospace().color(color));
-                        }
-                    });
+                    let row_h = ui.text_style_height(&TextStyle::Monospace) + 2.0;
+                    egui::ScrollArea::both()
+                        .max_height(440.0)
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, true])
+                        .show_rows(ui, row_h, shown.len(), |ui, range| {
+                            for l in &shown[range] {
+                                let color = match l.level {
+                                    log::Level::Error => BAD,
+                                    log::Level::Warn => WARN,
+                                    log::Level::Info => p.text,
+                                    log::Level::Debug => p.muted,
+                                    log::Level::Trace => p.muted.gamma_multiply(0.75),
+                                };
+                                ui.add(egui::Label::new(RichText::new(&l.text).monospace().color(color)).wrap_mode(egui::TextWrapMode::Extend));
+                            }
+                        });
                 });
         });
     }

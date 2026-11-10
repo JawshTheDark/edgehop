@@ -3,6 +3,7 @@
 //! background); elsewhere text goes through arboard.
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::time::Instant;
 
 const MAX_LEN: usize = 4 * 1024 * 1024;
 /// Largest image we'll move (PNG bytes): a 4K screenshot fits comfortably.
@@ -36,28 +37,51 @@ fn wayland() -> bool {
 }
 
 pub fn get() -> Option<String> {
+    let start = Instant::now();
     #[cfg(target_os = "linux")]
     if wayland() {
-        let b = linux::capture("wl-paste", &["--no-newline", "--type", "text"])?;
-        return String::from_utf8(b).ok();
+        let t = linux::capture("wl-paste", &["--no-newline", "--type", "text"]).and_then(|b| String::from_utf8(b).ok());
+        log::debug!(
+            "read text via wl-paste: {} ({} ms)",
+            t.as_ref().map_or("none".to_string(), |t| format!("{} chars", t.chars().count())),
+            start.elapsed().as_millis()
+        );
+        return t;
     }
-    let t = with_board(|b| b.get_text().ok()).flatten()?;
-    (t.len() <= MAX_LEN).then_some(t)
+    match with_board(|b| b.get_text()) {
+        Some(Ok(t)) => {
+            log::debug!("read text: {} chars ({} ms)", t.chars().count(), start.elapsed().as_millis());
+            (t.len() <= MAX_LEN).then_some(t)
+        }
+        Some(Err(e)) => {
+            log::debug!("no text on the clipboard ({e})");
+            None
+        }
+        None => {
+            log::warn!("clipboard unavailable");
+            None
+        }
+    }
 }
 
 pub fn set(text: &str) {
     if text.len() > MAX_LEN {
+        log::warn!("not setting {} chars of text: over the {} limit", text.len(), crate::files::human(MAX_LEN as u64));
         return;
     }
+    log::debug!("setting clipboard text ({} chars)", text.chars().count());
     #[cfg(target_os = "linux")]
     if wayland() {
         linux::feed("wl-copy", &[], text.as_bytes());
         return;
     }
-    if with_board(|b| b.set_text(text.to_string())).map(|r| r.is_err()).unwrap_or(true) {
+    if let Some(Err(e)) = with_board(|b| b.set_text(text.to_string())) {
         // Clipboard owner may have gone stale; retry with a fresh handle.
+        log::debug!("setting text failed ({e}); retrying with a fresh clipboard handle");
         BOARD.with(|b| *b.borrow_mut() = None);
-        let _ = with_board(|b| b.set_text(text.to_string()));
+        if let Some(Err(e)) = with_board(|b| b.set_text(text.to_string())) {
+            log::warn!("couldn't set clipboard text: {e}");
+        }
     }
 }
 
@@ -76,18 +100,41 @@ pub fn get_image_png() -> Option<Vec<u8>> {
         let png = linux::capture_max("wl-paste", &["--type", "image/png"], MAX_IMAGE)?;
         return (!png.is_empty() && png.len() < MAX_IMAGE).then_some(png);
     }
-    let img = with_board(|b| b.get_image().ok()).flatten()?;
+    let start = Instant::now();
+    let img = match with_board(|b| b.get_image()) {
+        Some(Ok(img)) => img,
+        Some(Err(e)) => {
+            log::debug!("no image on the clipboard ({e})");
+            return None;
+        }
+        None => return None,
+    };
     let png = encode_png(img.width as u32, img.height as u32, &img.bytes)?;
-    (png.len() < MAX_IMAGE).then_some(png)
+    log::debug!(
+        "read image {}x{} -> PNG {} ({} ms)",
+        img.width,
+        img.height,
+        crate::files::human(png.len() as u64),
+        start.elapsed().as_millis()
+    );
+    if png.len() >= MAX_IMAGE {
+        log::warn!("clipboard image is {}; over the {} limit", crate::files::human(png.len() as u64), crate::files::human(MAX_IMAGE as u64));
+        return None;
+    }
+    Some(png)
 }
 
 pub fn set_image_png(png: &[u8]) {
+    log::debug!("setting clipboard image (PNG {})", crate::files::human(png.len() as u64));
     #[cfg(target_os = "linux")]
     if wayland() {
         linux::feed("wl-copy", &["--type", "image/png"], png);
         return;
     }
-    let Some((w, h, rgba)) = decode_png(png) else { return };
+    let Some((w, h, rgba)) = decode_png(png) else {
+        log::warn!("received image isn't a readable PNG");
+        return;
+    };
     let img = arboard::ImageData { width: w as usize, height: h as usize, bytes: rgba.into() };
     if with_board(|b| b.set_image(img.clone())).map(|r| r.is_err()).unwrap_or(true) {
         BOARD.with(|b| *b.borrow_mut() = None);
@@ -148,6 +195,14 @@ mod image_tests {
 
 /// Files on the clipboard (as a file manager's Copy leaves them).
 pub fn get_files() -> Option<Vec<PathBuf>> {
+    let files = get_files_inner();
+    if let Some(f) = &files {
+        log::debug!("clipboard holds {} file(s): {:?}", f.len(), f.iter().take(5).collect::<Vec<_>>());
+    }
+    files
+}
+
+fn get_files_inner() -> Option<Vec<PathBuf>> {
     #[cfg(windows)]
     return crate::win32::clipboard_files();
     #[cfg(target_os = "linux")]
@@ -159,6 +214,15 @@ pub fn get_files() -> Option<Vec<PathBuf>> {
 /// Put files on the clipboard so the file manager's Paste copies them.
 /// Returns the text form that was set (used to avoid echoing it as text).
 pub fn set_files(paths: &[PathBuf]) -> Option<String> {
+    log::debug!("putting {} file(s) on the clipboard: {:?}", paths.len(), paths.iter().take(5).collect::<Vec<_>>());
+    let r = set_files_inner(paths);
+    if r.is_none() {
+        log::warn!("couldn't put files on the clipboard");
+    }
+    r
+}
+
+fn set_files_inner(paths: &[PathBuf]) -> Option<String> {
     #[cfg(windows)]
     return crate::win32::set_clipboard_files(paths).then(String::new);
     #[cfg(target_os = "linux")]
@@ -255,9 +319,16 @@ mod linux {
         let start = Instant::now();
         let ok = loop {
             match child.try_wait() {
-                Ok(Some(status)) => break status.success(),
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        // Normal when the clipboard has no data of that type.
+                        log::debug!("{cmd} {args:?} exited with {status}");
+                    }
+                    break status.success();
+                }
                 Ok(None) if start.elapsed() < Duration::from_millis(1500) => std::thread::sleep(Duration::from_millis(5)),
                 _ => {
+                    log::warn!("{cmd} {args:?} didn't finish in 1.5 s; gave up");
                     let _ = child.kill();
                     let _ = child.wait();
                     break false;
@@ -269,9 +340,11 @@ mod linux {
     }
 
     pub fn feed(cmd: &str, args: &[&str], data: &[u8]) {
-        if let Ok(mut child) =
-            Command::new(cmd).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()
-        {
+        let child = Command::new(cmd).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+        if let Err(e) = &child {
+            log::warn!("couldn't run {cmd}: {e} (is it installed?)");
+        }
+        if let Ok(mut child) = child {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(data);
             }
@@ -281,7 +354,14 @@ mod linux {
             let start = Instant::now();
             loop {
                 match child.try_wait() {
-                    Ok(Some(_)) => return,
+                    Ok(Some(status)) => {
+                        if status.success() {
+                            log::debug!("{cmd} {args:?}: {} in {} ms", crate::files::human(data.len() as u64), start.elapsed().as_millis());
+                        } else {
+                            log::warn!("{cmd} {args:?} exited with {status}");
+                        }
+                        return;
+                    }
                     Ok(None) if start.elapsed() < Duration::from_secs(2) => std::thread::sleep(Duration::from_millis(10)),
                     _ => {
                         log::warn!("{cmd} didn't finish in 2 s (screen locked?); clipboard not updated");
