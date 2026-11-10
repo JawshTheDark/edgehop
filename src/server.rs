@@ -28,6 +28,14 @@ pub enum Dir {
 }
 
 impl Dir {
+    fn opposite(self) -> Dir {
+        match self {
+            Dir::Left => Dir::Right,
+            Dir::Right => Dir::Left,
+            Dir::Up => Dir::Down,
+            Dir::Down => Dir::Up,
+        }
+    }
     fn delta(self) -> (f64, f64) {
         match self {
             Dir::Left => (-1.0, 0.0),
@@ -173,10 +181,16 @@ pub struct Core {
     app: Option<Arc<AppState>>,
     /// macOS server: Command is sent as Ctrl (and Ctrl as Command).
     command_is_ctrl: bool,
+    /// Just came back through this edge, at this spot, at this time.
+    reentry: Option<(Dir, i32, i32, Instant)>,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
 const VK_SCROLL: u32 = 0x91;
+/// After coming back through an edge, it stays shut until the pointer is
+/// this far from it, or for this long.
+const REENTRY_PX: i32 = 6;
+const REENTRY_TIME: Duration = Duration::from_millis(500);
 /// Scroll Lock (F14 on a Mac keyboard): always returns the mouse home.
 const KEY_SCROLLLOCK: u16 = 70;
 /// A client silent for this long is treated as unresponsive (pinged every second).
@@ -217,6 +231,7 @@ impl Core {
             desk,
             app,
             command_is_ctrl: false,
+            reentry: None,
         };
         c.apply_config(cfg);
         c
@@ -375,8 +390,28 @@ impl Core {
 
     fn cross(&mut self, hit: Hit, dir: Dir) {
         match hit {
-            Hit::Server(sx, sy) => self.enter_server(sx, sy),
+            Hit::Server(sx, sy) => {
+                self.enter_server(sx, sy);
+                // We land on the very edge we came through: don't go straight
+                // back out until the pointer has moved off it.
+                self.reentry = Some((dir.opposite(), sx, sy, Instant::now()));
+            }
             Hit::Client(name, px, py) => self.enter_client(name, dir, px, py),
+        }
+    }
+
+    /// Just came back through an edge: a touch against that same edge (a
+    /// trackpad wobbling as you lift your finger, a late or bogus report) must
+    /// not send the pointer straight back out.
+    /// Called for every pointer position on this computer.
+    fn track_reentry(&mut self, x: i32, y: i32) {
+        let Some((edge, ex, ey, at)) = self.reentry else { return };
+        let moved_off = match edge {
+            Dir::Left | Dir::Right => (x - ex).abs() >= REENTRY_PX,
+            Dir::Up | Dir::Down => (y - ey).abs() >= REENTRY_PX,
+        };
+        if moved_off || at.elapsed() > REENTRY_TIME {
+            self.reentry = None;
         }
     }
 
@@ -402,6 +437,7 @@ impl Core {
 
     pub fn on_mouse_move(&mut self, x: i32, y: i32) -> bool {
         if !self.is_remote() {
+            self.track_reentry(x, y);
             let hit = self.edge_hit(x, y);
             if self.local_buttons > 0 {
                 // A left-drag pushed against an edge with a screen beyond: maybe files.
@@ -430,6 +466,9 @@ impl Core {
                 return false; // otherwise never switch mid-drag
             }
             if let Some((Hit::Client(name, px, py), dir, _)) = hit {
+                if self.reentry.is_some_and(|(edge, ..)| edge == dir) {
+                    return false;
+                }
                 self.enter_client(name, dir, px, py);
                 return true;
             }
@@ -1829,6 +1868,31 @@ mod tests {
             sent.iter().any(|m| matches!(m, ToClient::Move { x: 1519, y: 1013 })),
             "pinned in the bottom-right corner"
         );
+    }
+
+    #[test]
+    fn coming_back_does_not_bounce_straight_out_again() {
+        let (mut core, rx, cursor) = setup(true);
+        assert!(core.on_mouse_move(960, 1079));
+        let _ = enter_pos(&rx);
+        // Push up past the Surface's top edge: back on monitor 1, bottom row.
+        for _ in 0..4 {
+            if core.active == "pc" {
+                break;
+            }
+            core.on_mouse_move(960, 540 - 60);
+        }
+        assert_eq!(core.active, "pc");
+        let (x, y) = *cursor.lock().unwrap();
+        assert_eq!(y, 1079);
+        // A wobble back down onto the same edge doesn't cross again...
+        assert!(!core.on_mouse_move(x, 1079));
+        assert!(!core.on_mouse_move(x + 3, 1080));
+        assert_eq!(core.active, "pc", "stays on the PC");
+        // ...but once the pointer has moved off the edge, it works as usual.
+        assert!(!core.on_mouse_move(x, 1060));
+        assert!(core.on_mouse_move(x, 1079));
+        assert_eq!(core.active, "surface");
     }
 
     #[test]

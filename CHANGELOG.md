@@ -5,6 +5,16 @@ Each release's section below becomes its notes on the
 
 ## [0.2.3] - 2026-11-10
 
+### Fixes
+- **Sharing from a Mac**: the pointer could get flung back and forth between
+  the Mac and the other computer, sometimes many times a second. macOS counts
+  Edgehop's own re-centring of the hidden pointer as mouse movement; Edgehop
+  now measures movement from where it parked the pointer instead, as it does
+  on Windows.
+- Coming back to the sharing computer, the edge you came through stays shut
+  until the pointer moves off it (or for half a second), so a wobble as you
+  lift your finger from a trackpad doesn't send you straight back.
+
 ### More Linux downloads
 - **Fedora**: an `.rpm` (`sudo dnf install ./edgehop-*.rpm`). CI installs it in
   a Fedora container and runs it before every release.

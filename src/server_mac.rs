@@ -337,13 +337,13 @@ pub fn run(s: Arc<Shared>, ready: mpsc::Sender<usize>, _drags: mpsc::Sender<Vec<
         let Some(mut core) = try_core(&s) else { return false };
         match input {
             Input::Move { x, y, dx, dy } => {
-                if core.is_remote() {
-                    // Parked: only the raw movement matters.
-                    let (cx, cy) = core.desk.center();
-                    core.on_mouse_move(cx + dx, cy + dy)
-                } else {
-                    core.on_mouse_move(x, y)
-                }
+                // Position, never macOS's delta fields: those count our own
+                // warps (parking the pointer) as movement, which flung the
+                // pointer back and forth between screens. While away, the
+                // switching logic measures how far the pointer got from the
+                // parked spot, like on Windows, and drops bogus jumps.
+                log::trace!("pointer at ({x}, {y}), macOS delta ({dx}, {dy})");
+                core.on_mouse_move(x, y)
             }
             Input::Button { button, down } => core.on_button(button, down),
             Input::Wheel { dx, dy } => core.on_wheel(dx, dy),
