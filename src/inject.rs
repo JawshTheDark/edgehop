@@ -30,6 +30,43 @@ pub fn permission() -> Option<bool> {
     None
 }
 
+/// Mac clients: Ctrl from the server's keyboard acts as Command (and the
+/// Windows key as Control), so Ctrl+C copies and Ctrl+V pastes like on Windows.
+static CTRL_IS_COMMAND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_ctrl_is_command(on: bool) {
+    if cfg!(target_os = "macos") {
+        CTRL_IS_COMMAND.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[allow(dead_code)]
+fn ctrl_is_command() -> bool {
+    CTRL_IS_COMMAND.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The key to hold with C or V to copy or paste on this computer, as sent to
+/// [`Injector::key`]: Ctrl, except on a Mac (Command, which is Ctrl when Ctrl acts as Command).
+pub fn copy_modifier() -> u16 {
+    if cfg!(target_os = "macos") && !ctrl_is_command() {
+        125
+    } else {
+        29
+    }
+}
+
+/// Swap Ctrl and Meta (Windows key / Command), left and right.
+#[allow(dead_code)]
+fn swap_ctrl_meta(code: u16) -> u16 {
+    match code {
+        29 => 125,
+        125 => 29,
+        97 => 126,
+        126 => 97,
+        c => c,
+    }
+}
+
 /// Accumulates high-resolution wheel deltas into whole notches.
 #[derive(Default)]
 #[allow(dead_code)]
@@ -448,10 +485,46 @@ mod macos {
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
         fn CFRelease(p: *const c_void);
+        fn CFDictionaryCreate(
+            alloc: *const c_void,
+            keys: *const *const c_void,
+            values: *const *const c_void,
+            count: isize,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> *const c_void;
+        static kCFBooleanTrue: *const c_void;
+        // Only their addresses are used.
+        static kCFTypeDictionaryKeyCallBacks: [usize; 6];
+        static kCFTypeDictionaryValueCallBacks: [usize; 5];
     }
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn AXIsProcessTrusted() -> bool;
+        fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+        static kAXTrustedCheckOptionPrompt: *const c_void;
+    }
+
+    /// Show macOS's "Edgehop would like to control this computer" prompt,
+    /// which leads to the Accessibility settings. Once per run.
+    fn ask_for_permission() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| unsafe {
+            let keys = [kAXTrustedCheckOptionPrompt];
+            let values = [kCFBooleanTrue];
+            let options = CFDictionaryCreate(
+                std::ptr::null(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                1,
+                std::ptr::addr_of!(kCFTypeDictionaryKeyCallBacks) as *const c_void,
+                std::ptr::addr_of!(kCFTypeDictionaryValueCallBacks) as *const c_void,
+            );
+            AXIsProcessTrustedWithOptions(options);
+            if !options.is_null() {
+                CFRelease(options);
+            }
+        });
     }
 
     const MOUSE_MOVED: u32 = 5;
@@ -492,8 +565,9 @@ mod macos {
 
     impl Quartz {
         pub fn new() -> Result<Quartz, String> {
-            if !unsafe { AXIsProcessTrusted() } {
+            if !trusted() {
                 log::warn!("Edgehop needs Accessibility permission: System Settings → Privacy & Security → Accessibility");
+                ask_for_permission();
             }
             let b = unsafe { CGDisplayBounds(CGMainDisplayID()) };
             Ok(Quartz {
@@ -574,6 +648,7 @@ mod macos {
         }
 
         fn key(&mut self, code: u16, down: bool) {
+            let code = if super::ctrl_is_command() { super::swap_ctrl_meta(code) } else { code };
             let flag = match code {
                 42 | 54 => FLAG_SHIFT,
                 29 | 97 => FLAG_CTRL,

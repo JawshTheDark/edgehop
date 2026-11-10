@@ -53,6 +53,8 @@ pub struct Config {
     pub server_address: String,
     pub trusted_server: Option<Peer>,
     pub screen_override: Option<(i32, i32)>,
+    /// Mac: Ctrl from the server's keyboard acts as Command (Ctrl+C copies).
+    pub ctrl_is_command: bool,
 }
 
 impl Default for Config {
@@ -79,6 +81,7 @@ impl Default for Config {
             server_address: String::new(),
             trusted_server: None,
             screen_override: None,
+            ctrl_is_command: cfg!(target_os = "macos"),
         }
     }
 }

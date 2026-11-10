@@ -3,6 +3,24 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.1.1] - 2026-11-10
+
+Mac fixes, found by testing on a real Mac in CI.
+
+### Mac
+- Asks for Accessibility permission on first launch (macOS's own prompt), and
+  the Connection tab shows a button to the right settings page until it's allowed.
+- **Ctrl works as Command**: Ctrl+C copies and Ctrl+V pastes on the Mac, as on
+  Windows; the Windows key becomes Control. On by default; switch it off under
+  Settings → Keyboard.
+- Explains why it asks to use the local network (macOS 15 and later ask).
+
+### Everything else
+- `edgehop --self-test` checks a computer's clipboard and input without a server;
+  `--type` also types a sentence and copies it back.
+- Every change is now tested on a real Mac: the app is launched, types into
+  TextEdit and copies the text back, and screenshots are kept with each CI run.
+
 ## [0.1.0] - 2026-11-10
 
 The first release.

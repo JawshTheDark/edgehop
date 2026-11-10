@@ -103,6 +103,7 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
             }
         });
     }
+    inject::set_ctrl_is_command(app.cfg().ctrl_is_command);
     let mut injector = match inject::create() {
         Ok(i) => i,
         Err(e) => {
@@ -474,7 +475,8 @@ fn session(
                 inj.key(1, true);
                 inj.key(1, false);
                 thread::sleep(Duration::from_millis(200));
-                for (code, down) in [(29, true), (46, true), (46, false), (29, false)] {
+                let modifier = inject::copy_modifier();
+                for (code, down) in [(modifier, true), (46, true), (46, false), (modifier, false)] {
                     inj.key(code, down);
                 }
                 let tx2 = tx.clone();

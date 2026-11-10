@@ -233,6 +233,9 @@ struct Gui {
     log_filter: log::Level,
     log_search: String,
     diag_msg: Arc<std::sync::Mutex<Option<String>>>,
+    /// Mac: whether Accessibility is allowed, and when we last asked.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    input_allowed: Option<(std::time::Instant, bool)>,
 }
 
 impl Gui {
@@ -260,6 +263,7 @@ impl Gui {
             log_filter: log::Level::Info,
             log_search: String::new(),
             diag_msg: Arc::new(std::sync::Mutex::new(None)),
+            input_allowed: None,
         }
     }
 
@@ -797,6 +801,20 @@ impl Gui {
 
     // ---------------- client: Connection ----------------
 
+    /// Mac: Accessibility permission, checked at most once a second.
+    #[cfg(target_os = "macos")]
+    fn input_allowed(&mut self, ctx: &egui::Context) -> bool {
+        let now = std::time::Instant::now();
+        if self.input_allowed.map_or(true, |(at, _)| now.duration_since(at).as_secs_f32() >= 1.0) {
+            self.input_allowed = Some((now, crate::inject::permission().unwrap_or(true)));
+        }
+        let ok = self.input_allowed.is_some_and(|(_, ok)| ok);
+        if !ok {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        ok
+    }
+
     fn connection_tab(&mut self, ui: &mut egui::Ui, cfg: &Config) {
         let p = palette(ui.visuals().dark_mode);
         let status = lk(&self.app.status).clone();
@@ -840,6 +858,22 @@ impl Gui {
                 });
             }
         });
+
+        #[cfg(target_os = "macos")]
+        if !self.input_allowed(ui.ctx()) {
+            ui.add_space(10.0);
+            card(ui, "⚠ Allow Edgehop to control this Mac", "", |ui| {
+                ui.label(
+                    "macOS only lets an app move the pointer and type once you allow it. Turn on Edgehop under                      System Settings > Privacy & Security > Accessibility; this message goes away by itself.",
+                );
+                ui.add_space(6.0);
+                if ui.button("Open Accessibility settings").clicked() {
+                    let _ = std::process::Command::new("open")
+                        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                        .spawn();
+                }
+            });
+        }
 
         if let Some(fp) = lk(&self.app.key_mismatch).clone() {
             ui.add_space(10.0);
@@ -1008,6 +1042,23 @@ impl Gui {
                     });
                 });
                 ui.add_space(10.0);
+                if cfg!(target_os = "macos") {
+                    card(ui, "Keyboard", "", |ui| {
+                        row(
+                            ui,
+                            "Ctrl works as Command",
+                            "Ctrl+C copies and Ctrl+V pastes, as on Windows. The Windows key becomes Control.",
+                            |ui| {
+                                let mut on = cfg.ctrl_is_command;
+                                if toggle(ui, &mut on).changed() {
+                                    self.app.update_config(|c| c.ctrl_is_command = on);
+                                    crate::inject::set_ctrl_is_command(on);
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(10.0);
+                }
                 card(ui, "Sharing", "", |ui| {
                     self.clipboard_row(ui, cfg);
                     row(

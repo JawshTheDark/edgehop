@@ -68,8 +68,8 @@ pub fn run(args: &[String]) -> i32 {
     r.info("desktop hooks", if crate::platform::client_hooks().is_some() { "available" } else { "none on this system" });
 
     let events_work = pointer(&mut r, inj.as_mut(), w, h, allowed);
-    if args.iter().any(|a| a == "--type") {
-        typing(&mut r, inj.as_mut(), events_work);
+    if args.iter().any(|a| a == "--type") && typing(&mut r, inj.as_mut(), events_work) && cfg!(target_os = "macos") {
+        ctrl_as_command(&mut r, inj.as_mut());
     }
     finish(r)
 }
@@ -145,18 +145,17 @@ fn near(at: Option<(f64, f64)>, x: i32, y: i32) -> bool {
     at.is_some_and(|(ax, ay)| (ax - x as f64).abs() <= 2.0 && (ay - y as f64).abs() <= 2.0)
 }
 
-fn typing(r: &mut Report, inj: &mut dyn crate::inject::Injector, events_work: bool) {
+/// Returns whether the sentence was typed and copied back.
+fn typing(r: &mut Report, inj: &mut dyn crate::inject::Injector, events_work: bool) -> bool {
     if !events_work {
         r.skip("typing", "injected input isn't reaching the system (see above)");
-        return;
+        return false;
     }
     const SHIFT: u16 = 42;
     #[cfg(target_os = "macos")]
     const MODIFIER: u16 = 125; // Command
     #[cfg(not(target_os = "macos"))]
     const MODIFIER: u16 = 29; // Ctrl
-    const KEY_A: u16 = 30;
-    const KEY_C: u16 = 46;
 
     crate::clipboard::set("before typing");
     fn tap(inj: &mut dyn crate::inject::Injector, code: u16, shift: bool) {
@@ -176,30 +175,59 @@ fn typing(r: &mut Report, inj: &mut dyn crate::inject::Injector, events_work: bo
             Some((code, shift)) => tap(inj, code, shift),
             None => {
                 r.fail("typing", format!("no key for {c:?}"));
-                return;
+                return false;
             }
         }
     }
     std::thread::sleep(Duration::from_millis(300));
-    for code in [KEY_A, KEY_C] {
-        inj.key(MODIFIER, true);
-        tap(inj, code, false);
-        inj.key(MODIFIER, false);
+    select_all_and_copy(inj, MODIFIER);
+    match copied() {
+        Some(t) if t == TYPED => {
+            r.pass("typing", format!("typed, selected and copied {TYPED:?}"));
+            return true;
+        }
+        Some(t) if t == "before typing" => {
+            r.fail("typing", "select-all + copy didn't reach the focused window (is a text editor in front?)")
+        }
+        other => r.fail("typing", format!("expected {TYPED:?}, clipboard has {other:?}")),
+    }
+    false
+}
+
+/// With "Ctrl works as Command" on, Ctrl+A / Ctrl+C from the server must
+/// select and copy on a Mac.
+fn ctrl_as_command(r: &mut Report, inj: &mut dyn crate::inject::Injector) {
+    crate::clipboard::set("before ctrl");
+    crate::inject::set_ctrl_is_command(true);
+    select_all_and_copy(inj, 29);
+    crate::inject::set_ctrl_is_command(false);
+    match copied() {
+        Some(t) if t == TYPED => r.pass("ctrl as command", "Ctrl+A, Ctrl+C selected and copied"),
+        other => r.fail("ctrl as command", format!("Ctrl+A, Ctrl+C didn't copy; clipboard has {other:?}")),
+    }
+}
+
+fn select_all_and_copy(inj: &mut dyn crate::inject::Injector, modifier: u16) {
+    for code in [30, 46] {
+        inj.key(modifier, true);
+        std::thread::sleep(Duration::from_millis(8));
+        inj.key(code, true);
+        std::thread::sleep(Duration::from_millis(8));
+        inj.key(code, false);
+        inj.key(modifier, false);
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// The clipboard once it holds the typed sentence, or whatever it holds after 3 s.
+fn copied() -> Option<String> {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut got = crate::clipboard::get();
     while got.as_deref() != Some(TYPED) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(100));
         got = crate::clipboard::get();
     }
-    match got {
-        Some(t) if t == TYPED => r.pass("typing", format!("typed, selected and copied {TYPED:?}")),
-        Some(t) if t == "before typing" => {
-            r.fail("typing", "select-all + copy didn't reach the focused window (is a text editor in front?)")
-        }
-        other => r.fail("typing", format!("expected {TYPED:?}, clipboard has {other:?}")),
-    }
+    got
 }
 
 /// US layout: character -> (evdev key code, needs Shift).
