@@ -194,6 +194,15 @@ pub struct Core {
     /// When each computer's connection was last replaced by a new one from it.
     replacements: HashMap<String, VecDeque<Instant>>,
     stale_reported: Option<Instant>,
+    /// Why game mode is wanted (shown and logged when it takes effect).
+    game_why: String,
+    /// Scroll Lock is held (its auto-repeat must not toggle again and again).
+    scroll_held: bool,
+    /// Keys that went down on this computer and haven't come up yet: their
+    /// release belongs here even if the mouse has moved on meanwhile.
+    local_keys: Vec<u16>,
+    /// A client this computer asked to send dropped files (it may now offer them).
+    pub drop_from: Option<String>,
     /// Game mode turned on (Some(true)) or off (Some(false)) by hand; None:
     /// automatic. Off while a game is in front lasts until that game closes.
     game_manual: Option<bool>,
@@ -266,6 +275,10 @@ impl Core {
             game_auto_enabled: true,
             game_auto: None,
             game_on: false,
+            game_why: String::new(),
+            scroll_held: false,
+            local_keys: Vec::new(),
+            drop_from: None,
         };
         c.apply_config(cfg);
         c
@@ -300,9 +313,22 @@ impl Core {
 
     fn update_game(&mut self, why: &str) {
         let on = self.game_wanted();
+        if !why.is_empty() {
+            self.game_why = why.to_string();
+        }
         if on == self.game_on {
             return;
         }
+        if on && self.is_remote() {
+            // The mouse is on another computer: turning it on now would take
+            // the mouse hook away from under it (the pointer over there would
+            // freeze while the mouse moved this computer's hidden cursor).
+            // It takes effect when the mouse comes back.
+            log::info!("game mode will turn on when the mouse is back on {}: {why}", self.me);
+            return;
+        }
+        let why = if why.is_empty() { self.game_why.clone() } else { why.to_string() };
+        let why = why.as_str();
         self.game_on = on;
         log::info!("game mode {}: {why}", if on { "on" } else { "off" });
         crate::flight::note("game mode", format!("{} ({why})", if on { "on" } else { "off" }));
@@ -574,10 +600,10 @@ impl Core {
     /// We crossed while the physical left button is still held down.
     fn hold_left_here(&mut self) {
         if self.is_remote() {
-            self.remote_buttons = 1;
+            self.remote_buttons = LEFT_ONLY;
             self.left_remote = true;
         } else {
-            self.local_buttons = 1;
+            self.local_buttons = LEFT_ONLY;
             self.left_local = true;
         }
     }
@@ -601,7 +627,7 @@ impl Core {
             if self.local_buttons > 0 {
                 // A left-drag pushed against an edge with a screen beyond: maybe files.
                 let can_grab = self.left_local
-                    && self.local_buttons == 1
+                    && self.local_buttons == LEFT_ONLY
                     && self.carry.is_none()
                     && self.grab_pending.is_none()
                     && !self.grab_tried
@@ -727,7 +753,7 @@ impl Core {
                     Dir::Up => (gx, r.t + 0.5),
                     Dir::Down => (gx, r.b - 0.5),
                 };
-                let carrying = self.carry.is_some() && self.left_remote && self.remote_buttons == 1;
+                let carrying = self.carry.is_some() && self.left_remote && self.remote_buttons == LEFT_ONLY;
                 match self.cast(ox, oy, dir, Some(&active)) {
                     Some(hit) if self.remote_buttons == 0 => {
                         log::info!(
@@ -748,7 +774,7 @@ impl Core {
                     }
                     Some(hit)
                         if self.left_remote
-                            && self.remote_buttons == 1
+                            && self.remote_buttons == LEFT_ONLY
                             && self.grab_pending.is_none()
                             && !self.grab_tried =>
                     {
@@ -775,8 +801,13 @@ impl Core {
 
     pub fn on_button(&mut self, button: u8, down: bool) -> bool {
         let remote = self.is_remote();
-        let counter = if remote { &mut self.remote_buttons } else { &mut self.local_buttons };
-        *counter = if down { *counter + 1 } else { counter.saturating_sub(1) };
+        // Which buttons are down, one bit each: a release that never arrives
+        // (a click into an administrator's window, say) is healed by the next
+        // click of that button, where a count would stay off by one forever
+        // and the pointer could never leave this screen again.
+        let held = if remote { &mut self.remote_buttons } else { &mut self.local_buttons };
+        let bit = 1u32 << (button as u32 & 31);
+        *held = if down { *held | bit } else { *held & !bit };
         if button == BTN_LEFT {
             if remote {
                 self.left_remote = down;
@@ -816,6 +847,7 @@ impl Core {
         } else if !self.is_remote() {
             log::info!("dropping {} item(s) from {} here", c.files.len(), c.from);
             self.drop_point = Some(self.desk.cursor());
+            self.drop_from = Some(c.from.clone());
             self.send(&c.from, ToClient::FilesSend { paths: c.files });
         } else {
             log::info!("dragging files between two other computers isn't supported yet");
@@ -828,6 +860,11 @@ impl Core {
         self.grab_tried = true;
         if files.is_empty() || !self.left_local || self.is_remote() || p.from != self.me {
             return;
+        }
+        if let Hit::Client(to, ..) = &p.hit {
+            if !self.clients.contains_key(to) {
+                return; // it disconnected while the drag was held at the edge
+            }
         }
         log::info!("carrying {} item(s) across", files.len());
         self.cross(p.hit, p.dir);
@@ -842,10 +879,19 @@ impl Core {
 
     /// A client answered `FilesGrab`.
     pub fn client_grab_result(&mut self, name: &str, files: Vec<String>) {
+        // Only the computer that was asked may answer.
+        if self.grab_pending.as_ref().map_or(true, |p| p.from != name) {
+            return;
+        }
         let Some(p) = self.grab_pending.take() else { return };
         self.grab_tried = true;
-        if files.is_empty() || p.from != name || self.active != name || !self.left_remote {
+        if files.is_empty() || self.active != name || !self.left_remote {
             return;
+        }
+        if let Hit::Client(to, ..) = &p.hit {
+            if !self.clients.contains_key(to) {
+                return;
+            }
         }
         log::info!("carrying {} item(s) from {name}", files.len());
         self.cross(p.hit, p.dir);
@@ -875,35 +921,54 @@ impl Core {
         if vk == VK_SCROLL {
             return self.on_evdev_key(KEY_SCROLLLOCK, down);
         }
+        match crate::keymap::win_to_evdev(scan, extended, vk) {
+            Some(code) => self.on_evdev_key(code, down),
+            None => self.is_remote(),
+        }
+    }
+
+    /// Track keys pressed on this computer. True if this event belongs to
+    /// this computer: every key while the mouse is here, and afterwards the
+    /// release of a key that went down here (or this computer would see it
+    /// held until pressed again: a stuck Ctrl, Shift or Alt on coming back).
+    fn key_is_local(&mut self, code: u16, down: bool) -> bool {
         if !self.is_remote() {
-            return false;
+            self.local_keys.retain(|&k| k != code);
+            if down {
+                self.local_keys.push(code);
+            }
+            return true;
         }
-        if let Some(code) = crate::keymap::win_to_evdev(scan, extended, vk) {
-            self.on_evdev_key(code, down);
+        if !down {
+            if let Some(i) = self.local_keys.iter().position(|&k| k == code) {
+                self.local_keys.swap_remove(i);
+                return true;
+            }
         }
-        true
+        false
     }
 
     /// A key as a Linux (evdev) key code: from macOS and Linux capture, and from on_key.
     pub fn on_evdev_key(&mut self, code: u16, down: bool) -> bool {
-        if code == KEY_SCROLLLOCK && !self.is_remote() {
-            // Scroll Lock (F14 on a Mac) on this computer: game mode on/off.
-            if down {
+        if code == KEY_SCROLLLOCK {
+            // Once per press: held, the key repeats, and each repeat would
+            // toggle again.
+            let pressed = down && !self.scroll_held;
+            self.scroll_held = down;
+            if pressed && self.is_remote() {
+                log::info!("Scroll Lock pressed: returning to {}", self.me);
+                self.go_home();
+            } else if pressed {
+                // Scroll Lock (F14 on a Mac) on this computer: game mode on/off.
                 self.toggle_game_mode("Scroll Lock");
             }
             return true;
         }
+        let here = self.key_is_local(code, down);
         if !self.is_remote() {
             return false;
         }
-        log::trace!("key {code} {} on {}", if down { "down" } else { "up" }, self.active);
-        if code == KEY_SCROLLLOCK {
-            if down {
-                log::info!("Scroll Lock pressed: returning to {}", self.me);
-                self.go_home();
-            }
-            return true;
-        }
+        log::trace!("key {code} {} on {}{}", if down { "down" } else { "up" }, self.active, if here { " (was pressed here)" } else { "" });
         // A Mac sharing its keyboard: Command does what Ctrl does elsewhere.
         let code = if self.command_is_ctrl {
             match code {
@@ -917,7 +982,9 @@ impl Core {
             code
         };
         self.send(&self.active, ToClient::Key { code, down });
-        true
+        // The release of a key pressed here goes to both: this computer
+        // must see it, and the other may have seen the key repeat.
+        !here
     }
 
     // ---- switching ----
@@ -930,8 +997,29 @@ impl Core {
             self.job(ClipJob::ReadLocal);
         }
         self.remote_buttons = 0;
+        self.left_remote = false;
         self.push = 0.0;
         self.push_dir = None;
+    }
+
+    /// The system says no mouse button is down: forget any we still think is
+    /// held on this computer (its release never reached us).
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    pub fn no_buttons_down(&mut self) {
+        if !self.is_remote() && self.local_buttons != 0 {
+            log::debug!("no mouse button is down any more (missed a release); buttons {:#b} cleared", self.local_buttons);
+            self.local_buttons = 0;
+            self.left_local = false;
+            self.edge_pushes = 0;
+            self.grab_pending = None;
+            self.grab_tried = false;
+            self.desk.hide_drop_strip();
+        }
+    }
+
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    pub fn thinks_a_button_is_down(&self) -> bool {
+        !self.is_remote() && self.local_buttons != 0
     }
 
     /// Enter client `name` at server-space point (px, py), travelling in `dir`.
@@ -986,6 +1074,8 @@ impl Core {
         self.desk.hide_drop_strip();
         self.sync_server_clipboard();
         self.publish();
+        // Game mode asked for while the mouse was away starts now.
+        self.update_game("");
     }
 
     fn sync_server_clipboard(&mut self) {
@@ -1034,7 +1124,10 @@ impl Core {
     /// stored size is current. Returns the placement to save if it changed.
     pub fn ensure_placed(&mut self, name: &str) -> Option<ScreenPos> {
         let (w, h) = self.clients.get(name).map(|s| (s.w, s.h))?;
-        self.mons = self.desk.monitors();
+        if self.mons.is_empty() {
+            // Normally kept current by the watchdog, off the input path.
+            self.mons = self.desk.monitors();
+        }
         let updated = match self.screens.iter().find(|p| p.name == name) {
             Some(p) if p.w == w && p.h == h => return None,
             Some(p) => crate::layout::resize(p, &self.mons, w, h),
@@ -1212,9 +1305,16 @@ impl ServerEngine {
                 .spawn(move || capture::run(s, tid_tx, drag_tx))
                 .map_err(|e| e.to_string())?;
             let hook_thread = match tid_rx.recv_timeout(Duration::from_secs(5)) {
-                Ok(0) => return Err(capture::failure()),
+                Ok(0) => {
+                    shared.stop.store(true, Ordering::Relaxed);
+                    return Err(capture::failure());
+                }
                 Ok(h) => h,
-                Err(_) => return Err("Input capture failed to start".into()),
+                Err(_) => {
+                    // Whatever was started (accept loop, a slow capture thread) must end too.
+                    shared.stop.store(true, Ordering::Relaxed);
+                    return Err("Input capture failed to start".into());
+                }
             };
 
             // File worker: grabbing a dragged selection and sending files.
@@ -1306,7 +1406,10 @@ impl ServerEngine {
                     if s.stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let Ok(stream) = conn else { continue };
+                    let Ok(stream) = conn else {
+                        thread::sleep(Duration::from_millis(200)); // e.g. out of handles: don't spin
+                        continue;
+                    };
                     let s2 = s.clone();
                     let _ = thread::Builder::new().name("conn".into()).spawn(move || {
                         let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
@@ -1358,6 +1461,10 @@ impl ServerEngine {
                         core.check_responsive();
                         #[cfg(windows)]
                         core.set_fullscreen_app(fullscreen);
+                        #[cfg(windows)]
+                        if core.thinks_a_button_is_down() && !crate::win32::any_mouse_button_down() {
+                            core.no_buttons_down();
+                        }
                         drop(core);
                         if capture::look_lost() && last_rehook.map_or(true, |t| t.elapsed() > Duration::from_secs(10)) {
                             #[cfg(windows)]
@@ -1418,7 +1525,12 @@ impl ServerEngine {
         for (_, s) in lk(&self.shared.streams).drain() {
             let _ = s.shutdown(Shutdown::Both);
         }
-        lk(&self.shared.core).clients.clear();
+        let mut core = lk(&self.shared.core);
+        core.clients.clear();
+        // Closing these channels lets the clipboard and file workers end
+        // (they'd otherwise keep this engine's state alive for good).
+        core.clip_jobs = None;
+        core.file_jobs = None;
     }
 }
 
@@ -1445,6 +1557,9 @@ fn try_core(s: &Shared) -> Option<std::sync::MutexGuard<'_, Core>> {
     }
 }
 
+/// Button state with only the left button down.
+const LEFT_ONLY: u32 = 1 << BTN_LEFT;
+
 fn sanitize_name(n: &str) -> String {
     let n: String = n.chars().filter(|c| !c.is_control()).take(40).collect();
     if n.trim().is_empty() {
@@ -1461,7 +1576,8 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     let raw = stream.try_clone()?;
     let net::Handshaked { mut tx, mut rx, remote_key, code } = net::accept_handshake(stream, &s.private_key)?;
     log::debug!("handshake with {addr} ok, key {}", net::fingerprint(&remote_key));
-    let first = rx.recv::<ToServer>()?;
+    // Nothing is known about this peer yet: its first message must be small.
+    let first = rx.recv_limited::<ToServer>(16 * 1024)?;
     if let ToServer::DataHello { id } = first {
         log::debug!("{addr} opened a transfer connection for {id:#x}");
         return data_connection(s, tx, rx, &remote_key, id);
@@ -1475,6 +1591,15 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     let cfg = app.cfg();
     if name == cfg.name {
         name = format!("{name}-client");
+    }
+    // A name belongs to the computer (key) paired under it: another computer
+    // calling itself the same gets a name of its own, instead of taking over
+    // the first one's connection, pairing and place on the desktop.
+    let taken = |n: &str| cfg.trusted_clients.iter().any(|p| p.name == n && p.key != remote_key);
+    if taken(&name) {
+        let base = name.clone();
+        name = (2..).map(|i| format!("{base}-{i}")).find(|n| !taken(n)).unwrap_or(base);
+        log::info!("another computer is already paired as {:?}; calling this one {name:?}", sanitize_name(&name));
     }
 
     match cfg.trusted_clients.iter().find(|p| p.key == remote_key) {
@@ -1493,6 +1618,17 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
         }
         Some(_) => {}
         None => {
+            {
+                // One request per address, and only a handful at once: anyone on
+                // the network can ask.
+                let pending = lk(&app.pending);
+                if pending.len() >= 6 || pending.iter().any(|p| p.addr == addr) {
+                    log::info!("pairing request from {name} ({addr}) refused: too many waiting");
+                    drop(pending);
+                    let _ = tx.send(&ToClient::PairRejected);
+                    return Ok(());
+                }
+            }
             log::info!("pairing request from {name} ({addr}), code {code}");
             let (reply_tx, reply_rx) = mpsc::channel();
             let id = s.next_id.fetch_add(1, Ordering::Relaxed);
@@ -1516,7 +1652,7 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
             }
             let (n, k) = (name.clone(), remote_key.clone());
             app.update_config(|c| {
-                c.trusted_clients.retain(|p| p.key != k && p.name != n);
+                c.trusted_clients.retain(|p| p.key != k);
                 c.trusted_clients.push(Peer { name: n.clone(), key: k });
             });
             log::info!("paired with {name}");
@@ -1617,15 +1753,30 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
             Ok(ToServer::Clipboard { text }) => lk(&s.core).client_clipboard(&name, Clip::Text { text }),
             Ok(ToServer::ClipboardImage { png }) => lk(&s.core).client_clipboard(&name, Clip::Image { png }),
             Ok(ToServer::FilesGrabbed { files }) => lk(&s.core).client_grab_result(&name, files),
-            Ok(ToServer::ClipboardFiles { manifest }) => {
+            Ok(ToServer::ClipboardFiles { mut manifest }) => {
+                // Who it's from is who sent it, under the name known here.
+                manifest.from = name.clone();
                 lk(&s.core).client_clipboard(&name, Clip::Files { manifest })
             }
-            Ok(ToServer::DropOffer { manifest }) => receive_drop(s.clone(), manifest),
+            Ok(ToServer::DropOffer { mut manifest }) => {
+                manifest.from = name.clone();
+                // Only files this computer asked that client for (a drag dropped here).
+                let asked = lk(&s.core).drop_from.take();
+                if asked.as_deref() == Some(name.as_str()) {
+                    receive_drop(s.clone(), manifest)
+                } else {
+                    log::warn!("{name} offered dropped files nobody asked for; ignoring them");
+                }
+            }
             Ok(ToServer::Logs { text }) => {
                 log::debug!("received {}'s log ({} lines)", name, text.lines().count());
                 lk(&app.remote_logs).insert(name.clone(), text);
             }
             Ok(_) => {}
+            // A message this version doesn't know (a newer Edgehop on the other side).
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                log::debug!("{name} sent a message this version doesn't understand: {e}");
+            }
             Err(e) => break e,
         }
     };
@@ -1895,7 +2046,11 @@ mod hooks {
         }
         let Some(mut core) = try_core(&s) else { return false };
         let took = core.on_key(kb.vkCode, kb.scanCode, kb.flags & LLKHF_EXTENDED != 0, down);
-        crate::flight::rec("win key", "vk scan flags down took", &[kb.vkCode as i64, kb.scanCode as i64, kb.flags as i64, down as i64, took as i64]);
+        // Which key, only for keys that don't type anything (see flight::types_text).
+        let typing = crate::keymap::win_to_evdev(kb.scanCode, kb.flags & LLKHF_EXTENDED != 0, kb.vkCode)
+            .is_some_and(crate::flight::types_text);
+        let (vk, scan) = if typing { (0, 0) } else { (kb.vkCode as i64, kb.scanCode as i64) };
+        crate::flight::rec("win key", "vk scan flags down took", &[vk, scan, kb.flags as i64, down as i64, took as i64]);
         took
     }
 
@@ -2006,6 +2161,8 @@ mod hooks {
 
     pub fn run(s: Arc<Shared>, ready: mpsc::Sender<usize>, drags: mpsc::Sender<Vec<String>>) {
         *lk(&ACTIVE) = Some(s);
+        // A new engine starts with game mode off: watch the mouse again.
+        MOUSE_OFF.store(false, Ordering::Relaxed);
         // The drop target lives on this thread: it needs the message loop below.
         crate::dragdrop::init(drags);
         if !crate::win32::raise_thread_priority() {
@@ -2236,12 +2393,77 @@ mod tests {
         core.on_key(0x91, 0x46, false, false);
         core.on_key(0x91, 0x46, false, true);
         assert!(!core.game_mode_on(), "pressed again: off");
+        core.on_key(0x91, 0x46, false, false);
         // On the other computer it still brings the mouse home (no game mode).
         core.on_mouse_move(960, 1079);
         let _ = enter_pos(&rx);
         core.on_key(0x91, 0x46, false, true);
         assert_eq!(core.active, "pc");
         assert!(!core.game_mode_on());
+    }
+
+    #[test]
+    fn holding_scroll_lock_toggles_once() {
+        let (mut core, _rx, _) = setup(true);
+        for _ in 0..5 {
+            core.on_key(0x91, 0x46, false, true); // the key repeating
+        }
+        assert!(core.game_mode_on(), "one press, however long it's held");
+        core.on_key(0x91, 0x46, false, false);
+        assert!(core.game_mode_on());
+    }
+
+    #[test]
+    fn a_game_starting_while_away_waits_for_the_mouse_to_come_home() {
+        let (mut core, rx, _) = setup(true);
+        core.on_mouse_move(960, 1079);
+        let _ = enter_pos(&rx);
+        core.set_fullscreen_app(Some("game.exe".into()));
+        assert!(!core.game_mode_on(), "not while the mouse is on the Surface: its pointer would freeze");
+        assert!(core.on_mouse_move(960 + 5, 540), "the mouse still drives the Surface");
+        core.go_home();
+        assert!(core.game_mode_on(), "on once the mouse is back");
+    }
+
+    #[test]
+    fn a_missed_button_release_doesnt_trap_the_pointer() {
+        let (mut core, _rx, _) = setup(true);
+        // A press whose release never arrives (clicked into an admin window)...
+        core.on_button(BTN_LEFT, true);
+        assert!(!core.on_mouse_move(960, 1079), "held: no switching mid-drag");
+        // ...is healed by the next click of that button.
+        core.on_button(BTN_LEFT, true);
+        core.on_button(BTN_LEFT, false);
+        assert!(core.on_mouse_move(960, 1079), "the pointer can leave again");
+        assert_eq!(core.active, "surface");
+    }
+
+    #[test]
+    fn the_system_saying_no_button_is_down_clears_a_stuck_one() {
+        let (mut core, _rx, _) = setup(true);
+        core.on_button(BTN_RIGHT, true);
+        assert!(core.thinks_a_button_is_down());
+        core.no_buttons_down();
+        assert!(core.on_mouse_move(960, 1079));
+        assert_eq!(core.active, "surface");
+    }
+
+    #[test]
+    fn a_key_held_while_crossing_is_released_on_both_computers() {
+        let (mut core, rx, _) = setup(true);
+        assert!(!core.on_evdev_key(29, true), "Ctrl goes down here");
+        core.on_mouse_move(960, 1079);
+        let _ = enter_pos(&rx);
+        while rx.try_recv().is_ok() {}
+        // Its release must reach this computer too (or Ctrl stays stuck here)...
+        assert!(!core.on_evdev_key(29, false), "the release is let through here");
+        // ...and the other one, which may have seen the key repeat.
+        // (A Mac sends its Ctrl as the Windows key: Command is its Ctrl.)
+        let sent = if core.command_is_ctrl { 125 } else { 29 };
+        assert!(rx.try_iter().any(|m| matches!(m, ToClient::Key { code, down: false } if code == sent)));
+        // Keys pressed over there stay over there.
+        assert!(core.on_evdev_key(30, true));
+        assert!(core.on_evdev_key(30, false));
     }
 
     #[test]

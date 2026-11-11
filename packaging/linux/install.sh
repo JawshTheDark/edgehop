@@ -13,8 +13,10 @@ sudo install -Dm644 70-edgehop-input.rules /etc/udev/rules.d/70-edgehop-input.ru
 sudo install -Dm644 edgehop-uinput.conf /etc/modules-load.d/edgehop-uinput.conf
 sudo install -Dm644 edgehop.desktop /usr/local/share/applications/edgehop.desktop
 # Optional login-screen service (off until you switch it on in Edgehop's Settings).
-sed 's#/usr/bin/edgehop#/usr/local/bin/edgehop#' edgehop-login.service | sudo tee /etc/systemd/system/edgehop-login.service >/dev/null
-sudo systemctl daemon-reload 2>/dev/null || true
+if [ -d /etc/systemd/system ]; then
+    sed 's#/usr/bin/edgehop#/usr/local/bin/edgehop#' edgehop-login.service | sudo tee /etc/systemd/system/edgehop-login.service >/dev/null
+    sudo systemctl daemon-reload 2>/dev/null || true
+fi
 sudo install -Dm644 edgehop.png /usr/local/share/icons/hicolor/256x256/apps/edgehop.png
 
 sudo modprobe uinput 2>/dev/null || true

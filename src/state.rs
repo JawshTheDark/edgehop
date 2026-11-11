@@ -60,6 +60,10 @@ pub struct AppState {
     pub pending: Mutex<Vec<PairRequest>>,
     pub discovered: Mutex<Vec<Discovered>>,
     pub pairing_code: Mutex<Option<String>>,
+    /// Client: the computer asking to be trusted (shown with the code).
+    pub pair_with: Mutex<Option<String>>,
+    /// Client: the user's answer to "pair with this computer?".
+    pub pair_answer: Mutex<Option<bool>>,
     pub key_mismatch: Mutex<Option<String>>,
     pub logs: Mutex<VecDeque<LogLine>>,
     pub ctx: Mutex<Option<eframe::egui::Context>>,
@@ -90,6 +94,8 @@ impl AppState {
             pending: Mutex::new(Vec::new()),
             discovered: Mutex::new(Vec::new()),
             pairing_code: Mutex::new(None),
+            pair_with: Mutex::new(None),
+            pair_answer: Mutex::new(None),
             key_mismatch: Mutex::new(None),
             logs: Mutex::new(VecDeque::new()),
             ctx: Mutex::new(None),
@@ -122,6 +128,11 @@ impl AppState {
         let (flag, cv) = &self.open_request;
         *lk(flag) = true;
         cv.notify_all();
+    }
+
+    /// The window is up: requests made while it was opening are answered.
+    pub fn window_opened(&self) {
+        *lk(&self.open_request.0) = false;
     }
 
     /// Block until something asks for the window.
@@ -164,9 +175,11 @@ impl AppState {
         let snapshot = {
             let mut c = lk(&self.config);
             f(&mut c);
+            // Saved before the lock is let go, so two changes at once can't
+            // land on disk in the wrong order.
+            c.save();
             c.clone()
         };
-        snapshot.save();
         if let Some(Engine::Server(s)) = lk(&self.engine).as_ref() {
             s.apply_config(&snapshot);
         }
@@ -200,6 +213,10 @@ impl AppState {
             let _ = p.reply.send(false);
         }
         *lk(&self.pairing_code) = None;
+        *lk(&self.pair_with) = None;
+        *lk(&self.pair_answer) = None;
+        // A new engine starts with game mode off.
+        *lk(&self.game_mode) = None;
         *lk(&self.active_screen) = String::new();
         self.set_status("Stopped", false);
     }
@@ -260,6 +277,8 @@ impl AppState {
 
     pub fn quit(&self) -> ! {
         self.stop_engine();
+        // A cursor hidden while the mouse was away must not stay hidden.
+        crate::platform::restore_cursor();
         flush_logs();
         std::process::exit(0);
     }
@@ -409,6 +428,10 @@ fn write_logs(rx: std::sync::mpsc::Receiver<LogMsg>, file: Option<std::fs::File>
                 LogMsg::Line(level, text) => lines.push(LogLine { level, text }),
                 LogMsg::Flush(done) => waiting.push(done),
             }
+        }
+        if out.is_none() {
+            // The file couldn't be opened (or reopened after rotating): try again.
+            out = std::fs::OpenOptions::new().create(true).append(true).open(log_path()).ok().map(std::io::BufWriter::new);
         }
         let echo = echo_to_stderr();
         for l in &lines {

@@ -215,6 +215,10 @@ pub fn run(app: Arc<AppState>, minimized: bool) -> eframe::Result<()> {
     result
 }
 
+/// Linux: the login-screen switch is waiting on the password prompt.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+static LOGIN_SERVICE_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Screens,
@@ -242,6 +246,8 @@ struct Gui {
     /// Linux: whether the login-screen service is on (None: not installed), and when we checked.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     login_service: Option<(std::time::Instant, Option<bool>)>,
+    /// Screen size override while it's being typed or dragged.
+    size_edit: Option<(i32, i32)>,
     /// Mac: whether Accessibility is allowed, and when we last asked.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     input_allowed: Option<(std::time::Instant, bool)>,
@@ -255,7 +261,27 @@ impl Gui {
         // starts hidden in the tray may not draw a frame until it's shown).
         // Linux: the tray outlives the window and is made at startup.
         // macOS: on the first frame, once the app is running.
-        let tray = if cfg!(windows) { tray::create(app.clone()) } else { None };
+        // The window is up: requests for it made while it was opening are answered.
+        app.window_opened();
+        let tray = if cfg!(windows) {
+            let mut tray = tray::create(app.clone());
+            // Started hidden at sign-in, before Windows' notification area is
+            // there to put the icon in: wait for it, or there'd be no window
+            // and no icon. Still none? Then show the window.
+            let mut tries = 0;
+            while tray.is_none() && minimized && tries < 30 {
+                std::thread::sleep(Duration::from_millis(500));
+                tray = tray::create(app.clone());
+                tries += 1;
+            }
+            if tray.is_none() && minimized {
+                log::warn!("no tray icon could be made; showing the window instead of starting hidden");
+                platform::show_window(&app);
+            }
+            tray
+        } else {
+            None
+        };
         apply_theme(&cc.egui_ctx);
         let cfg = app.cfg();
         let logo = cc.egui_ctx.load_texture(
@@ -280,6 +306,7 @@ impl Gui {
             diag_msg: Arc::new(std::sync::Mutex::new(None)),
             input_allowed: None,
             login_service: None,
+            size_edit: None,
         }
     }
 
@@ -301,6 +328,14 @@ impl Gui {
 }
 
 impl eframe::App for Gui {
+    /// macOS: Cmd+Q and Quit in the Dock end the program from inside the
+    /// window loop, without returning to main: stop sharing here.
+    #[cfg(target_os = "macos")]
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.app.stop_engine();
+        crate::state::flush_logs();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.tray_tried {
             self.tray_tried = true;
@@ -896,7 +931,9 @@ impl Gui {
     #[cfg(target_os = "linux")]
     fn login_service_state(&mut self) -> Option<bool> {
         let fresh = self.login_service.is_some_and(|(at, _)| at.elapsed() < std::time::Duration::from_secs(5));
-        if !fresh {
+        // While the password prompt is up, keep showing what was asked for.
+        let busy = LOGIN_SERVICE_BUSY.load(std::sync::atomic::Ordering::Relaxed) && self.login_service.is_some();
+        if !fresh && !busy {
             let state = std::process::Command::new("systemctl")
                 .args(["is-enabled", "edgehop-login.service"])
                 .output()
@@ -919,10 +956,30 @@ impl Gui {
 
         card(ui, "", "", |ui| {
             if let Some(code) = &code {
-                ui.label(RichText::new("Waiting for approval").size(18.0).strong());
-                ui.label(RichText::new("Approve this computer on the server. It should show this same code:").color(p.muted));
+                let who = lk(&self.app.pair_with).clone().unwrap_or_else(|| "the other computer".into());
+                let answered = *lk(&self.app.pair_answer) == Some(true);
+                ui.label(RichText::new(format!("Pair with {who}?")).size(18.0).strong());
+                ui.label(
+                    RichText::new(
+                        "It will be able to use this computer's keyboard and mouse. Only pair if it shows this                          same code, and approve this computer there too:",
+                    )
+                    .color(p.muted),
+                );
                 ui.add_space(8.0);
                 code_boxes(ui, code);
+                ui.add_space(10.0);
+                if answered {
+                    ui.label(RichText::new("Waiting for approval on the other computer…").color(p.muted));
+                } else {
+                    ui.horizontal(|ui| {
+                        if primary_button(ui, "The codes match: pair").clicked() {
+                            *lk(&self.app.pair_answer) = Some(true);
+                        }
+                        if ui.button("Don't pair").clicked() {
+                            *lk(&self.app.pair_answer) = Some(false);
+                        }
+                    });
+                }
                 return;
             }
             ui.horizontal(|ui| {
@@ -1224,19 +1281,26 @@ impl Gui {
                             |ui| match state {
                                 Some(enabled) => {
                                     let mut on = enabled;
-                                    if toggle(ui, &mut on).changed() {
+                                    let busy = LOGIN_SERVICE_BUSY.load(std::sync::atomic::Ordering::Relaxed);
+                                    if ui.add_enabled_ui(!busy, |ui| toggle(ui, &mut on)).inner.changed() {
                                         self.login_service = Some((std::time::Instant::now(), Some(on)));
-                                        let verb = if on { "enable" } else { "disable" };
+                                        LOGIN_SERVICE_BUSY.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        let verb = if on { "on" } else { "off" };
                                         std::thread::spawn(move || {
+                                            // As root, Edgehop records that it's *this* account's
+                                            // settings the service uses, then switches it.
+                                            let exe = crate::update::own_exe().unwrap_or_else(|| "edgehop".into());
                                             let ok = std::process::Command::new("pkexec")
-                                                .args(["systemctl", verb, "--now", "edgehop-login.service"])
+                                                .arg(exe)
+                                                .args(["--login-service", verb])
                                                 .status()
                                                 .is_ok_and(|s| s.success());
                                             if ok {
-                                                log::info!("login-screen service: {verb}d");
+                                                log::info!("login-screen service switched {verb}");
                                             } else {
-                                                log::warn!("couldn't {verb} the login-screen service (password prompt cancelled?)");
+                                                log::warn!("couldn't switch the login-screen service {verb} (password prompt cancelled?)");
                                             }
+                                            LOGIN_SERVICE_BUSY.store(false, std::sync::atomic::Ordering::Relaxed);
                                         });
                                     }
                                 }
@@ -1260,17 +1324,24 @@ impl Gui {
                                 self.app.update_config(|c| c.screen_override = if on { Some((1920, 1080)) } else { None });
                                 self.restart();
                             }
-                            if let Some((mut w, mut h)) = cfg.screen_override {
+                            if let Some(saved) = cfg.screen_override {
+                                // The size being edited lives here until it's
+                                // committed (writing it straight into the
+                                // settings made the "has it changed?" test
+                                // below always say no: it was never saved).
+                                let (mut w, mut h) = self.size_edit.unwrap_or(saved);
                                 let b = ui.add(egui::DragValue::new(&mut h).range(240..=16000));
                                 ui.label("×");
                                 let a = ui.add(egui::DragValue::new(&mut w).range(320..=16000));
-                                if (a.drag_stopped() || a.lost_focus() || b.drag_stopped() || b.lost_focus())
-                                    && Some((w, h)) != cfg.screen_override
-                                {
-                                    self.app.update_config(|c| c.screen_override = Some((w, h)));
-                                    self.restart();
-                                } else if a.changed() || b.changed() {
-                                    lk(&self.app.config).screen_override = Some((w, h));
+                                if a.changed() || b.changed() {
+                                    self.size_edit = Some((w, h));
+                                }
+                                if a.drag_stopped() || a.lost_focus() || b.drag_stopped() || b.lost_focus() {
+                                    self.size_edit = None;
+                                    if (w, h) != saved {
+                                        self.app.update_config(|c| c.screen_override = Some((w, h)));
+                                        self.restart();
+                                    }
                                 }
                             }
                         },

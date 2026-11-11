@@ -116,8 +116,10 @@ the changelog section as its notes.
    keyboard & mouse** under Settings → Role.
 2. On the other computer, open Edgehop. It starts as **Use a shared keyboard &
    mouse** and finds the sharing computer by itself.
-3. A pairing prompt pops up on the sharing computer. Check that the code matches
-   the one on the other computer, then click **Approve**.
+3. Both computers show a pairing prompt with a 6-digit code. Check that the
+   codes match, then click **The codes match: pair** on the new computer and
+   **Approve** on the sharing computer. (A computer with no screen to click
+   on: start it with `edgehop --accept-pairing`.)
 4. The new computer shows up to the right of your PC in **Screen layout**. Drag
    it to wherever it physically sits.
 5. Move the mouse off that edge. You're now typing on the other computer.
@@ -148,7 +150,7 @@ pointer or on the Desktop (macOS asks once whether Edgehop may ask Finder).
 
 **Controlling Linux**: to type your password at the login screen with the
 sharing computer's keyboard, switch on Settings → Login screen → *Also work at
-the login screen* (or `sudo systemctl enable --now edgehop-login`). If this
+the login screen* (or `pkexec edgehop --login-service on`). If this
 computer is set up so Super (Command) works as Ctrl, Edgehop notices from KDE's
 or GNOME's keyboard settings (or keyd) and adjusts; if Ctrl+C from the other
 computer still doesn't copy, switch on Settings → Keyboard → *Swap Ctrl and Super*.

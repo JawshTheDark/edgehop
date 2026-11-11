@@ -60,6 +60,11 @@ pub fn win_to_evdev(scan: u32, extended: bool, vk: u32) -> Option<u16> {
         return Some(c);
     }
     let scan = scan as u16;
+    if scan == 0x36 {
+        // Right Shift: the low-level keyboard hook reports it with the
+        // extended flag set (kbdus marks it KBDEXT), unlike its scancode.
+        return Some(54);
+    }
     if extended {
         EXTENDED.iter().find(|(s, _)| *s == scan).map(|&(_, c)| c)
     } else if (1..=88).contains(&scan) {

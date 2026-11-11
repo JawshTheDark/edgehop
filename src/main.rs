@@ -44,6 +44,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let minimized = args.iter().any(|a| a == "--minimized");
     let headless = args.iter().any(|a| a == "--headless");
+    // For a computer with no screen to click "pair" on: trust the first server that answers.
+    if args.iter().any(|a| a == "--accept-pairing") {
+        client::ACCEPT_PAIRING.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // Transfer speed test between two computers (see transfer.rs).
     if let Some(i) = args.iter().position(|a| a == "--bench-serve") {
         let path = std::path::PathBuf::from(args.get(i + 1).expect("--bench-serve <file or folder>"));
@@ -73,6 +77,11 @@ fn main() {
     if args.iter().any(|a| a == "--login-screen") {
         login_screen::run(&args);
         return;
+    }
+    // Linux: switch that service on or off for the account asking (as root, via pkexec).
+    #[cfg(target_os = "linux")]
+    if let Some(i) = args.iter().position(|a| a == "--login-service") {
+        std::process::exit(login_screen::service(args.get(i + 1).map(String::as_str) != Some("off")));
     }
     if let Some(i) = args.iter().position(|a| a == "--write-ico") {
         let path = args.get(i + 1).map(String::as_str).unwrap_or("edgehop.ico");
@@ -145,6 +154,9 @@ fn main() {
     let app = state::AppState::new(cfg);
     state::init_logger(app.clone(), &args);
     instance.listen(app.clone());
+    if let Some(problem) = config::Config::load_problem() {
+        log::error!("{problem}");
+    }
     if let Some(e) = state::log_open_error() {
         log::error!("can't write the log file {}: {e}", state::log_path().display());
     }
@@ -190,6 +202,15 @@ fn main() {
     }
 
     files::cleanup_old();
+    {
+        // An Edgehop that starts at sign-in may run for weeks.
+        let _ = std::thread::Builder::new().name("cleanup".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
+            files::cleanup_old();
+        });
+    }
+    #[cfg(unix)]
+    quit_on_signals(app.clone());
     // Keep "start at login" pointing at this copy of the app (after updates,
     // renames, moves), off the startup path.
     if app.cfg().autostart {
@@ -211,6 +232,30 @@ fn main() {
     run_windows(&app, minimized);
     app.stop_engine();
     state::flush_logs();
+}
+
+/// Unix: on SIGTERM, SIGINT or SIGHUP (logging out, shutting down, Ctrl+C in
+/// a terminal), stop sharing first: release held keys, show the pointer and
+/// undo screen dimming, which would otherwise be left as they are.
+#[cfg(unix)]
+fn quit_on_signals(app: std::sync::Arc<state::AppState>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ASKED: AtomicBool = AtomicBool::new(false);
+    extern "C" fn on_signal(_: libc::c_int) {
+        ASKED.store(true, Ordering::Relaxed); // all a signal handler may safely do
+    }
+    unsafe {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::signal(sig, on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
+        }
+    }
+    let _ = std::thread::Builder::new().name("signals".into()).spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if ASKED.load(Ordering::Relaxed) {
+            log::info!("asked to quit (signal); stopping");
+            app.quit();
+        }
+    });
 }
 
 /// Show the window, until Edgehop quits. On Linux the window closes into the

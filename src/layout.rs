@@ -166,16 +166,29 @@ pub fn snap(mons: &[Monitor], others: &[Rect], pos: &ScreenPos) -> Option<Screen
     best.map(|(_, p)| p)
 }
 
-/// Keep a placement consistent when the client's resolution changes.
+/// Keep a placement consistent when the client's resolution changes: same
+/// fit, and still touching the monitor edge it was attached to (a screen to
+/// the left of or above a monitor would otherwise drift away from it as it
+/// shrinks, and past a small gap the pointer can no longer cross).
 pub fn resize(pos: &ScreenPos, mons: &[Monitor], w: i32, h: i32) -> ScreenPos {
     let mut p = pos.clone();
+    let old = pos.rect();
+    let beside = |m: &Rect| old.t < m.b && m.t < old.b; // shares some height
+    let stacked = |m: &Rect| old.l < m.r && m.l < old.r; // shares some width
     if p.fit {
-        let r = pos.rect();
-        let horizontal_edge = mons.iter().any(|m| (r.t - m.rect.b).abs() < 1.0 || (r.b - m.rect.t).abs() < 1.0);
-        p.scale = if horizontal_edge { r.w() / w.max(1) as f64 } else { r.h() / h.max(1) as f64 };
+        let horizontal_edge =
+            mons.iter().any(|m| stacked(&m.rect) && ((old.t - m.rect.b).abs() < 1.0 || (old.b - m.rect.t).abs() < 1.0));
+        p.scale = if horizontal_edge { old.w() / w.max(1) as f64 } else { old.h() / h.max(1) as f64 };
     }
     p.w = w;
     p.h = h;
+    let new = p.rect();
+    if mons.iter().any(|m| beside(&m.rect) && (old.r - m.rect.l).abs() < 1.0) {
+        p.x = old.r - new.w(); // left of a monitor: keep the right edge in place
+    }
+    if mons.iter().any(|m| stacked(&m.rect) && (old.b - m.rect.t).abs() < 1.0) {
+        p.y = old.b - new.h(); // above a monitor: keep the bottom edge in place
+    }
     p
 }
 
@@ -208,6 +221,20 @@ pub mod tests {
         let p = snap(&mons, &[], &dragged).unwrap();
         assert_eq!(p.y, 1080.0);
         assert_eq!(p.x, 300.0, "keeps where you dropped it along the edge");
+    }
+
+    #[test]
+    fn a_screen_left_of_a_monitor_stays_attached_when_it_shrinks() {
+        let mons = vec![Monitor { rect: Rect::new(0.0, 0.0, 1920.0, 1080.0), label: "1".into(), primary: true }];
+        let left = ScreenPos { name: "s".into(), x: -1920.0, y: 0.0, scale: 1.0, w: 1920, h: 1080, fit: false };
+        let p = resize(&left, &mons, 1280, 720);
+        assert_eq!(p.rect().r, 0.0, "its right edge still touches the monitor");
+        let above = ScreenPos { name: "s".into(), x: 0.0, y: -1200.0, scale: 1.0, w: 1920, h: 1200, fit: false };
+        let p = resize(&above, &mons, 1920, 1080);
+        assert_eq!(p.rect().b, 0.0, "its bottom edge still touches the monitor");
+        // To the right or below, the touching edge is the one that doesn't move.
+        let right = ScreenPos { name: "s".into(), x: 1920.0, y: 0.0, scale: 1.0, w: 1920, h: 1080, fit: false };
+        assert_eq!(resize(&right, &mons, 1280, 720).x, 1920.0);
     }
 
     #[test]

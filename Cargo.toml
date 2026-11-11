@@ -1,6 +1,6 @@
 [package]
 name = "edgehop"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2021"
 description = "Share one keyboard and mouse across every computer on your network"
 license = "MIT"
@@ -81,6 +81,14 @@ udevadm trigger --subsystem-match=input 2>/dev/null || true
 gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
 systemctl daemon-reload 2>/dev/null || true
 systemctl try-restart edgehop-login.service 2>/dev/null || true
+"""
+# Removing the package (not upgrading it): stop the login-screen service.
+pre_uninstall_script = """
+if [ "$1" -eq 0 ]; then
+    systemctl disable --now edgehop-login.service 2>/dev/null || true
+    rm -f /etc/edgehop/login-screen 2>/dev/null || true
+    rmdir /etc/edgehop 2>/dev/null || true
+fi
 """
 
 [package.metadata.generate-rpm.recommends]

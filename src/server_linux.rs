@@ -110,6 +110,10 @@ struct Dev {
     hires: (bool, bool),
     /// Touchpad: pixels per device unit.
     scale: (f64, f64),
+    /// Opened read-write (can have it report events of our making).
+    writable: bool,
+    /// Keys and buttons this device has reported down and not yet up.
+    down: Vec<u16>,
     st: DevState,
 }
 
@@ -153,7 +157,14 @@ impl Dev {
     /// (or is one of Edgehop's own virtual devices).
     fn open(path: &std::path::Path) -> Result<Option<Dev>, std::io::Error> {
         let c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(std::io::Error::other)?;
-        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        // Read-write where allowed: writing to an event device makes it report
+        // those events itself (used to release held keys before grabbing).
+        let mut writable = true;
+        let mut fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if fd < 0 {
+            writable = false;
+            fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        }
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -183,6 +194,8 @@ impl Dev {
             touchpad,
             hires: (has(&rel, REL_WHEEL_HI_RES), has(&rel, REL_HWHEEL_HI_RES)),
             scale: (1.0, 1.0),
+            writable,
+            down: Vec::new(),
             st: DevState::default(),
         };
         if ours || !(keyboard || pointer || touchpad) {
@@ -213,9 +226,74 @@ impl Dev {
         (1..0x2ffu16).filter(|&k| has(&b, k)).collect()
     }
 
+    /// Have the device itself report every held key and button released, so
+    /// the desktop doesn't keep them down (repeating a letter, latching a
+    /// modifier) once the device is grabbed and it stops hearing from it. A
+    /// release sent from another (virtual) device would be dropped by the
+    /// kernel: that device never pressed the key. Returns how many.
+    fn release_held(&self) -> usize {
+        if !self.writable {
+            return 0;
+        }
+        let held: Vec<u16> = self
+            .held()
+            .into_iter()
+            .filter(|&k| k < 0x100 || (BTN_LEFT_CODE..BTN_LEFT_CODE + 5).contains(&k))
+            .collect();
+        if held.is_empty() {
+            return 0;
+        }
+        let mut evs: Vec<libc::input_event> = Vec::with_capacity(held.len() + 1);
+        for &k in &held {
+            let mut e: libc::input_event = unsafe { std::mem::zeroed() };
+            (e.type_, e.code, e.value) = (EV_KEY, k, 0);
+            evs.push(e);
+        }
+        let mut syn: libc::input_event = unsafe { std::mem::zeroed() };
+        (syn.type_, syn.code, syn.value) = (EV_SYN, SYN_REPORT, 0);
+        evs.push(syn);
+        let bytes = evs.len() * std::mem::size_of::<libc::input_event>();
+        let n = unsafe { libc::write(self.fd, evs.as_ptr() as *const c_void, bytes) };
+        if n < 0 {
+            log::debug!("couldn't release held keys on {:?}: {}", self.name, std::io::Error::last_os_error());
+            return 0;
+        }
+        held.len()
+    }
+
     fn event(&mut self, t: u16, code: u16, value: i32, out: &mut Vec<Input>) {
         if (t, code) == (EV_SYN, SYN_REPORT) {
             return self.flush(out);
+        }
+        if t == EV_KEY && (code < 0x100 || (BTN_LEFT_CODE..BTN_LEFT_CODE + 5).contains(&code)) {
+            self.down.retain(|&k| k != code);
+            if value != 0 {
+                self.down.push(code);
+            }
+        }
+        if (t, code) == (EV_SYN, SYN_DROPPED) {
+            // The kernel threw events away (we read too slowly). A release
+            // may have been among them: report up whatever isn't down now.
+            let held = self.held();
+            let lost: Vec<u16> = self.down.iter().copied().filter(|k| !held.contains(k)).collect();
+            if !lost.is_empty() {
+                log::warn!("{:?} dropped input events; releasing {lost:?}, which went up meanwhile", self.name);
+            }
+            for k in lost {
+                self.down.retain(|&d| d != k);
+                if k < 0x100 {
+                    out.push(Input::Key { code: k, down: false });
+                } else {
+                    let button = match k - BTN_LEFT_CODE {
+                        0 => BTN_LEFT,
+                        1 => BTN_RIGHT,
+                        2 => BTN_MIDDLE,
+                        3 => BTN_BACK,
+                        _ => BTN_FORWARD,
+                    };
+                    out.push(Input::Button { button, down: false });
+                }
+            }
         }
         let st = &mut self.st;
         match (t, code) {
@@ -312,7 +390,9 @@ impl Dev {
 /// The keyboards, mice and touchpads Edgehop watches (and grabs while away).
 pub struct Devices {
     list: Mutex<Vec<Dev>>,
-    skip: Mutex<HashSet<PathBuf>>,
+    /// Event devices that aren't keyboards or mice, with the node's identity:
+    /// a different device may show up under the same path later.
+    skip: Mutex<std::collections::HashMap<PathBuf, (u64, i64)>>,
     grabbed: AtomicBool,
     denied: AtomicU64,
 }
@@ -321,7 +401,7 @@ impl Devices {
     pub fn new() -> Devices {
         Devices {
             list: Mutex::new(Vec::new()),
-            skip: Mutex::new(HashSet::new()),
+            skip: Mutex::new(std::collections::HashMap::new()),
             grabbed: AtomicBool::new(false),
             denied: AtomicU64::new(0),
         }
@@ -338,10 +418,14 @@ impl Devices {
         let mut list = lk(&self.list);
         let mut skip = lk(&self.skip);
         list.retain(|d| present.contains(&d.path));
-        skip.retain(|p| present.contains(p));
+        let identity = |p: &PathBuf| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(p).map(|m| (m.ino(), m.ctime())).unwrap_or((0, 0))
+        };
+        skip.retain(|p, id| present.contains(p) && *id == identity(p));
         let mut denied = 0;
         for p in &present {
-            if list.iter().any(|d| &d.path == p) || skip.contains(p) {
+            if list.iter().any(|d| &d.path == p) || skip.contains_key(p) {
                 continue;
             }
             match Dev::open(p) {
@@ -353,13 +437,13 @@ impl Devices {
                     list.push(d);
                 }
                 Ok(None) => {
-                    skip.insert(p.clone());
+                    skip.insert(p.clone(), identity(p));
                 }
                 Err(e) => {
                     if e.raw_os_error() == Some(libc::EACCES) {
                         denied += 1;
                     } else {
-                        skip.insert(p.clone());
+                        skip.insert(p.clone(), identity(p));
                     }
                 }
             }
@@ -370,23 +454,17 @@ impl Devices {
 
     /// Take the devices away from the desktop (true) or give them back.
     /// Keys and buttons held right now are released on the desktop first
-    /// (through `out`), or it would see them stuck down until pressed again.
-    pub fn grab(&self, on: bool, out: Option<&mut Box<dyn crate::inject::Injector>>) {
+    /// (each device reports its own released), or it would see them stuck
+    /// down until pressed again.
+    pub fn grab(&self, on: bool) {
         let list = lk(&self.list);
         if self.grabbed.swap(on, Ordering::Relaxed) == on {
             return;
         }
         if on {
-            if let Some(out) = out {
-                for d in list.iter() {
-                    for k in d.held() {
-                        if (1..0x100).contains(&k) {
-                            out.key(k, false);
-                        } else if (BTN_LEFT_CODE..BTN_LEFT_CODE + 3).contains(&k) {
-                            out.button([BTN_LEFT, BTN_RIGHT, BTN_MIDDLE][(k - BTN_LEFT_CODE) as usize], false);
-                        }
-                    }
-                }
+            let released: usize = list.iter().map(|d| d.release_held()).sum();
+            if released > 0 {
+                log::debug!("released {released} held key(s) on this computer before leaving");
             }
         }
         let failed: Vec<&str> = list.iter().filter(|d| !d.set_grab(on)).map(|d| d.name.as_str()).collect();
@@ -458,6 +536,16 @@ struct X11 {
     dpy: *mut c_void,
     root: c_ulong,
     query: XQueryPointer,
+    close: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+}
+
+impl Drop for X11 {
+    fn drop(&mut self) {
+        // One X connection per start of sharing would otherwise pile up.
+        if let Some(close) = self.close {
+            unsafe { close(self.dpy) };
+        }
+    }
 }
 
 impl X11 {
@@ -479,7 +567,9 @@ impl X11 {
             if dpy.is_null() {
                 return None;
             }
-            Some(X11 { dpy, root: root(dpy), query: std::mem::transmute(query) })
+            let close = libc::dlsym(lib, c"XCloseDisplay".as_ptr());
+            let close = (!close.is_null()).then(|| std::mem::transmute(close));
+            Some(X11 { dpy, root: root(dpy), query: std::mem::transmute(query), close })
         }
     }
 
@@ -596,7 +686,7 @@ fn dispatch(s: &Shared, input: Input, src: &Source) {
         }
         Input::Button { button, down } => crate::flight::rec("linux button", "button down away", &[button as i64, down as i64, away]),
         Input::Wheel { dx, dy } => crate::flight::rec("linux wheel", "dx dy away", &[dx as i64, dy as i64, away]),
-        Input::Key { code, down } => crate::flight::rec("linux key", "code down away", &[code as i64, down as i64, away]),
+        Input::Key { code, down } => crate::flight::rec("linux key", "code down away", &[crate::flight::key_id(code), down as i64, away]),
     }
     let Some(mut core) = try_core(s) else { return };
     match input {
@@ -698,7 +788,7 @@ pub fn run(s: Arc<Shared>, ready: mpsc::Sender<usize>, _drags: mpsc::Sender<Vec<
             last_scan = Instant::now();
         }
     }
-    cap.devs.grab(false, None);
+    cap.devs.grab(false);
     if let (Source::KWin, Some(k)) = (&src, &cap.kde) {
         k.report_pointer(None);
     }
@@ -751,14 +841,13 @@ impl Desktop for LinuxDesktop {
         }
     }
     fn captured(&mut self, remote: bool) {
-        let mut out = lk(&self.cap.out);
-        self.cap.devs.grab(remote, out.as_mut());
+        self.cap.devs.grab(remote);
     }
 }
 
 impl Drop for LinuxDesktop {
     fn drop(&mut self) {
-        self.cap.devs.grab(false, None);
+        self.cap.devs.grab(false);
         if self.hidden {
             let _ = lk(&self.cap.pointer_tx).send(true);
         }
@@ -778,6 +867,10 @@ impl Devices {
     /// Names and kinds of the devices in use.
     pub fn describe(&self) -> Vec<String> {
         lk(&self.list).iter().map(|d| format!("{} ({})", d.name, d.kind())).collect()
+    }
+    /// Have devices whose name starts with `prefix` report their held keys released; how many keys.
+    pub fn release_held_named(&self, prefix: &str) -> usize {
+        lk(&self.list).iter().filter(|d| d.name.starts_with(prefix)).map(|d| d.release_held()).sum()
     }
     /// Grab or release only devices whose name starts with `prefix`; true if all succeeded.
     pub fn grab_named(&self, prefix: &str, on: bool) -> bool {

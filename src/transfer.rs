@@ -24,6 +24,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const DEFAULT_CONNS: u8 = 4;
 /// Size of one request.
 const PIECE: u64 = 8 * 1024 * 1024;
+/// More entries than this in one transfer is refused (the list itself has to fit in one message).
+const MAX_ENTRIES: usize = 100_000;
+/// Sanity limit on what one transfer may claim to hold (4 TiB).
+const MAX_TOTAL: u64 = 1 << 42;
 /// Responses are sent in slices of this size (bounds memory per write).
 const SLICE: usize = 1024 * 1024;
 
@@ -115,11 +119,18 @@ impl Outbox {
             entries.push(Entry { rel, size, dir, mtime });
             paths.push(abs);
         }
+        if entries.len() > MAX_ENTRIES {
+            return Err(io::Error::other(format!(
+                "{} files and folders is more than can be sent at once ({MAX_ENTRIES}); zip them, or send fewer",
+                entries.len()
+            )));
+        }
         let total = entries.iter().map(|e| e.size).sum();
         let mut manifest = Manifest { id: 0, from: from.to_string(), total, entries };
         let sig = manifest.signature();
         let mut offers = lk(&self.offers);
-        if let Some(o) = offers.iter().find(|o| o.manifest.signature() == sig) {
+        // Same names, sizes and times *from the same places*: the same offer.
+        if let Some(o) = offers.iter().find(|o| o.manifest.signature() == sig && o.paths == paths) {
             return Ok(o.manifest.clone());
         }
         manifest.id = new_id();
@@ -156,7 +167,7 @@ pub fn serve(tx: &mut FrameSender, rx: &mut FrameReceiver, offered: &Offered) ->
             return Ok(sent);
         }
         let entry = offered.manifest.entries.get(fi as usize).ok_or_else(|| io::Error::other("bad file index"))?;
-        if entry.dir || off.saturating_add(len as u64) > entry.size {
+        if entry.dir || len as u64 > PIECE || off.saturating_add(len as u64) > entry.size {
             return Err(io::Error::other("bad piece request"));
         }
         if !open.contains_key(&fi) {
@@ -181,12 +192,39 @@ pub fn fetch(
     dest: &Path,
     done: &AtomicU64,
 ) -> io::Result<Vec<PathBuf>> {
+    let mut tops: Vec<PathBuf> = Vec::new();
+    let r = fetch_into(m, conns, dest, done, &mut tops);
+    if r.is_err() {
+        // Nothing half-received is left behind looking like the real thing
+        // (files are made at full size before their contents arrive).
+        for p in &tops {
+            let _ = if p.is_dir() { fs::remove_dir_all(p) } else { fs::remove_file(p) };
+        }
+    }
+    r.map(|()| tops)
+}
+
+fn fetch_into(
+    m: &Manifest,
+    conns: Vec<(FrameSender, FrameReceiver)>,
+    dest: &Path,
+    done: &AtomicU64,
+    tops: &mut Vec<PathBuf>,
+) -> io::Result<()> {
     if conns.is_empty() {
         return Err(io::Error::other("no transfer connections"));
     }
+    // What the other computer says it's sending has to add up before any
+    // space is set aside for it.
+    if m.entries.len() > MAX_ENTRIES {
+        return Err(io::Error::other(format!("too many files in one transfer ({})", m.entries.len())));
+    }
+    let sum = m.entries.iter().filter(|e| !e.dir).try_fold(0u64, |a, e| a.checked_add(e.size));
+    if sum != Some(m.total) || m.total > MAX_TOTAL {
+        return Err(io::Error::other("the file sizes in this transfer don't add up; refusing it"));
+    }
     fs::create_dir_all(dest)?;
     // Lay out every directory and pre-size every file.
-    let mut tops: Vec<PathBuf> = Vec::new();
     let mut renamed: HashMap<String, PathBuf> = HashMap::new();
     let mut targets: Vec<PathBuf> = Vec::with_capacity(m.entries.len());
     for e in &m.entries {
@@ -210,7 +248,14 @@ pub fn fetch(
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            File::create(&path)?.set_len(e.size)?;
+            // New files only: two names that are the same file here (differing
+            // only in case, say) must not be written into each other.
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| io::Error::other(format!("can't create {}: {e}", path.display())))?
+                .set_len(e.size)?;
         }
         targets.push(path);
     }
@@ -293,7 +338,7 @@ pub fn fetch(
         let why = lk(&last_err).take().map(|e| e.to_string()).unwrap_or_default();
         return Err(io::Error::other(format!("transfer incomplete: {why}")));
     }
-    Ok(tops)
+    Ok(())
 }
 
 /// Files already received this session (signature -> top-level paths), so

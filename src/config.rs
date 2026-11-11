@@ -104,6 +104,9 @@ impl Default for Config {
 /// Never write the settings file (the login-screen service runs as root and
 /// reads the signed-in user's settings).
 static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The settings file couldn't be read or moved aside: don't write over it.
+static NO_SAVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOAD_PROBLEM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn set_read_only() {
@@ -138,11 +141,30 @@ impl Config {
                 }
             }
         }
-        let mut cfg: Config = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
-        let mut dirty = !path.exists();
+        // Only a file that isn't there means "new install". One that can't be
+        // read or understood (a typo from editing by hand, a half-written
+        // file after a power cut, a newer version's format) is kept aside,
+        // never silently replaced: it holds this computer's identity and
+        // every pairing.
+        let read_only = READ_ONLY.load(std::sync::atomic::Ordering::Relaxed);
+        let mut dirty = false;
+        let mut cfg: Config = match std::fs::read(&path) {
+            Ok(b) => match serde_json::from_slice(&b) {
+                Ok(c) => c,
+                Err(e) => {
+                    Self::set_aside(&path, &format!("can't be understood ({e})"), read_only);
+                    Config::default()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                dirty = true;
+                Config::default()
+            }
+            Err(e) => {
+                Self::set_aside(&path, &format!("can't be read ({e})"), read_only);
+                Config::default()
+            }
+        };
         if cfg.private_key.is_empty() || net::unhex(&cfg.private_key).is_none() {
             let (private, public) = net::generate_keypair();
             cfg.private_key = net::hex(&private);
@@ -159,22 +181,73 @@ impl Config {
         cfg
     }
 
+    /// Move a settings file that couldn't be loaded out of the way (so
+    /// starting fresh doesn't destroy it), and remember to say so.
+    fn set_aside(path: &std::path::Path, why: &str, read_only: bool) {
+        let mut msg = format!("the settings file {} {why}", path.display());
+        if read_only {
+            *LOAD_PROBLEM.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+            return;
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let bad = path.with_extension(format!("json.bad-{stamp}"));
+        match std::fs::rename(path, &bad) {
+            Ok(()) => msg.push_str(&format!(
+                "; it was kept as {} and Edgehop started with new settings (computers need pairing again).                  To get the old ones back, quit Edgehop, fix that file and rename it to config.json",
+                bad.display()
+            )),
+            Err(e) => {
+                // Can't even move it: don't write over it this run.
+                NO_SAVE.store(true, std::sync::atomic::Ordering::Relaxed);
+                msg.push_str(&format!("; it couldn't be moved aside either ({e}), so settings won't be saved this time"));
+            }
+        }
+        crate::state::print_err(&msg);
+        *LOAD_PROBLEM.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+    }
+
+    /// What went wrong loading the settings, if anything (for the log, once it's up).
+    pub fn load_problem() -> Option<String> {
+        LOAD_PROBLEM.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     pub fn save(&self) {
-        if READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if READ_ONLY.load(Relaxed) || NO_SAVE.load(Relaxed) {
             return; // the login-screen service only borrows the user's settings
         }
+        // One save at a time, each through its own temporary file.
+        static SAVING: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+        let mut n = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+        *n += 1;
         let path = Self::path();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        match serde_json::to_vec_pretty(self) {
-            Ok(b) => {
-                let tmp = path.with_extension("json.tmp");
-                if std::fs::write(&tmp, b).is_ok() {
-                    let _ = std::fs::rename(&tmp, &path);
-                }
+        let bytes = match serde_json::to_vec_pretty(self) {
+            Ok(b) => b,
+            Err(e) => return log::error!("could not save settings: {e}"),
+        };
+        let tmp = path.with_extension(format!("json.tmp-{}-{}", std::process::id(), *n));
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create(true).truncate(true);
+            // It holds this computer's private key: for this user only.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.mode(0o600);
             }
-            Err(e) => log::error!("could not save config: {e}"),
+            let mut f = o.open(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?; // on disk before it replaces the old one
+            drop(f);
+            std::fs::rename(&tmp, &path)
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            log::error!("could not save settings to {}: {e}", path.display());
         }
     }
 

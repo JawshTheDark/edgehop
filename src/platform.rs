@@ -35,6 +35,9 @@ pub struct InstanceGuard {
     _mutex: crate::win32::HANDLE,
     #[cfg(unix)]
     listener: Option<std::os::unix::net::UnixListener>,
+    /// Held for as long as this copy runs.
+    #[cfg(unix)]
+    _lock: std::fs::File,
 }
 
 /// Claim "the one Edgehop running". If another copy has it, ask that one to
@@ -84,28 +87,40 @@ pub fn single_instance(restarting: bool) -> Option<InstanceGuard> {
 pub fn single_instance(restarting: bool) -> Option<InstanceGuard> {
     use std::io::Write;
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::os::fd::AsRawFd;
     let path = instance_socket();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Who runs is decided by a lock on a file (the system lets go of it when
+    // the holder ends, however it ends): two copies started in the same
+    // instant can't both win, as they could when each only looked for the
+    // other's socket.
+    let lock_path = path.with_extension("lock");
+    let lock = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path) {
+        Ok(f) => f,
+        Err(e) => {
+            crate::state::print_err(&format!("can't open {}: {e}", lock_path.display()));
+            return None;
+        }
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if restarting { 15 } else { 0 });
     loop {
-        match UnixStream::connect(&path) {
-            Ok(mut other) => {
-                if std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    continue;
-                }
-                let _ = other.write_all(b"show\n");
-                crate::state::print_err("Edgehop is already running; showing its window.");
-                return None;
-            }
-            Err(_) => {
-                // Nobody listening: a leftover from a run that crashed.
-                let _ = std::fs::remove_file(&path);
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                return Some(InstanceGuard { listener: UnixListener::bind(&path).ok() });
-            }
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // Ours. Any socket there is a leftover from a run that has ended.
+            let _ = std::fs::remove_file(&path);
+            return Some(InstanceGuard { listener: UnixListener::bind(&path).ok(), _lock: lock });
         }
+        if std::time::Instant::now() < deadline {
+            // Replacing ourselves: wait for the old copy to go, quietly.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            continue;
+        }
+        if let Ok(mut other) = UnixStream::connect(&path) {
+            let _ = other.write_all(b"show\n");
+        }
+        crate::state::print_err("Edgehop is already running; showing its window.");
+        return None;
     }
 }
 
@@ -242,15 +257,35 @@ pub fn monitor_rects() -> Vec<crate::layout::Monitor> {
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
         static CACHE: Mutex<Option<(Instant, Vec<crate::layout::Monitor>)>> = Mutex::new(None);
-        let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, v)) = c.as_ref() {
-            if at.elapsed() < Duration::from_secs(3) {
-                return v.clone();
+        static REFRESHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let stale = {
+            let c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            match c.as_ref() {
+                Some((at, v)) if at.elapsed() < Duration::from_secs(3) => return v.clone(),
+                Some((_, v)) => Some(v.clone()),
+                None => None,
             }
+        };
+        let refresh = || {
+            let v = enumerate(false);
+            *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), v.clone()));
+            v
+        };
+        match stale {
+            // Callers include the input path, holding the switching state's
+            // lock: hand back what's known and look again in the background,
+            // never wait here for an external program.
+            Some(v) => {
+                if !REFRESHING.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::spawn(move || {
+                        refresh();
+                        REFRESHING.store(false, std::sync::atomic::Ordering::Relaxed);
+                    });
+                }
+                v
+            }
+            None => refresh(), // the very first time
         }
-        let v = enumerate(false);
-        *c = Some((Instant::now(), v.clone()));
-        v
     }
     #[cfg(not(target_os = "linux"))]
     enumerate(false)
@@ -526,6 +561,7 @@ pub trait DesktopHooks: Send + Sync {
         None
     }
     /// Is the drag under the pointer coming from a file manager? None = can't tell.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     fn drag_source_ok(&self) -> Option<bool> {
         None
     }

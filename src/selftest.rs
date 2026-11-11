@@ -282,6 +282,26 @@ fn sharing_linux(r: &mut Report) {
     check(r, "capture buttons up", &[(1, 0x110, 0)], &[Input::Button { button: crate::proto::BTN_LEFT, down: false }]);
     check(r, "capture wheel", &[(2, 11, 120), (2, 8, 1)], &[Input::Wheel { dx: 0, dy: 120 }]);
 
+    // A key held while leaving for another computer: the device itself must
+    // report it released (the desktop would otherwise keep it down), and say
+    // nothing more when the key is really let go.
+    dev.emit(&[(1, 38, 1)]);
+    std::thread::sleep(Duration::from_millis(100));
+    devs.poll(100);
+    let released = devs.release_held_named(NAME);
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !got.contains(&Input::Key { code: 38, down: false }) {
+        got.extend(devs.poll(100));
+    }
+    dev.emit(&[(1, 38, 0)]);
+    let after = devs.poll(300);
+    if released == 1 && got.contains(&Input::Key { code: 38, down: false }) && after.is_empty() {
+        r.pass("release held keys", "a held key is released on this computer before its keyboard is taken over");
+    } else {
+        r.fail("release held keys", format!("released {released}, then saw {got:?}, and {after:?} at the real release"));
+    }
+
     // Grabbing must be exclusive: nobody else can grab the device after us.
     if !devs.grab_named(NAME, true) {
         r.fail("grab", "couldn't grab the test device");

@@ -162,6 +162,13 @@ fn decode_png(png: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let mut dec = png::Decoder::new(std::io::Cursor::new(png));
     dec.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = dec.read_info().ok()?;
+    // A few bytes of PNG can claim to be millions of pixels each way: don't
+    // set aside memory for more than any real screenshot (64 megapixels).
+    let (w, h) = (reader.info().width as u64, reader.info().height as u64);
+    if w * h > 64_000_000 {
+        log::warn!("ignoring a {w}x{h} clipboard image: too large");
+        return None;
+    }
     let mut buf = vec![0; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).ok()?;
     buf.truncate(info.buffer_size());
@@ -241,31 +248,38 @@ fn set_files_inner(paths: &[PathBuf]) -> Option<String> {
 /// Detects whether a Copy that we trigger actually put files on the clipboard,
 /// and afterwards puts back what the user had: the Copy is only how we learn
 /// what was being dragged, it must not change this computer's clipboard.
+#[cfg_attr(target_os = "macos", allow(dead_code))] // a Mac reads the drag pasteboard instead
 pub struct Probe {
     #[cfg(windows)]
     seq: u32,
     saved_text: Option<String>,
     saved_files: Option<Vec<PathBuf>>,
+    /// A copied picture (PNG), when there were neither files nor text.
+    saved_image: Option<Vec<u8>>,
 }
 
 #[cfg(not(windows))]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 const SENTINEL: &str = "\u{2063}edgehop-probe";
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 impl Probe {
     /// Call just before injecting Ctrl+C.
     pub fn start() -> Probe {
         let saved_files = get_files();
         let saved_text = if saved_files.is_some() { None } else { get() };
+        // A screenshot or copied picture must survive this too.
+        let saved_image = if saved_files.is_some() || saved_text.is_some() { None } else { get_image_png() };
         #[cfg(windows)]
         {
-            Probe { seq: unsafe { crate::win32::GetClipboardSequenceNumber() }, saved_text, saved_files }
+            Probe { seq: unsafe { crate::win32::GetClipboardSequenceNumber() }, saved_text, saved_files, saved_image }
         }
         #[cfg(not(windows))]
         {
             // No change counter on Linux: park a marker so stale files aren't mistaken for new ones.
             let saved_text = saved_text.filter(|t| t != SENTINEL);
             set(SENTINEL);
-            Probe { saved_text, saved_files }
+            Probe { saved_text, saved_files, saved_image }
         }
     }
 
@@ -292,8 +306,11 @@ impl Probe {
             set_files(&files);
         } else if let Some(text) = self.saved_text {
             set(&text);
+        } else if let Some(png) = self.saved_image {
+            set_image_png(&png);
         } else {
-            #[cfg(not(windows))]
+            // It was empty: not our marker, and not the files our Copy put
+            // there (they'd be offered to the other computer as "copied").
             set("");
         }
     }

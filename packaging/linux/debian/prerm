@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+# Removing the package (not upgrading it): stop the login-screen service and
+# forget whose settings it used, or it would stay enabled and keep running the
+# deleted program until the next restart.
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now edgehop-login.service 2>/dev/null || true
+    fi
+    rm -f /etc/edgehop/login-screen 2>/dev/null || true
+    rmdir /etc/edgehop 2>/dev/null || true
+fi
+exit 0

@@ -7,7 +7,7 @@ Wants=network-online.target
 [Service]
 # Borrows the signed-in user's Edgehop settings (read-only) and steps aside
 # while their own Edgehop runs. Turn on in Edgehop: Settings, "Also work at
-# the login screen" (or: sudo systemctl enable --now edgehop-login).
+# the login screen" (or: pkexec edgehop --login-service on).
 ExecStart=/usr/bin/edgehop --login-screen
 Restart=on-failure
 RestartSec=3

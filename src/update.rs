@@ -106,7 +106,7 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 fn fetch(url: &str, big: bool, api: bool) -> Result<Vec<u8>, String> {
     let agent = format!("Edgehop/{} (update check)", env!("CARGO_PKG_VERSION"));
     let timeout = if big { "900" } else { "30" };
-    let mut curl = command("curl");
+    let mut curl = command(system_tool("curl"));
     curl.args(["-fsSL", "--retry", "2", "--max-time", timeout, "-A", &agent]);
     if api {
         curl.args(["-H", "Accept: application/vnd.github+json"]);
@@ -132,6 +132,19 @@ fn fetch(url: &str, big: bool, api: bool) -> Result<Vec<u8>, String> {
         }
         Err(e) => Err(format!("couldn't run wget: {e}")),
     }
+}
+
+/// Windows looks for a program next to the one starting it before anywhere
+/// else, and Edgehop may be run from Downloads: name the system's own.
+fn system_tool(name: &str) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        let p = Path::new(&root).join("System32").join(format!("{name}.exe"));
+        if p.is_file() {
+            return p;
+        }
+    }
+    PathBuf::from(name)
 }
 
 fn sha256_hex(path: &Path) -> Result<String, String> {
@@ -196,7 +209,10 @@ fn download(asset: &Asset, dir: &Path) -> Result<PathBuf, String> {
             return Err(format!("the download's SHA-256 is {hash}, not the published {want}; not installing it"));
         }
         Some(_) => log::info!("downloaded {} ({size} bytes), SHA-256 matches GitHub's: {hash}", asset.name),
-        None => log::warn!("downloaded {} ({size} bytes, SHA-256 {hash}); GitHub published no checksum for it", asset.name),
+        None => {
+            let _ = std::fs::remove_file(&file);
+            return Err(format!("GitHub published no checksum for {} to check the download against; not installing it", asset.name));
+        }
     }
     Ok(file)
 }
@@ -281,7 +297,15 @@ fn parse_release(json: &[u8], kind: &Kind, arch: &str) -> Result<Release, String
     let v: serde_json::Value = serde_json::from_slice(json).map_err(|e| format!("unexpected answer from GitHub: {e}"))?;
     let tag = v["tag_name"].as_str().ok_or("GitHub's answer has no version")?;
     let version = tag.trim_start_matches('v').to_string();
-    let page = v["html_url"].as_str().unwrap_or(RELEASES_PAGE).to_string();
+    // It becomes part of file and folder names: nothing but a plain version.
+    let plain = !version.is_empty()
+        && version.len() <= 40
+        && version.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+        && !version.contains("..");
+    if !plain {
+        return Err(format!("GitHub's answer has an odd version ({tag:?})"));
+    }
+    let page = v["html_url"].as_str().filter(|u| u.starts_with("https://github.com/")).unwrap_or(RELEASES_PAGE).to_string();
     let published = v["published_at"].as_str().and_then(unix_time);
     let want = asset_name(kind, &version, arch);
     let asset = want.as_ref().and_then(|want| {
@@ -346,6 +370,33 @@ fn set_status_unless_busy(app: &AppState, s: Status) -> bool {
     true
 }
 
+/// An update found earlier is still on offer when a later check can't
+/// reach GitHub: keep saying so rather than `otherwise`.
+fn known_or(app: &AppState, otherwise: Status) -> Status {
+    if lk(&app.update).release.is_some() {
+        Status::Available
+    } else {
+        otherwise
+    }
+}
+
+/// Downloads left behind (a failed update, an installer that has finished):
+/// clear out those more than a day old.
+fn sweep_old_downloads() {
+    let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for e in dir.flatten() {
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > Duration::from_secs(24 * 3600));
+        if old && e.file_name().to_string_lossy().starts_with("edgehop-update-") {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 /// Ask GitHub for the newest release; on a new one, say so (once per version).
 /// Returns false if it should be asked again soon.
 pub fn check(app: &Arc<AppState>, by_hand: bool) -> bool {
@@ -362,7 +413,7 @@ pub fn check(app: &Arc<AppState>, by_hand: bool) -> bool {
         {
             // Just published: its files may still be uploading. Look again soon.
             log::info!("Edgehop {} was just published; waiting for its files to finish uploading", rel.version);
-            set_status_unless_busy(app, Status::Idle);
+            set_status_unless_busy(app, known_or(app, Status::Idle));
             false
         }
         Ok(rel) if is_newer(&rel.version, &cur) => {
@@ -415,10 +466,8 @@ pub fn check(app: &Arc<AppState>, by_hand: bool) -> bool {
         Err(e) => {
             log::warn!("update check failed: {e}");
             // A failed background check isn't worth a red message.
-            set_status_unless_busy(
-                app,
-                if by_hand { Status::Failed(format!("Couldn't check for updates: {e}")) } else { Status::Idle },
-            );
+            let failed = if by_hand { Status::Failed(format!("Couldn't check for updates: {e}")) } else { Status::Idle };
+            set_status_unless_busy(app, known_or(app, failed));
             false
         }
     }
@@ -430,6 +479,7 @@ pub fn check(app: &Arc<AppState>, by_hand: bool) -> bool {
 pub fn start_checker(app: Arc<AppState>) {
     let _ = std::thread::Builder::new().name("updates".into()).spawn(move || {
         std::thread::sleep(FIRST_CHECK);
+        sweep_old_downloads();
         let mut last: Option<std::time::SystemTime> = None;
         let mut ok = true;
         loop {
@@ -481,7 +531,13 @@ pub fn install_release(rel: &Release, autostart: bool, say: &dyn Fn(String)) -> 
     }
     let dir = private_dir(&rel.version)?;
     say(format!("Downloading Edgehop {}…", rel.version));
-    let file = download(asset, &dir)?;
+    let file = match download(asset, &dir) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+    };
     say(format!("Installing Edgehop {}…", rel.version));
     let result = match kind {
         Kind::WindowsInstaller => {
@@ -506,7 +562,11 @@ pub fn install_release(rel: &Release, autostart: bool, say: &dyn Fn(String)) -> 
         Kind::Rpm => as_admin("rpm", &["-U", "--replacepkgs"], &file),
         Kind::Manual(why) => Err(why),
     };
-    let _ = std::fs::remove_dir_all(&dir);
+    // On failure the package stays (for a day): the message may name it for
+    // installing by hand.
+    if result.is_ok() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     result.map(|()| Done::Restart)
 }
 
@@ -602,6 +662,10 @@ fn install_mac(zip: &Path, dir: &Path, bundle: &Path) -> Result<Done, String> {
     const SWAP: &str = r#"echo "$(date): waiting for Edgehop ($1) to quit"
 n=0
 while kill -0 "$1" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.2; n=$((n+1)); done
+if kill -0 "$1" 2>/dev/null; then
+    echo "$(date): Edgehop is still running after a minute; not replacing it"
+    exit 1
+fi
 old="$2.old-$$"
 if mv "$2" "$old"; then
     if mv "$3" "$2"; then
@@ -609,11 +673,13 @@ if mv "$2" "$old"; then
         echo "$(date): replaced $2"
     else
         echo "$(date): couldn't move the new app into place; putting the old one back"
+        rm -rf "$2"
         mv "$old" "$2"
     fi
 else
     echo "$(date): couldn't move $2 aside"
 fi
+rm -rf "$4"
 open "$2" --args --minimized && echo "$(date): opened $2""#;
     let log = crate::state::log_path().with_file_name("update-helper.log");
     let out = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
@@ -623,6 +689,7 @@ open "$2" --args --minimized && echo "$(date): opened $2""#;
         .arg(std::process::id().to_string())
         .arg(bundle)
         .arg(&new_app)
+        .arg(dir)
         .stdin(std::process::Stdio::null())
         .stdout(out)
         .stderr(err);
