@@ -3,6 +3,51 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.5.0] - 2026-11-10
+
+### Linux: type into the login screen
+- **Settings → Login screen → *Also work at the login screen***: a small
+  system service (`edgehop-login`) starts at boot, so the sharing computer's
+  keyboard and mouse work at the login screen, before anyone signs in (no more
+  on-screen keyboard). It borrows your Edgehop settings read-only (same
+  pairing, same name), steps aside as soon as your own Edgehop starts, and
+  takes over again when you sign out. Switching it asks for your password; from
+  a terminal: `sudo systemctl enable --now edgehop-login`.
+
+### Keyboard
+- **Linux: Ctrl+C copies even where Super works as Ctrl.** People coming from
+  a Mac often set Linux up so the Command (Super) key works as Ctrl. That
+  setting applies to Edgehop's virtual keyboard too, so Ctrl from the other
+  computer arrived as Super. Edgehop now reads the layout options in KDE's and
+  GNOME's keyboard settings (and keyd's setup) and sends whichever key this
+  computer turns into the one you pressed. Settings → Keyboard → *Swap Ctrl and
+  Super* sets it by hand; the log says what was found (`keyboard: ...`).
+
+### Mac
+- **Drag files from Finder onto another computer.** At the edge, Edgehop reads
+  what the drag carries from the drag pasteboard, cancels the drag on the Mac
+  (so nothing is dropped at the edge, and macOS doesn't switch Spaces), and the
+  drag carries on over there.
+- **Files dragged onto the Mac** land in the Finder window under the pointer, or
+  on the Desktop (macOS asks once whether Edgehop may ask Finder which folder
+  that is); dropped anywhere else, they're on the clipboard to paste.
+- **Copy and paste files and folders** between a Mac and other computers, with
+  Finder's Copy and Paste.
+- **Trackpad gestures stay off the Mac while you're on another computer**: a
+  three-finger swipe no longer opens Mission Control or switches Spaces behind
+  your back (which also left a second pointer on the Mac). Gestures don't
+  carry across to the other computer yet; two-finger scrolling does.
+
+### Connections
+- **Two copies of Edgehop on one computer** no longer knock each other off every
+  few seconds ("Not connected" / "Connected" flicker). The older copy is told it
+  was replaced, says so, and waits; the sharing computer logs which computer
+  runs two copies.
+- Clients log every 5 minutes that they're still connected and when they last
+  heard from the sharing computer, to pin down silent network drops.
+- Linux: *Override screen size* now also places the pointer correctly (it only
+  scaled the movement before).
+
 ## [0.4.0] - 2026-11-10
 
 ### Game mode

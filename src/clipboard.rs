@@ -207,6 +207,8 @@ fn get_files_inner() -> Option<Vec<PathBuf>> {
     return crate::win32::clipboard_files();
     #[cfg(target_os = "linux")]
     return linux::get_files();
+    #[cfg(target_os = "macos")]
+    return crate::mac_files::clipboard_files();
     #[allow(unreachable_code)]
     None
 }
@@ -227,6 +229,8 @@ fn set_files_inner(paths: &[PathBuf]) -> Option<String> {
     return crate::win32::set_clipboard_files(paths).then(String::new);
     #[cfg(target_os = "linux")]
     return linux::set_files(paths);
+    #[cfg(target_os = "macos")]
+    return crate::mac_files::set_clipboard_files(paths).then(|| get().unwrap_or_default());
     #[allow(unreachable_code)]
     {
         let _ = paths;

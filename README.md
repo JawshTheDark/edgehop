@@ -140,6 +140,17 @@ from Terminal: `tccutil reset Accessibility com.edgehop.app` (and
 `ListenEvent`, `PostEvent`). *Command works as Ctrl* (Settings → Keyboard,
 on by default) makes Command+C / Command+V copy and paste on Windows and Linux.
 Mac keyboards have no Scroll Lock: **F14** brings the mouse home instead.
+Trackpad gestures (three-finger swipes, pinches) stay off the Mac while you're
+on another computer, so they can't open Mission Control behind your back; they
+don't carry across. Files dropped on the Mac land in the Finder window under the
+pointer or on the Desktop (macOS asks once whether Edgehop may ask Finder).
+
+**Controlling Linux**: to type your password at the login screen with the
+sharing computer's keyboard, switch on Settings → Login screen → *Also work at
+the login screen* (or `sudo systemctl enable --now edgehop-login`). If this
+computer is set up so Super (Command) works as Ctrl, Edgehop notices from KDE's
+or GNOME's keyboard settings (or keyd) and adjusts; if Ctrl+C from the other
+computer still doesn't copy, switch on Settings → Keyboard → *Swap Ctrl and Super*.
 
 **Sharing from Linux** works on X11 and on KDE Plasma (Wayland). GNOME on Wayland
 doesn't let apps follow the pointer; choose *GNOME on Xorg* at the login screen to

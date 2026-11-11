@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "edgehop"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arboard",
  "base64",
@@ -1133,6 +1133,7 @@ dependencies = [
  "ksni",
  "libc",
  "log",
+ "objc2 0.6.5",
  "png 0.17.16",
  "serde",
  "serde_json",

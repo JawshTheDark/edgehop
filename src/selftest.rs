@@ -51,6 +51,8 @@ pub fn run(args: &[String]) -> i32 {
     }
     clipboard_text(&mut r);
     clipboard_image(&mut r);
+    #[cfg(target_os = "macos")]
+    mac_files(&mut r);
 
     let mut inj = match crate::inject::create() {
         Ok(i) => i,
@@ -316,6 +318,48 @@ fn clipboard_text(r: &mut Report) {
         Some(t) => r.fail("clipboard text", format!("read back {t:?}")),
         None => r.fail("clipboard text", "nothing on the clipboard after copying"),
     }
+}
+
+/// Files on the clipboard and on the drag pasteboard (what a Finder drag
+/// leaves there), written and read back.
+#[cfg(target_os = "macos")]
+fn mac_files(r: &mut Report) {
+    let dir = std::env::temp_dir().join(format!("edgehop-self-test-{}", std::process::id()));
+    let paths: Vec<std::path::PathBuf> = ["one.txt", "two with spaces.txt"].iter().map(|n| dir.join(n)).collect();
+    if std::fs::create_dir_all(&dir).is_err() || paths.iter().any(|p| std::fs::write(p, "edgehop").is_err()) {
+        r.fail("clipboard files", format!("couldn't make test files in {}", dir.display()));
+        return;
+    }
+    let same = |got: &[std::path::PathBuf]| {
+        let canon = |p: &std::path::PathBuf| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        got.len() == paths.len() && got.iter().zip(&paths).all(|(a, b)| canon(a) == canon(b))
+    };
+    let saved = crate::clipboard::get();
+    crate::clipboard::set_files(&paths);
+    std::thread::sleep(Duration::from_millis(150));
+    match crate::clipboard::get_files() {
+        Some(f) if same(&f) => r.pass("clipboard files", "2 files copied and read back"),
+        Some(f) => r.fail("clipboard files", format!("read back {f:?}")),
+        None => r.fail("clipboard files", "no files on the clipboard after copying two"),
+    }
+    let before = crate::mac_files::drag_change_count();
+    if !crate::mac_files::put_on_drag_pasteboard(&paths) {
+        r.fail("drag pasteboard", "couldn't write to it");
+    } else {
+        let after = crate::mac_files::drag_change_count();
+        let f = crate::mac_files::drag_files();
+        if after != before && same(&f) {
+            r.pass("drag pasteboard", format!("a new drag is noticed (count {before} -> {after}) and its 2 files read"));
+        } else {
+            r.fail("drag pasteboard", format!("count {before} -> {after}, files {f:?}"));
+        }
+    }
+    let desktop = directories::UserDirs::new().and_then(|u| u.desktop_dir().map(|d| d.to_path_buf()));
+    r.info("drop folder", format!("desktop is {desktop:?}"));
+    if let Some(t) = saved {
+        crate::clipboard::set(&t);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn clipboard_image(r: &mut Report) {

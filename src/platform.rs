@@ -439,7 +439,9 @@ pub fn folder_at(x: i32, y: i32) -> Option<std::path::PathBuf> {
             UnderCursor::Other => None,
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    return crate::mac_files::folder_at(x, y);
+    #[cfg(target_os = "linux")]
     {
         let _ = (x, y);
         None

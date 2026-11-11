@@ -102,7 +102,7 @@ jobs:
           fi
           name="edgehop-$TAG-linux-$ARCH"
           mkdir -p "$name"
-          cp target/release/edgehop packaging/linux/60-edgehop-uinput.rules packaging/linux/70-edgehop-input.rules packaging/linux/edgehop-uinput.conf \
+          cp target/release/edgehop packaging/linux/60-edgehop-uinput.rules packaging/linux/70-edgehop-input.rules packaging/linux/edgehop-uinput.conf packaging/linux/edgehop-login.service \
              packaging/linux/edgehop.desktop packaging/linux/edgehop.png README.md "$name/"
           [ -f packaging/linux/install.sh ] && install -m755 packaging/linux/install.sh "$name/"
           tar czf "dist/$name.tar.gz" "$name"

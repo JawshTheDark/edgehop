@@ -79,6 +79,9 @@ pub enum ToClient {
     Clipboard { text: String },
     ClipboardImage { png: String },
     Ping,
+    /// This computer connected again (another copy of Edgehop on it): this
+    /// connection is being closed in favour of the new one.
+    Replaced,
     /// Log this much ("info", "debug", "trace").
     SetLogLevel { level: String },
     /// Send your recent log (for a diagnostics report).

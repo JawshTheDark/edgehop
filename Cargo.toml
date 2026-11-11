@@ -1,6 +1,6 @@
 [package]
 name = "edgehop"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Share one keyboard and mouse across every computer on your network"
 license = "MIT"
@@ -26,6 +26,9 @@ libc = "0.2"
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 tray-icon = "0.19"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.2"
@@ -54,6 +57,7 @@ assets = [
     ["packaging/linux/60-edgehop-uinput.rules", "lib/udev/rules.d/", "644"],
     ["packaging/linux/70-edgehop-input.rules", "lib/udev/rules.d/", "644"],
     ["packaging/linux/edgehop-uinput.conf", "usr/lib/modules-load.d/", "644"],
+    ["packaging/linux/edgehop-login.service", "lib/systemd/system/", "644"],
 ]
 
 # Fedora / RHEL / openSUSE: `cargo generate-rpm` (after `cargo build --release`).
@@ -66,6 +70,7 @@ assets = [
     { source = "packaging/linux/60-edgehop-uinput.rules", dest = "/usr/lib/udev/rules.d/60-edgehop-uinput.rules", mode = "644" },
     { source = "packaging/linux/70-edgehop-input.rules", dest = "/usr/lib/udev/rules.d/70-edgehop-input.rules", mode = "644" },
     { source = "packaging/linux/edgehop-uinput.conf", dest = "/usr/lib/modules-load.d/edgehop-uinput.conf", mode = "644" },
+    { source = "packaging/linux/edgehop-login.service", dest = "/usr/lib/systemd/system/edgehop-login.service", mode = "644" },
 ]
 post_install_script = """
 modprobe uinput 2>/dev/null || true
@@ -73,6 +78,8 @@ udevadm control --reload-rules 2>/dev/null || true
 udevadm trigger --name-match=uinput 2>/dev/null || true
 udevadm trigger --subsystem-match=input 2>/dev/null || true
 gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true
+systemctl try-restart edgehop-login.service 2>/dev/null || true
 """
 
 [package.metadata.generate-rpm.recommends]

@@ -20,6 +20,10 @@ pub struct ClientEngine {
 }
 
 /// Lets the watchdog see whether the connection loop is still making progress.
+/// The login-screen service sets this while the signed-in user's own Edgehop
+/// runs: don't connect (the server would take the connection from theirs).
+pub static STAND_DOWN: AtomicBool = AtomicBool::new(false);
+
 struct Liveness {
     /// `recovery::now_ms()` when the loop last handled a message.
     progress: AtomicU64,
@@ -58,9 +62,15 @@ impl ClientEngine {
 /// is still stuck after that, restart edgehop.
 fn watchdog(stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpStream>>>, live: Arc<Liveness>) {
     let mut nudged = false;
+    let mut ticks = 0u64;
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
         let stuck_ms = now_ms().saturating_sub(live.progress.load(Ordering::Relaxed));
+        // Every 5 minutes: proof of life, so a log shows when a link died.
+        ticks += 1;
+        if ticks % 300 == 0 && live.connected.load(Ordering::Relaxed) {
+            log::info!("still connected; last message from the server {stuck_ms} ms ago");
+        }
         if !live.connected.load(Ordering::Relaxed) || stuck_ms < 8000 {
             nudged = false;
             continue;
@@ -104,6 +114,24 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
         });
     }
     inject::set_ctrl_is_command(app.cfg().ctrl_is_command);
+    #[cfg(target_os = "linux")]
+    {
+        // This computer may rearrange Ctrl and Super (e.g. Super works as
+        // Ctrl, Mac-style): send the keys that arrive as the ones pressed.
+        let setting = app.cfg().swap_ctrl_super;
+        let found = crate::keyfix::detected();
+        let fix = crate::keyfix::effective(setting);
+        log::info!("keyboard: {}", found.report);
+        log::info!(
+            "keys from the server: {} ({})",
+            if fix.is_empty() { "sent as pressed".to_string() } else { format!("sent as {fix:?} (pressed, sent)") },
+            match setting {
+                None => "found automatically",
+                Some(_) => "Ctrl/Super switch in Settings",
+            }
+        );
+        inject::set_key_fix(fix);
+    }
     let mut injector = match inject::create() {
         Ok(i) => i,
         Err(e) => {
@@ -116,6 +144,10 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
     // connection ends, however it ended, so nothing stays stuck down.
     let mut held = Held::default();
     while !stop.load(Ordering::Relaxed) {
+        if STAND_DOWN.load(Ordering::Relaxed) {
+            sleep_unless_stopped(&stop, Duration::from_millis(500));
+            continue;
+        }
         let result = session(&app, &stop, &current, injector.as_mut(), hooks.as_deref(), &away_tx, &mut held, &live);
         live.connected.store(false, Ordering::Relaxed);
         for k in held.keys.drain() {
@@ -293,6 +325,10 @@ fn session(
     *lk(&app.key_mismatch) = None;
 
     let (w, h) = cfg.screen_override.unwrap_or_else(|| inj.screen_size());
+    inj.set_screen_size(w, h);
+    if cfg.screen_override.is_none() && cfg.last_screen != Some((w, h)) {
+        app.update_config(|c| c.last_screen = Some((w, h)));
+    }
     tx.send(&ToServer::Hello {
         name: cfg.name.clone(),
         width: w,
@@ -453,6 +489,15 @@ fn session(
                 }
             }
             ToClient::Ping => lk(&tx).send(&ToServer::Pong)?,
+            ToClient::Replaced => {
+                // Without this the two copies take turns knocking each other off.
+                log::warn!(
+                    "{server_name} took a newer connection from this computer: another copy of Edgehop is \
+                     running here; this one waits 30 s before trying again"
+                );
+                app.set_status("Another copy of Edgehop on this computer is connected", false);
+                return Ok(Duration::from_secs(30));
+            }
             ToClient::SetLogLevel { level } => {
                 if level != crate::state::log_level_name() {
                     crate::state::set_log_level(&level);

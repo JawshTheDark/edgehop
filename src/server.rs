@@ -191,6 +191,8 @@ pub struct Core {
     bounce_reported: Option<Instant>,
     /// Recent pointer reports that made no sense while away (to notice a storm).
     stale: VecDeque<Instant>,
+    /// When each computer's connection was last replaced by a new one from it.
+    replacements: HashMap<String, VecDeque<Instant>>,
     stale_reported: Option<Instant>,
     /// Game mode turned on (Some(true)) or off (Some(false)) by hand; None:
     /// automatic. Off while a game is in front lasts until that game closes.
@@ -259,6 +261,7 @@ impl Core {
             bounce_reported: None,
             stale: VecDeque::new(),
             stale_reported: None,
+            replacements: HashMap::new(),
             game_manual: None,
             game_auto_enabled: true,
             game_auto: None,
@@ -1006,9 +1009,25 @@ impl Core {
 
     // ---- clients & clipboard ----
 
-    /// Register a client; returns the id of a replaced older connection.
-    pub fn add_client(&mut self, name: &str, slot: Slot) -> Option<u64> {
-        self.clients.insert(name.to_string(), slot).map(|old| old.id)
+    /// Register a client; returns a replaced older connection from the same computer.
+    pub fn add_client(&mut self, name: &str, slot: Slot) -> Option<Slot> {
+        let old = self.clients.insert(name.to_string(), slot);
+        if old.is_some() {
+            // Two copies of Edgehop on one computer take turns replacing each other.
+            let now = Instant::now();
+            let times = self.replacements.entry(name.to_string()).or_default();
+            times.push_back(now);
+            while times.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(60)) {
+                times.pop_front();
+            }
+            if times.len() == 3 {
+                log::warn!(
+                    "{name} connected again 3 times in a minute, each time replacing its last connection: two \
+                     copies of Edgehop are probably running on {name} (an older one too?)"
+                );
+            }
+        }
+        old
     }
 
     /// Make sure a connected client has a place next to a monitor and that its
@@ -1524,8 +1543,14 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
         });
     }
     if let Some(old) = replaced {
-        if let Some(st) = lk(&s.streams).remove(&old) {
-            let _ = st.shutdown(Shutdown::Both);
+        log::info!("{name} connected again; closing its previous connection");
+        // Tell the old copy why, then close it once that's had a moment to go out.
+        let _ = old.tx.send(ToClient::Replaced);
+        if let Some(st) = lk(&s.streams).remove(&old.id) {
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(300));
+                let _ = st.shutdown(Shutdown::Both);
+            });
         }
     }
     {
@@ -1724,8 +1749,9 @@ fn receive_clipboard_files(s: Arc<Shared>, m: Manifest) {
 /// drop point (desktop / Explorer window), otherwise onto the clipboard.
 fn receive_drop(s: Arc<Shared>, m: Manifest) {
     let point = lk(&s.core).drop_point.take();
-    let folder = point.and_then(|(x, y)| crate::platform::folder_at(x, y));
     thread::spawn(move || {
+        // Asking the file manager can take a moment (or a permission prompt).
+        let folder = point.and_then(|(x, y)| crate::platform::folder_at(x, y));
         let dest = folder.clone().unwrap_or_else(transfer::new_drop_dir);
         match fetch_from_client(&s, &m, &dest) {
             Ok(paths) => {

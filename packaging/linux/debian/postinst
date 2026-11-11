@@ -7,6 +7,11 @@ if [ "$1" = "configure" ]; then
         udevadm trigger --name-match=uinput 2>/dev/null || true
         udevadm trigger --subsystem-match=input 2>/dev/null || true
     fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null || true
+        # If the login-screen service is on, run the new version.
+        systemctl try-restart edgehop-login.service 2>/dev/null || true
+    fi
     command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -q /usr/share/icons/hicolor 2>/dev/null || true
 fi
 exit 0

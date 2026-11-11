@@ -51,6 +51,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>LSUIElement</key><false/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>Edgehop asks Finder which folder you dropped files into, when you drag them over from another computer.</string>
   <key>NSLocalNetworkUsageDescription</key><string>Edgehop finds and connects to the computer sharing its keyboard and mouse on your local network.</string>
 </dict></plist>
 PLIST

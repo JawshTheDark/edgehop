@@ -239,6 +239,9 @@ struct Gui {
     log_filter: log::Level,
     log_search: String,
     diag_msg: Arc<std::sync::Mutex<Option<String>>>,
+    /// Linux: whether the login-screen service is on (None: not installed), and when we checked.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    login_service: Option<(std::time::Instant, Option<bool>)>,
     /// Mac: whether Accessibility is allowed, and when we last asked.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     input_allowed: Option<(std::time::Instant, bool)>,
@@ -276,6 +279,7 @@ impl Gui {
             log_search: String::new(),
             diag_msg: Arc::new(std::sync::Mutex::new(None)),
             input_allowed: None,
+            login_service: None,
         }
     }
 
@@ -887,6 +891,25 @@ impl Gui {
         });
     }
 
+    /// Linux: is the login-screen service on? Asked at most every 5 s.
+    #[cfg(target_os = "linux")]
+    fn login_service_state(&mut self) -> Option<bool> {
+        let fresh = self.login_service.is_some_and(|(at, _)| at.elapsed() < std::time::Duration::from_secs(5));
+        if !fresh {
+            let state = std::process::Command::new("systemctl")
+                .args(["is-enabled", "edgehop-login.service"])
+                .output()
+                .ok()
+                .and_then(|o| match String::from_utf8_lossy(&o.stdout).trim() {
+                    "enabled" => Some(true),
+                    "disabled" => Some(false),
+                    _ => None,
+                });
+            self.login_service = Some((std::time::Instant::now(), state));
+        }
+        self.login_service.and_then(|(_, s)| s)
+    }
+
     fn connection_tab(&mut self, ui: &mut egui::Ui, cfg: &Config) {
         let p = palette(ui.visuals().dark_mode);
         let status = lk(&self.app.status).clone();
@@ -1161,6 +1184,63 @@ impl Gui {
                                 if toggle(ui, &mut on).changed() {
                                     self.app.update_config(|c| c.ctrl_is_command = on);
                                     crate::inject::set_ctrl_is_command(on);
+                                }
+                            },
+                        );
+                    });
+                    ui.add_space(10.0);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let found = crate::keyfix::detected();
+                    card(ui, "Keyboard", "", |ui| {
+                        let detail = if found.why.is_empty() {
+                            "Turn on if Ctrl+C from the other computer doesn't copy here, e.g. when this computer                              is set up so Super (Command) works as Ctrl."
+                                .to_string()
+                        } else {
+                            format!("Found automatically: {}. Keys from the other computer are adjusted to match.", found.why)
+                        };
+                        row(ui, "Swap Ctrl and Super", &detail, |ui| {
+                            let mut on = !crate::keyfix::effective(cfg.swap_ctrl_super).is_empty();
+                            if toggle(ui, &mut on).changed() {
+                                self.app.update_config(|c| c.swap_ctrl_super = Some(on));
+                                crate::inject::set_key_fix(crate::keyfix::effective(Some(on)));
+                                log::info!("keys from the server: Ctrl and Super {}", if on { "swapped" } else { "as pressed" });
+                            }
+                        });
+                    });
+                    ui.add_space(10.0);
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let state = self.login_service_state();
+                    card(ui, "Login screen", "", |ui| {
+                        row(
+                            ui,
+                            "Also work at the login screen",
+                            "Type your password with the sharing computer's keyboard. A small service starts \
+                             at boot and steps aside once you're signed in. Asks for your password to switch.",
+                            |ui| match state {
+                                Some(enabled) => {
+                                    let mut on = enabled;
+                                    if toggle(ui, &mut on).changed() {
+                                        self.login_service = Some((std::time::Instant::now(), Some(on)));
+                                        let verb = if on { "enable" } else { "disable" };
+                                        std::thread::spawn(move || {
+                                            let ok = std::process::Command::new("pkexec")
+                                                .args(["systemctl", verb, "--now", "edgehop-login.service"])
+                                                .status()
+                                                .is_ok_and(|s| s.success());
+                                            if ok {
+                                                log::info!("login-screen service: {verb}d");
+                                            } else {
+                                                log::warn!("couldn't {verb} the login-screen service (password prompt cancelled?)");
+                                            }
+                                        });
+                                    }
+                                }
+                                None => {
+                                    ui.label(RichText::new("Needs the edgehop package").small());
                                 }
                             },
                         );

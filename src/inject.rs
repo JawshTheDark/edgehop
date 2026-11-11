@@ -8,6 +8,9 @@ pub trait Injector: Send {
     /// Units of 1/120 notch; positive dy = away from the user (scroll up).
     fn wheel(&mut self, dx: i32, dy: i32);
     fn key(&mut self, evdev_code: u16, down: bool);
+    /// The client reported this size (an override, or the login-screen
+    /// service's remembered size): map pointer positions to it.
+    fn set_screen_size(&mut self, _w: i32, _h: i32) {}
 }
 
 pub fn create() -> Result<Box<dyn Injector>, String> {
@@ -46,6 +49,22 @@ pub fn set_ctrl_is_command(on: bool) {
     if cfg!(target_os = "macos") {
         CTRL_IS_COMMAND.store(on, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Linux clients: keys to send instead, undoing this computer's own modifier
+/// rearrangements (see keyfix.rs): (key pressed on the server, key to send).
+#[allow(dead_code)]
+static KEY_FIX: std::sync::Mutex<Vec<(u16, u16)>> = std::sync::Mutex::new(Vec::new());
+
+#[allow(dead_code)]
+pub fn set_key_fix(pairs: Vec<(u16, u16)>) {
+    *KEY_FIX.lock().unwrap_or_else(|e| e.into_inner()) = pairs;
+}
+
+#[allow(dead_code)]
+fn key_fix(code: u16) -> u16 {
+    let fix = KEY_FIX.lock().unwrap_or_else(|e| e.into_inner());
+    fix.iter().find(|&&(want, _)| want == code).map_or(code, |&(_, send)| send)
 }
 
 #[allow(dead_code)]
@@ -290,6 +309,12 @@ pub mod linux {
         fn screen_size(&self) -> (i32, i32) {
             (self.w, self.h)
         }
+        fn set_screen_size(&mut self, w: i32, h: i32) {
+            if w > 0 && h > 0 {
+                self.w = w;
+                self.h = h;
+            }
+        }
         fn move_to(&mut self, x: i32, y: i32) {
             let ax = (x.clamp(0, self.w - 1) as i64 * ABS_MAX as i64 / (self.w - 1).max(1) as i64) as i32;
             let ay = (y.clamp(0, self.h - 1) as i64 * ABS_MAX as i64 / (self.h - 1).max(1) as i64) as i32;
@@ -326,6 +351,7 @@ pub mod linux {
             }
         }
         fn key(&mut self, code: u16, down: bool) {
+            let code = super::key_fix(code);
             if (1..=255).contains(&code) {
                 self.kbd.emit(&[(EV_KEY, code, down as i32)]);
             }

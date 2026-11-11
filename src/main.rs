@@ -14,8 +14,14 @@ mod icon;
 mod inject;
 #[cfg(target_os = "linux")]
 mod kde;
+#[cfg(target_os = "linux")]
+mod keyfix;
 mod keymap;
 mod layout;
+#[cfg(target_os = "macos")]
+mod mac_files;
+#[cfg(target_os = "linux")]
+mod login_screen;
 mod net;
 mod platform;
 mod proto;
@@ -59,6 +65,12 @@ fn main() {
         let path = args.get(i + 1).map(String::as_str).unwrap_or("edgehop.png");
         let size = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(256).clamp(16, 1024);
         std::fs::write(path, icon::png(size)).expect("write icon");
+        return;
+    }
+    // Linux: the login-screen service (see login_screen.rs).
+    #[cfg(target_os = "linux")]
+    if args.iter().any(|a| a == "--login-screen") {
+        login_screen::run(&args);
         return;
     }
     if let Some(i) = args.iter().position(|a| a == "--write-ico") {

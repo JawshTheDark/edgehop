@@ -58,6 +58,12 @@ pub struct Config {
     /// Sharing computer: game mode turns on by itself while a fullscreen game
     /// or app is in front (Windows).
     pub game_mode_auto: bool,
+    /// Client: the screen size last seen in a desktop session, for the
+    /// login-screen service (which can't ask the desktop).
+    pub last_screen: Option<(i32, i32)>,
+    /// Linux client: swap Ctrl and Super for keys from the server, because
+    /// this computer swaps them (Super works as Ctrl). None = as detected.
+    pub swap_ctrl_super: Option<bool>,
 }
 
 impl Default for Config {
@@ -86,8 +92,19 @@ impl Default for Config {
             screen_override: None,
             ctrl_is_command: cfg!(target_os = "macos"),
             game_mode_auto: true,
+            last_screen: None,
+            swap_ctrl_super: None,
         }
     }
+}
+
+/// Never write the settings file (the login-screen service runs as root and
+/// reads the signed-in user's settings).
+static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn set_read_only() {
+    READ_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl Config {
@@ -140,6 +157,9 @@ impl Config {
     }
 
     pub fn save(&self) {
+        if READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+            return; // the login-screen service only borrows the user's settings
+        }
         let path = Self::path();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);

@@ -49,6 +49,9 @@ extern "C" {
     fn CGDisplayBounds(display: u32) -> CGRect;
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
+    fn CGEventCreateKeyboardEvent(src: *const c_void, key: u16, down: bool) -> CGEventRef;
+    fn CGEventSetIntegerValueField(e: CGEventRef, field: u32, value: i64);
+    fn CGEventPost(tap: u32, e: CGEventRef);
 }
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
@@ -80,6 +83,9 @@ const SCROLL: u32 = 22;
 const OTHER_DOWN: u32 = 25;
 const OTHER_UP: u32 = 26;
 const OTHER_DRAGGED: u32 = 27;
+/// Trackpad gestures (pinch, rotate, swipes, and the Dock's own: Mission
+/// Control, switching Spaces, App Exposé, Launchpad).
+const GESTURES: [u32; 8] = [18, 19, 20, 29, 30, 31, 32, 33];
 const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
 const TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 
@@ -88,6 +94,9 @@ const MOUSE_BUTTON_NUMBER: u32 = 3;
 const MOUSE_DELTA_X: u32 = 4;
 const MOUSE_DELTA_Y: u32 = 5;
 const KEYCODE: u32 = 9;
+/// Free for the poster's own use: marks events Edgehop posts itself.
+const EVENT_SOURCE_USER_DATA: u32 = 42;
+const OURS: i64 = 0x4544_4745;
 const SCROLL_FIXED_DELTA_Y: u32 = 93;
 const SCROLL_FIXED_DELTA_X: u32 = 94;
 
@@ -167,6 +176,9 @@ pub enum Input {
     Key { code: u16, down: bool },
     /// A key with no equivalent elsewhere (e.g. Fn): swallowed while away.
     Other,
+    /// A trackpad gesture (its event type): kept from this Mac while away,
+    /// so a swipe doesn't open Mission Control here.
+    Gesture(u32),
 }
 
 /// Receives each input event; returns true to swallow it.
@@ -183,6 +195,7 @@ fn mask() -> u64 {
         SCROLL, OTHER_DOWN, OTHER_UP, OTHER_DRAGGED,
     ]
     .iter()
+    .chain(GESTURES.iter())
     .fold(0u64, |m, t| m | (1u64 << t))
 }
 
@@ -269,6 +282,7 @@ fn translate(etype: u32, e: CGEventRef) -> [Option<Input>; 2] {
                     None => [Some(Input::Other), None],
                 }
             }
+            t if GESTURES.contains(&t) => [Some(Input::Gesture(t)), None],
             _ => [None, None],
         }
     }
@@ -285,6 +299,7 @@ fn record(input: Input, took: bool) {
         Input::Wheel { dx, dy } => crate::flight::rec("mac wheel", "dx dy took", &[dx as i64, dy as i64, t]),
         Input::Key { code, down } => crate::flight::rec("mac key", "code down took", &[code as i64, down as i64, t]),
         Input::Other => crate::flight::rec("mac other", "took", &[t]),
+        Input::Gesture(g) => crate::flight::rec("mac gesture", "type took", &[g as i64, t]),
     }
 }
 
@@ -294,6 +309,9 @@ extern "C" fn callback(_proxy: *mut c_void, etype: u32, event: CGEventRef, info:
         log::warn!("macOS paused the input tap ({}); turning it back on", if etype == TAP_DISABLED_BY_TIMEOUT { "timeout" } else { "user input" });
         unsafe { CGEventTapEnable(st.tap, true) };
         return event;
+    }
+    if unsafe { CGEventGetIntegerValueField(event, EVENT_SOURCE_USER_DATA) } == OURS {
+        return event; // posted by Edgehop itself (cancelling a drag)
     }
     let mut swallow = false;
     for input in translate(etype, event).into_iter().flatten() {
@@ -416,9 +434,69 @@ impl Parker {
     }
 }
 
-pub fn run(s: Arc<Shared>, ready: mpsc::Sender<usize>, _drags: mpsc::Sender<Vec<String>>) {
+/// Finds what a drag carries, off the tap's thread (the pasteboard is another process).
+enum DragMsg {
+    /// The left button went down here: remember the drag pasteboard's count.
+    Pressed,
+    /// A left-drag is pushed against an edge with a screen beyond.
+    AtEdge,
+}
+
+static DRAG_WORKER: Mutex<Option<mpsc::Sender<DragMsg>>> = Mutex::new(None);
+
+fn tell_drag_worker(m: DragMsg) {
+    if let Some(tx) = lk(&DRAG_WORKER).as_ref() {
+        let _ = tx.send(m);
+    }
+}
+
+fn start_drag_worker(drags: mpsc::Sender<Vec<String>>) {
+    let (tx, rx) = mpsc::channel::<DragMsg>();
+    *lk(&DRAG_WORKER) = Some(tx);
+    let _ = std::thread::Builder::new().name("mac drag".into()).spawn(move || {
+        let mut at_press: Option<isize> = None;
+        for m in rx {
+            match m {
+                DragMsg::Pressed => at_press = Some(crate::mac_files::drag_change_count()),
+                DragMsg::AtEdge => {
+                    let now = crate::mac_files::drag_change_count();
+                    // Only a drag that started after the button went down counts.
+                    let files =
+                        if at_press.is_some_and(|c| c != now) { crate::mac_files::drag_files() } else { Vec::new() };
+                    if files.is_empty() {
+                        log::debug!("drag at the edge carries no files (drag pasteboard {at_press:?} -> {now})");
+                    } else {
+                        log::info!("drag at the edge carries {} item(s)", files.len());
+                    }
+                    let _ = drags.send(files.into_iter().map(|p| p.to_string_lossy().into_owned()).collect());
+                }
+            }
+        }
+    });
+}
+
+/// Press Esc on this Mac (marked as ours, so the tap lets it through).
+fn post_escape() {
+    const ESCAPE: u16 = 0x35;
+    for down in [true, false] {
+        unsafe {
+            let e = CGEventCreateKeyboardEvent(std::ptr::null(), ESCAPE, down);
+            if e.is_null() {
+                log::warn!("couldn't make an Esc key event to cancel the drag here");
+                return;
+            }
+            CGEventSetIntegerValueField(e, EVENT_SOURCE_USER_DATA, OURS);
+            CGEventPost(HID_TAP, e);
+            CFRelease(e as *const c_void);
+        }
+    }
+}
+
+pub fn run(s: Arc<Shared>, ready: mpsc::Sender<usize>, drags: mpsc::Sender<Vec<String>>) {
     let stop = s.stop.clone();
     let mut parker = Parker::default();
+    start_drag_worker(drags);
+    let mut gesture_logged: Option<std::time::Instant> = None;
     let sink: Sink = Box::new(move |input| {
         if s.stop.load(Ordering::Relaxed) {
             return false;
@@ -451,10 +529,27 @@ pub fn run(s: Arc<Shared>, ready: mpsc::Sender<usize>, _drags: mpsc::Sender<Vec<
                 }
                 took
             }
-            Input::Button { button, down } => core.on_button(button, down),
+            Input::Button { button, down } => {
+                if button == BTN_LEFT && down && !core.is_remote() {
+                    tell_drag_worker(DragMsg::Pressed);
+                }
+                core.on_button(button, down)
+            }
             Input::Wheel { dx, dy } => core.on_wheel(dx, dy),
             Input::Key { code, down } => core.on_evdev_key(code, down),
             Input::Other => core.is_remote(),
+            Input::Gesture(t) => {
+                let away = core.is_remote();
+                if away && gesture_logged.map_or(true, |at| at.elapsed() > Duration::from_secs(10)) {
+                    gesture_logged = Some(std::time::Instant::now());
+                    log::info!(
+                        "trackpad gesture (type {t}) while on {}: kept from this Mac so it doesn't open Mission \
+                         Control or switch Spaces here (gestures don't carry across)",
+                        core.active
+                    );
+                }
+                away
+            }
         }
     });
     tap_loop(sink, ready, stop);
@@ -603,6 +698,15 @@ impl Desktop for MacDesktop {
             set_pointer_visible(visible);
             self.hidden = !visible;
         }
+    }
+    fn show_drop_strip(&mut self, _r: (i32, i32, i32, i32)) {
+        // No window needed: the drag pasteboard says what the drag carries.
+        tell_drag_worker(DragMsg::AtEdge);
+    }
+    fn end_os_drag(&mut self) {
+        // The drag goes on on the other computer: cancel it here, so nothing
+        // is dropped at the edge (the button's release goes over there).
+        post_escape();
     }
 }
 
