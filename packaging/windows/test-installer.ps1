@@ -33,6 +33,10 @@ Write-Host "info  Edgehop running after a silent install: $([bool]$running)"
 
 Write-Host '== Updating from inside Edgehop to the newest published release (pretending to be 0.0.1)'
 $latest = (Invoke-RestMethod 'https://api.github.com/repos/JawshTheDark/edgehop/releases/latest' -Headers @{ 'User-Agent' = 'edgehop-ci' }).tag_name.TrimStart('v')
+# Edgehop's log: the installer should start Edgehop again after updating.
+$log = Join-Path $env:LOCALAPPDATA 'edgehop\cache\edgehop.log'
+function Starts { if (Test-Path $log) { @(Select-String -Path $log -Pattern 'starting on windows').Count } else { 0 } }
+$startsBefore = Starts
 $env:EDGEHOP_PRETEND_VERSION = '0.0.1'
 $p = Start-Process $exe -ArgumentList '--update' -PassThru
 $p.WaitForExit()
@@ -45,9 +49,13 @@ do {
     $v = (Get-Item $exe -ErrorAction SilentlyContinue).VersionInfo.ProductVersion
 } until (($v -like "$latest*") -or ((Get-Date) -gt $deadline))
 Check "updated to the newest release $latest (edgehop.exe is now $v)" ($v -like "$latest*")
+# CI has no interactive desktop, so Edgehop may not stay running here (see
+# above); that it was started again shows in its log.
 $deadline = (Get-Date).AddSeconds(60)
-while (-not (Get-Process edgehop -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
-Check 'Edgehop running again after the update (in the tray)' ($null -ne (Get-Process edgehop -ErrorAction SilentlyContinue))
+while (-not (Get-Process edgehop -ErrorAction SilentlyContinue) -and (Starts) -le $startsBefore -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+$running = $null -ne (Get-Process edgehop -ErrorAction SilentlyContinue)
+Check "the installer started Edgehop again after the update (running: $running, new log starts: $((Starts) - $startsBefore))" ($running -or ((Starts) -gt $startsBefore))
+if (Test-Path $log) { Write-Host '-- end of edgehop.log:'; Get-Content $log -Tail 8 | ForEach-Object { Write-Host "   $_" } }
 Check 'sign-in task kept' ($null -ne (Get-ScheduledTask -TaskName 'Edgehop' -ErrorAction SilentlyContinue))
 Check 'desktop icon kept' (Test-Path (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Edgehop.lnk'))
 
