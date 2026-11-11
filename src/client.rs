@@ -119,7 +119,7 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
         // This computer may rearrange Ctrl and Super (e.g. Super works as
         // Ctrl, Mac-style): send the keys that arrive as the ones pressed.
         let setting = app.cfg().swap_ctrl_super;
-        let found = crate::keyfix::detected();
+        let found = crate::keyfix::refresh();
         let fix = crate::keyfix::effective(setting);
         log::info!("keyboard: {}", found.report);
         log::info!(

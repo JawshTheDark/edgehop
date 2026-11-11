@@ -8,7 +8,7 @@
 //! the sharing computer would arrive as Super and Ctrl+C wouldn't copy.
 //! Edgehop sends whichever key this computer turns into the one pressed.
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 
 const LCTRL: u16 = 29;
 const RCTRL: u16 = 97;
@@ -31,10 +31,20 @@ pub struct Detected {
     pub report: String,
 }
 
-/// Found once per run (asks gsettings, reads a few files).
-pub fn detected() -> &'static Detected {
-    static D: OnceLock<Detected> = OnceLock::new();
-    D.get_or_init(detect)
+static FOUND: Mutex<Option<Detected>> = Mutex::new(None);
+
+/// What was found last (looks the first time).
+pub fn detected() -> Detected {
+    let mut f = FOUND.lock().unwrap_or_else(|e| e.into_inner());
+    f.get_or_insert_with(detect).clone()
+}
+
+/// Look again (asks gsettings, reads a few files): keyboard settings may
+/// have changed since Edgehop started.
+pub fn refresh() -> Detected {
+    let d = detect();
+    *FOUND.lock().unwrap_or_else(|e| e.into_inner()) = Some(d.clone());
+    d
 }
 
 /// The keys to send instead, given the user's switch (None = as detected).
@@ -42,7 +52,7 @@ pub fn effective(setting: Option<bool>) -> Vec<(u16, u16)> {
     match setting {
         Some(true) => SWAP.to_vec(),
         Some(false) => Vec::new(),
-        None => detected().pairs.clone(),
+        None => detected().pairs,
     }
 }
 
@@ -124,7 +134,9 @@ fn xkb_options() -> (Vec<String>, &'static str) {
             all.extend(opts);
             return (all, "KDE's keyboard settings");
         }
-    } else if !desktop.is_empty() {
+    } else if ["GNOME", "UNITY", "BUDGIE", "PANTHEON"].iter().any(|d| desktop.contains(d)) {
+        // Desktops that keep their layout options in GNOME's settings (others,
+        // like Sway or Hyprland, have their own; GNOME's would be stale there).
         if let Some(opts) = gnome_options() {
             return (opts, "GNOME's keyboard settings");
         }

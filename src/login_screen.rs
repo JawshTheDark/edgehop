@@ -56,17 +56,8 @@ fn owner_uid(proc_dir: &Path) -> Option<u32> {
     line.split_whitespace().nth(1)?.parse().ok()
 }
 
-pub fn run(args: &[String]) {
-    let Some(path) = find_settings(args) else {
-        crate::state::print_err(
-            "edgehop --login-screen: no paired Edgehop settings found under /home. Pair this computer in \
-             Edgehop first (signed in), then start this service again.",
-        );
-        std::process::exit(1);
-    };
-    // Borrow them: load from there, never write back (we're root).
-    std::env::set_var("EDGEHOP_CONFIG", &path);
-    crate::config::set_read_only();
+/// The signed-in user's settings, as this service uses them.
+fn borrowed_settings() -> crate::config::Config {
     let mut cfg = crate::config::Config::load();
     cfg.clipboard = false; // the login screen has no clipboard to share
     cfg.autostart = false;
@@ -74,7 +65,30 @@ pub fn run(args: &[String]) {
         // Before sign-in the desktop can't be asked for its (scaled) size.
         cfg.screen_override = cfg.last_screen;
     }
-    let app = AppState::new(cfg);
+    cfg
+}
+
+pub fn run(args: &[String]) {
+    // Not paired yet: wait for it rather than quit (systemd would start this
+    // again every few seconds, forever).
+    let mut said = false;
+    let path = loop {
+        if let Some(p) = find_settings(args) {
+            break p;
+        }
+        if !said {
+            crate::state::print_err(
+                "edgehop --login-screen: no paired Edgehop settings under /home yet; pair this computer in \
+                 Edgehop (signed in) and this service picks them up within a minute",
+            );
+            said = true;
+        }
+        std::thread::sleep(Duration::from_secs(60));
+    };
+    // Borrow them: load from there, never write back (we're root).
+    std::env::set_var("EDGEHOP_CONFIG", &path);
+    crate::config::set_read_only();
+    let app = AppState::new(borrowed_settings());
     crate::state::init_logger(app.clone(), args);
     {
         let c = app.cfg();
@@ -96,6 +110,8 @@ pub fn run(args: &[String]) {
             connected = false;
         } else if !theirs && !connected {
             log::info!("nobody's Edgehop is running: connecting, so you can type into the login screen");
+            // Pairing or screen size may have changed since last time.
+            *lk(&app.config) = borrowed_settings();
             app.start_engine();
             connected = true;
         }

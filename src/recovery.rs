@@ -88,20 +88,45 @@ fn relaunch() -> ! {
             args.push("--minimized".into());
             // The new copy waits for this one to exit (one Edgehop at a time).
             args.push("--restarting".into());
-            let mut cmd = std::process::Command::new(&exe);
+            #[allow(unused_mut)]
+            let mut started = false;
             // Inside a systemd service that won't restart us (e.g. a desktop's
             // autostart entry), a child would be stopped along with this one:
-            // start the new copy as a unit of its own.
+            // start the new copy as a unit of its own, with this session's
+            // display and settings. If that doesn't work, start it directly.
             #[cfg(target_os = "linux")]
             if std::env::var_os("INVOCATION_ID").is_some() && which("systemd-run") {
-                cmd = std::process::Command::new("systemd-run");
+                let mut cmd = std::process::Command::new("systemd-run");
                 if unsafe { libc::geteuid() } != 0 {
                     cmd.arg("--user");
                 }
-                cmd.args(["--collect", "--quiet", "--"]).arg(&exe);
+                cmd.args(["--collect", "--quiet"]);
+                for var in [
+                    "WAYLAND_DISPLAY",
+                    "DISPLAY",
+                    "XDG_CURRENT_DESKTOP",
+                    "XDG_SESSION_TYPE",
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    "EDGEHOP_CONFIG",
+                    "EDGEHOP_LOG",
+                ] {
+                    if let Some(v) = std::env::var_os(var) {
+                        let mut a = std::ffi::OsString::from(format!("--setenv={var}="));
+                        a.push(v);
+                        cmd.arg(a);
+                    }
+                }
+                cmd.arg("--").arg(&exe).args(&args);
+                match cmd.output() {
+                    Ok(o) if o.status.success() => started = true,
+                    Ok(o) => log::warn!("systemd-run couldn't start Edgehop: {}", String::from_utf8_lossy(&o.stderr).trim()),
+                    Err(e) => log::warn!("couldn't run systemd-run: {e}"),
+                }
             }
-            if let Err(e) = cmd.args(&args).spawn() {
-                log::error!("couldn't start Edgehop again ({}): {e}", exe.display());
+            if !started {
+                if let Err(e) = std::process::Command::new(&exe).args(&args).spawn() {
+                    log::error!("couldn't start Edgehop again ({}): {e}", exe.display());
+                }
             }
         }
     }
@@ -128,13 +153,20 @@ fn systemd_restarts_us() -> bool {
     if unsafe { libc::geteuid() } != 0 {
         c.arg("--user");
     }
-    let restart = c
-        .args(["show", "-p", "Restart", "--value", &unit])
+    let props = c
+        .args(["show", "-p", "Restart", "-p", "MainPID", &unit])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
-    log::info!("running as systemd unit {unit} (Restart={restart})");
-    matches!(restart.as_str(), "on-failure" | "always")
+    let prop = |name: &str| {
+        props.lines().find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix('='))).unwrap_or("").trim().to_string()
+    };
+    let (restart, main) = (prop("Restart"), prop("MainPID"));
+    // Only the unit's main process gets restarted: Edgehop may just have
+    // been started from inside some other service (a terminal in one, say).
+    let ours = main == std::process::id().to_string();
+    log::info!("running in systemd unit {unit} (Restart={restart}, main process {main}{})", if ours { ", this one" } else { "" });
+    ours && matches!(restart.as_str(), "on-failure" | "always")
 }
 
 #[cfg(not(target_os = "linux"))]

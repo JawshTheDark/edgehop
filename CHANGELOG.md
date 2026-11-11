@@ -3,6 +3,59 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.5.2] - 2026-11-10
+
+Edge cases in updating, restarting and the login-screen service.
+
+### Updating
+- **Windows: updates keep your current settings.** The installer used to
+  replay the choices from the first install, so an update turned *Start
+  Edgehop when I log in* back on (or off) whatever Settings said, and put back
+  a desktop icon you'd deleted. A copy run from outside the install folder
+  (Downloads, say) gets its firewall rule when an update moves it there.
+- **Windows: a failed installer leaves Edgehop running.** Edgehop now waits
+  for the installer; if it stops before installing, Edgehop carries on with
+  the current version and says so (it used to quit, leaving nothing running).
+- **Linux: downloads go to a new private folder.** They used a fixed name in
+  the shared /tmp, where another account could have made that folder first
+  and swapped the package between the checksum test and its install as root.
+- Linux installs with apt-get where there is one (it waits for automatic
+  updates holding the package lock, and installs anything a new version
+  newly needs) and dnf on Fedora. rpm-ostree systems (Silverblue, Kinoite)
+  get the download page.
+- A double click on *Update now*, or a check running at the same moment, no
+  longer starts a second update.
+- Checks go by the wall clock, so hours a laptop spends asleep count; a failed
+  check (no network yet at sign-in) is retried after 15 minutes, not 6 hours.
+- A release spotted while its files are still uploading (within 2 hours of
+  publishing) is checked again later instead of offering the download page.
+- Windows: updating works for user names in other scripts (Windows' curl
+  can't open those paths; downloads now come through Edgehop itself).
+- Updating waits while files are being copied between computers.
+- Mac: if macOS runs Edgehop from a temporary copy (opened straight from
+  Downloads), Edgehop says to move it to Applications before downloading
+  anything. The helper that swaps the app logs to `update-helper.log`.
+- A clearer message when Linux can't ask for your password (no polkit agent).
+- The update banner stays up while a background check runs.
+
+### Restarting (Linux)
+- Edgehop counted on systemd to restart it inside any systemd unit, even one
+  where it wasn't the main program (started from a terminal inside some
+  other service, say), and then simply quit. It now checks it's the unit's
+  main program; otherwise it starts the new copy itself, as a unit of its own
+  with this session's display and settings, falling back to a plain start.
+
+### Login-screen service
+- Before this computer is paired, it waits for the pairing instead of failing
+  and being restarted by systemd every 3 seconds.
+- It rereads your settings each time it takes over, so a new pairing or
+  screen size is picked up.
+
+### Keyboard (Linux)
+- GNOME's layout options only count on GNOME-family desktops (on Sway or
+  Hyprland they'd be leftovers), and keyboard settings are looked at again
+  each time Edgehop connects.
+
 ## [0.5.1] - 2026-11-10
 
 ### Updates

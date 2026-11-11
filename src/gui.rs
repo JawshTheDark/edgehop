@@ -1357,7 +1357,7 @@ impl Gui {
             (u.status.clone(), u.release.clone())
         };
         let Some(rel) = rel else { return };
-        if !matches!(status, Status::Available | Status::Working(_) | Status::Failed(_)) {
+        if !matches!(status, Status::Available | Status::Working(_) | Status::Failed(_) | Status::Checking) {
             return;
         }
         let p = palette(ui.visuals().dark_mode);

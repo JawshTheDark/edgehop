@@ -21,6 +21,12 @@ const REPO: &str = "JawshTheDark/edgehop";
 pub const RELEASES_PAGE: &str = "https://github.com/JawshTheDark/edgehop/releases";
 const FIRST_CHECK: Duration = Duration::from_secs(20);
 const EVERY: Duration = Duration::from_secs(6 * 3600);
+/// After a failed check (no network yet at sign-in, say): try again sooner.
+const RETRY: Duration = Duration::from_secs(15 * 60);
+/// How often the checker wakes to see whether a check is due.
+const TICK: Duration = Duration::from_secs(5 * 60);
+/// A release this new may still be uploading its files.
+const UPLOAD_GRACE_SECS: i64 = 2 * 3600;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum Status {
@@ -39,6 +45,8 @@ pub enum Status {
 pub struct Release {
     pub version: String,
     pub page: String,
+    /// When it was published (seconds since 1970).
+    pub published: Option<i64>,
     /// The file for this computer, if it can update itself.
     pub asset: Option<Asset>,
     /// Why it can't, if it can't.
@@ -92,17 +100,16 @@ fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     c
 }
 
-/// GET a URL: its body, or (with `to`) saved to that file.
-fn fetch(url: &str, to: Option<&Path>, api: bool) -> Result<Vec<u8>, String> {
+/// GET a URL's body. Files come through memory too (they're a few MB), so
+/// curl never has to open our paths: Windows' curl.exe can't open a path with
+/// characters outside the system code page (a user name in another script).
+fn fetch(url: &str, big: bool, api: bool) -> Result<Vec<u8>, String> {
     let agent = format!("Edgehop/{} (update check)", env!("CARGO_PKG_VERSION"));
-    let timeout = if to.is_some() { "900" } else { "30" };
+    let timeout = if big { "900" } else { "30" };
     let mut curl = command("curl");
     curl.args(["-fsSL", "--retry", "2", "--max-time", timeout, "-A", &agent]);
     if api {
         curl.args(["-H", "Accept: application/vnd.github+json"]);
-    }
-    if let Some(p) = to {
-        curl.arg("-o").arg(p);
     }
     curl.arg(url);
     match curl.output() {
@@ -116,7 +123,7 @@ fn fetch(url: &str, to: Option<&Path>, api: bool) -> Result<Vec<u8>, String> {
     if api {
         wget.arg("--header=Accept: application/vnd.github+json");
     }
-    wget.arg("-O").arg(to.map_or_else(|| std::ffi::OsString::from("-"), |p| p.as_os_str().to_owned())).arg(url);
+    wget.args(["-O", "-"]).arg(url);
     match wget.output() {
         Ok(o) if o.status.success() => Ok(o.stdout),
         Ok(o) => Err(format!("wget: {}", String::from_utf8_lossy(&o.stderr).trim())),
@@ -143,13 +150,42 @@ fn sha256_hex(path: &Path) -> Result<String, String> {
     Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// A new folder only this user can use, for one download. Never a fixed name
+/// in a shared folder: on Linux, /tmp is shared, and someone else could have
+/// made that folder first and swap the package between our checksum test and
+/// it being installed as root.
+fn private_dir(version: &str) -> Result<PathBuf, String> {
+    let base = std::env::temp_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let template = base.join(format!("edgehop-update-{version}-XXXXXX"));
+        let mut t = std::ffi::CString::new(template.as_os_str().as_bytes()).map_err(|e| e.to_string())?.into_bytes_with_nul();
+        // mkdtemp: created new, mode 0700, or fails.
+        let p = unsafe { libc::mkdtemp(t.as_mut_ptr() as *mut libc::c_char) };
+        if p.is_null() {
+            return Err(format!("couldn't make a folder in {}: {}", base.display(), std::io::Error::last_os_error()));
+        }
+        t.pop();
+        return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&t)));
+    }
+    // Windows: %TEMP% is the user's own; still start from an empty folder.
+    #[allow(unreachable_code)]
+    {
+        let dir = base.join(format!("edgehop-update-{version}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        Ok(dir)
+    }
+}
+
 /// Download an asset and make sure it's the published file.
 fn download(asset: &Asset, dir: &Path) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let file = dir.join(&asset.name);
-    let _ = std::fs::remove_file(&file);
-    fetch(&asset.url, Some(&file), false)?;
-    let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    let body = fetch(&asset.url, true, false)?;
+    std::fs::write(&file, &body).map_err(|e| format!("couldn't save {}: {e}", file.display()))?;
+    let size = body.len() as u64;
+    drop(body);
     if asset.size != 0 && size != asset.size {
         return Err(format!("the download is {size} bytes; GitHub says {} (try again)", asset.size));
     }
@@ -212,6 +248,10 @@ pub fn install_kind() -> Kind {
             return Kind::Deb;
         }
         if owned_by("rpm", &["-qf", "/usr/bin/edgehop"]) {
+            if Path::new("/run/ostree-booted").exists() {
+                // Silverblue, Kinoite...: /usr is read-only; packages are layered.
+                return Kind::Manual("this system installs packages with rpm-ostree".into());
+            }
             return Kind::Rpm;
         }
         return Kind::Manual("/usr/bin/edgehop doesn't belong to a package".into());
@@ -242,6 +282,7 @@ fn parse_release(json: &[u8], kind: &Kind, arch: &str) -> Result<Release, String
     let tag = v["tag_name"].as_str().ok_or("GitHub's answer has no version")?;
     let version = tag.trim_start_matches('v').to_string();
     let page = v["html_url"].as_str().unwrap_or(RELEASES_PAGE).to_string();
+    let published = v["published_at"].as_str().and_then(unix_time);
     let want = asset_name(kind, &version, arch);
     let asset = want.as_ref().and_then(|want| {
         v["assets"].as_array()?.iter().find(|a| a["name"].as_str() == Some(want)).map(|a| Asset {
@@ -257,11 +298,29 @@ fn parse_release(json: &[u8], kind: &Kind, arch: &str) -> Result<Release, String
         (_, None, Some(want)) => Some(format!("this release has no {want}")),
         _ => None,
     };
-    Ok(Release { version, page, asset, manual })
+    Ok(Release { version, page, published, asset, manual })
+}
+
+/// Seconds since 1970 for GitHub's "2026-11-11T04:30:00Z".
+fn unix_time(s: &str) -> Option<i64> {
+    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    Some(days * 86_400 + hh * 3600 + mm * 60 + ss)
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
 pub fn latest() -> Result<Release, String> {
-    let body = fetch(&format!("https://api.github.com/repos/{REPO}/releases/latest"), None, true)?;
+    let body = fetch(&format!("https://api.github.com/repos/{REPO}/releases/latest"), false, true)?;
     parse_release(&body, &install_kind(), std::env::consts::ARCH)
 }
 
@@ -274,11 +333,38 @@ fn set_status(app: &AppState, s: Status) {
     app.repaint();
 }
 
+/// Set the status unless an update is being installed (a check that ran
+/// alongside must not bring the Update button back mid-install).
+fn set_status_unless_busy(app: &AppState, s: Status) -> bool {
+    let mut u = lk(&app.update);
+    if matches!(u.status, Status::Working(_)) {
+        return false;
+    }
+    u.status = s;
+    drop(u);
+    app.repaint();
+    true
+}
+
 /// Ask GitHub for the newest release; on a new one, say so (once per version).
-pub fn check(app: &Arc<AppState>, by_hand: bool) {
-    set_status(app, Status::Checking);
+/// Returns false if it should be asked again soon.
+pub fn check(app: &Arc<AppState>, by_hand: bool) -> bool {
+    if !set_status_unless_busy(app, Status::Checking) {
+        return true;
+    }
     let cur = current();
     match latest() {
+        Ok(rel)
+            if is_newer(&rel.version, &cur)
+                && rel.asset.is_none()
+                && !matches!(install_kind(), Kind::Manual(_))
+                && rel.published.is_some_and(|t| now_unix() - t < UPLOAD_GRACE_SECS) =>
+        {
+            // Just published: its files may still be uploading. Look again soon.
+            log::info!("Edgehop {} was just published; waiting for its files to finish uploading", rel.version);
+            set_status_unless_busy(app, Status::Idle);
+            false
+        }
         Ok(rel) if is_newer(&rel.version, &cur) => {
             log::info!(
                 "Edgehop {} is available (this is {cur}); {}",
@@ -291,6 +377,9 @@ pub fn check(app: &Arc<AppState>, by_hand: bool) {
             );
             let first = {
                 let mut u = lk(&app.update);
+                if matches!(u.status, Status::Working(_)) {
+                    return true; // installing already
+                }
                 let first = u.notified.as_deref() != Some(rel.version.as_str());
                 u.notified = Some(rel.version.clone());
                 u.release = Some(rel.clone());
@@ -309,6 +398,7 @@ pub fn check(app: &Arc<AppState>, by_hand: bool) {
                     },
                 );
             }
+            true
         }
         Ok(rel) => {
             if by_hand {
@@ -316,34 +406,50 @@ pub fn check(app: &Arc<AppState>, by_hand: bool) {
             } else {
                 log::debug!("Edgehop {cur} is up to date (newest release {})", rel.version);
             }
-            lk(&app.update).release = None;
-            set_status(app, Status::UpToDate(rel.version));
-            crate::tray::refresh();
+            if set_status_unless_busy(app, Status::UpToDate(rel.version)) {
+                lk(&app.update).release = None;
+                crate::tray::refresh();
+            }
+            true
         }
         Err(e) => {
             log::warn!("update check failed: {e}");
             // A failed background check isn't worth a red message.
-            set_status(app, if by_hand { Status::Failed(format!("Couldn't check for updates: {e}")) } else { Status::Idle });
+            set_status_unless_busy(
+                app,
+                if by_hand { Status::Failed(format!("Couldn't check for updates: {e}")) } else { Status::Idle },
+            );
+            false
         }
     }
 }
 
-/// Check soon after start, then every few hours, while switched on in Settings.
+/// Check soon after start, then every few hours, while switched on in
+/// Settings. Time is measured on the wall clock, so hours a laptop spends
+/// asleep count; after a failed check (no network yet), it tries again sooner.
 pub fn start_checker(app: Arc<AppState>) {
     let _ = std::thread::Builder::new().name("updates".into()).spawn(move || {
         std::thread::sleep(FIRST_CHECK);
+        let mut last: Option<std::time::SystemTime> = None;
+        let mut ok = true;
         loop {
-            if app.cfg().check_updates {
-                crate::recovery::guard("update check", || check(&app, false));
+            let wait = if ok { EVERY } else { RETRY };
+            // A clock that went backwards counts as due.
+            let due = last.map_or(true, |t| t.elapsed().map_or(true, |e| e >= wait));
+            if due && app.cfg().check_updates {
+                ok = crate::recovery::guard("update check", || check(&app, false)).unwrap_or(false);
+                last = Some(std::time::SystemTime::now());
             }
-            std::thread::sleep(EVERY);
+            std::thread::sleep(TICK);
         }
     });
 }
 
 pub fn check_now(app: &Arc<AppState>) {
     let app = app.clone();
-    std::thread::spawn(move || check(&app, true));
+    std::thread::spawn(move || {
+        check(&app, true);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -351,45 +457,86 @@ pub fn check_now(app: &Arc<AppState>) {
 // ---------------------------------------------------------------------------
 
 /// What to do once the new version is in place.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Done {
-    /// The installer (or a helper script) takes over from here: quit now.
+    /// Windows: the installer is running; it stops this copy when it starts
+    /// installing, and starts the new one when it's done.
+    Installer(std::process::Child),
+    /// A helper takes over once this copy has quit: quit now.
     Quit,
     /// Installed: restart to run it.
     Restart,
 }
 
 /// Download and install `rel`, reporting progress through `say`.
-pub fn install_release(rel: &Release, say: &dyn Fn(String)) -> Result<Done, String> {
+/// `autostart`: the current "start at sign-in" setting (the Windows installer
+/// would otherwise set it back to what was chosen at the first install).
+pub fn install_release(rel: &Release, autostart: bool, say: &dyn Fn(String)) -> Result<Done, String> {
     let asset = rel.asset.as_ref().ok_or_else(|| {
         rel.manual.clone().unwrap_or_else(|| "there's no download for this computer in that release".into())
     })?;
-    let dir = std::env::temp_dir().join(format!("edgehop-update-{}", rel.version));
+    let kind = install_kind();
+    if let Kind::MacApp(bundle) = &kind {
+        mac_can_replace(bundle)?; // before downloading anything
+    }
+    let dir = private_dir(&rel.version)?;
     say(format!("Downloading Edgehop {}…", rel.version));
     let file = download(asset, &dir)?;
     say(format!("Installing Edgehop {}…", rel.version));
-    match install_kind() {
+    let result = match kind {
         Kind::WindowsInstaller => {
-            // Silent: no questions, keeps your choices from the first install,
-            // except the firewall rule (already there; adding it asks for admin).
-            Command::new(&file)
-                .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/MERGETASKS=!firewall"])
+            let tasks = installer_tasks(autostart);
+            log::info!("running the installer silently ({tasks})");
+            let child = Command::new(&file)
+                .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", &tasks])
                 .spawn()
                 .map_err(|e| format!("couldn't start the installer: {e}"))?;
             log::info!("the installer is running; it stops this copy and starts {} in the tray", rel.version);
-            Ok(Done::Quit)
+            return Ok(Done::Installer(child));
         }
-        Kind::MacApp(bundle) => install_mac(&file, &dir, &bundle),
-        Kind::Deb => {
-            as_admin("dpkg", &["-i"], &file)?;
-            Ok(Done::Restart)
+        Kind::MacApp(bundle) => return install_mac(&file, &dir, &bundle),
+        Kind::Deb if on_path("apt-get") => {
+            // apt-get also installs anything a new version newly depends on,
+            // and waits for another package manager (automatic updates) to finish.
+            let args = ["install", "-y", "--allow-downgrades", "-o", "DPkg::Lock::Timeout=180"];
+            as_admin("apt-get", &args, &file)
         }
-        Kind::Rpm => {
-            as_admin("rpm", &["-U", "--replacepkgs"], &file)?;
-            Ok(Done::Restart)
-        }
+        Kind::Deb => as_admin("dpkg", &["-i"], &file),
+        Kind::Rpm if on_path("dnf") => as_admin("dnf", &["install", "-y"], &file),
+        Kind::Rpm => as_admin("rpm", &["-U", "--replacepkgs"], &file),
         Kind::Manual(why) => Err(why),
-    }
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    result.map(|()| Done::Restart)
+}
+
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
+}
+
+/// Windows installer tasks for an update: as things are now, not as they
+/// were chosen at the first install.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn installer_tasks(autostart: bool) -> String {
+    let desktop_icon = directories::UserDirs::new()
+        .and_then(|u| u.desktop_dir().map(|d| d.join("Edgehop.lnk").exists()))
+        .unwrap_or(true);
+    // The firewall rule names the program's path. The installed copy has one;
+    // a copy run from elsewhere (Downloads, say) moves to the installed path
+    // and needs it (that asks for admin once).
+    let installed = directories::BaseDirs::new().map(|b| b.data_local_dir().join("Programs\\Edgehop\\edgehop.exe"));
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let is_installed = match (own_exe(), installed) {
+        (Some(me), Some(inst)) => canon(&me) == canon(&inst),
+        _ => true,
+    };
+    let task = |on: bool, name: &str| if on { name.to_string() } else { format!("!{name}") };
+    format!(
+        "/MERGETASKS={},{},{}",
+        task(autostart, "autostart"),
+        task(desktop_icon, "desktopicon"),
+        task(!is_installed, "firewall")
+    )
 }
 
 /// Linux: run a package tool as root: pkexec in a desktop session (it asks for
@@ -397,14 +544,14 @@ pub fn install_release(rel: &Release, say: &dyn Fn(String)) -> Result<Done, Stri
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn as_admin(tool: &str, args: &[&str], file: &Path) -> Result<(), String> {
     let desktop = std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
-    let sudo_ok = || Command::new("sudo").args(["-n", "true"]).output().is_ok_and(|o| o.status.success());
-    let mut cmd = if desktop && !sudo_ok() {
-        let mut c = Command::new("pkexec");
-        c.arg(tool);
-        c
-    } else if sudo_ok() {
+    let sudo_ok = Command::new("sudo").args(["-n", "true"]).output().is_ok_and(|o| o.status.success());
+    let mut cmd = if sudo_ok {
         let mut c = Command::new("sudo");
         c.args(["-n", tool]);
+        c
+    } else if desktop {
+        let mut c = Command::new("pkexec");
+        c.arg(tool);
         c
     } else {
         return Err(format!(
@@ -418,12 +565,14 @@ fn as_admin(tool: &str, args: &[&str], file: &Path) -> Result<(), String> {
         log::info!("{tool} installed {}", file.display());
         return Ok(());
     }
+    let detail = String::from_utf8_lossy(&out.stderr).trim().lines().last().unwrap_or("no details").to_string();
+    log::warn!("{tool} failed ({}): {}", out.status, String::from_utf8_lossy(&out.stderr).trim());
     match out.status.code() {
-        Some(126) | Some(127) => Err("the password prompt was cancelled; nothing was installed".into()),
-        _ => Err(format!(
-            "{tool} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim().lines().last().unwrap_or("no details")
+        Some(126) => Err("the password prompt was cancelled; nothing was installed".into()),
+        Some(127) if !sudo_ok => Err(format!(
+            "couldn't get administrator rights (not allowed, or no password prompt on this desktop): {detail}"
         )),
+        _ => Err(format!("{tool} failed: {detail}")),
     }
 }
 
@@ -447,6 +596,54 @@ fn install_mac(zip: &Path, dir: &Path, bundle: &Path) -> Result<Done, String> {
     if !new_app.join("Contents/MacOS/edgehop").exists() {
         return Err(format!("{} has no Edgehop.app in it", zip.display()));
     }
+    mac_can_replace(bundle)?;
+    // $1: our process id, $2: the running app, $3: the new one. Waits at most
+    // a minute for this copy to quit; puts the old app back if the swap fails.
+    const SWAP: &str = r#"echo "$(date): waiting for Edgehop ($1) to quit"
+n=0
+while kill -0 "$1" 2>/dev/null && [ $n -lt 300 ]; do sleep 0.2; n=$((n+1)); done
+old="$2.old-$$"
+if mv "$2" "$old"; then
+    if mv "$3" "$2"; then
+        rm -rf "$old"
+        echo "$(date): replaced $2"
+    else
+        echo "$(date): couldn't move the new app into place; putting the old one back"
+        mv "$old" "$2"
+    fi
+else
+    echo "$(date): couldn't move $2 aside"
+fi
+open "$2" --args --minimized && echo "$(date): opened $2""#;
+    let log = crate::state::log_path().with_file_name("update-helper.log");
+    let out = std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
+    let err = out.try_clone().map_err(|e| e.to_string())?;
+    let mut sh = Command::new("/bin/sh");
+    sh.args(["-c", SWAP, "edgehop-update"])
+        .arg(std::process::id().to_string())
+        .arg(bundle)
+        .arg(&new_app)
+        .stdin(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        sh.process_group(0); // outlives this copy
+    }
+    sh.spawn().map_err(|e| format!("couldn't start the update helper: {e}"))?;
+    log::info!("swapping {} for the new version once this copy quits (helper log: {})", bundle.display(), log.display());
+    Ok(Done::Quit)
+}
+
+/// Mac: can this account put a new Edgehop.app where this one is?
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mac_can_replace(bundle: &Path) -> Result<(), String> {
+    if bundle.to_string_lossy().contains("/AppTranslocation/") {
+        return Err("macOS is running Edgehop from a temporary read-only copy (it was opened straight from \
+                    Downloads): move Edgehop.app to your Applications folder, open it from there, then update"
+            .into());
+    }
     let parent = bundle.parent().ok_or("Edgehop.app has no folder")?;
     if !writable(parent) {
         return Err(format!(
@@ -454,29 +651,7 @@ fn install_mac(zip: &Path, dir: &Path, bundle: &Path) -> Result<Done, String> {
             bundle.display()
         ));
     }
-    // $1: our process id, $2: the running app, $3: the new one.
-    const SWAP: &str = r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
-old="$2.old-$$"
-if mv "$2" "$old"; then
-    if mv "$3" "$2"; then rm -rf "$old"; else mv "$old" "$2"; fi
-fi
-open "$2" --args --minimized"#;
-    let mut sh = Command::new("/bin/sh");
-    sh.args(["-c", SWAP, "edgehop-update"])
-        .arg(std::process::id().to_string())
-        .arg(bundle)
-        .arg(&new_app)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        sh.process_group(0); // outlives this copy
-    }
-    sh.spawn().map_err(|e| format!("couldn't start the update helper: {e}"))?;
-    log::info!("swapping {} for the new version once this copy quits", bundle.display());
-    Ok(Done::Quit)
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -494,16 +669,52 @@ fn writable(_dir: &Path) -> bool {
 
 /// The Update button: download, install, then quit or restart into the new version.
 pub fn install(app: &Arc<AppState>) {
-    let Some(rel) = lk(&app.update).release.clone() else { return };
-    if matches!(lk(&app.update).status, Status::Working(_)) {
-        return;
-    }
+    // Claim it in one step, so a double click starts one update.
+    let rel = {
+        let mut u = lk(&app.update);
+        let Some(rel) = u.release.clone() else { return };
+        if matches!(u.status, Status::Working(_)) {
+            return;
+        }
+        if lk(&app.transfer).is_some() {
+            u.status = Status::Failed("Files are being copied; update once that's done (Edgehop restarts to update).".into());
+            drop(u);
+            app.repaint();
+            return;
+        }
+        u.status = Status::Working(format!("Getting Edgehop {} …", rel.version));
+        rel
+    };
+    app.repaint();
     let app = app.clone();
     std::thread::spawn(move || {
         log::info!("updating from {} to {}", current(), rel.version);
         let a = app.clone();
         let say = move |s: String| set_status(&a, Status::Working(s));
-        match install_release(&rel, &say) {
+        match install_release(&rel, app.cfg().autostart, &say) {
+            Ok(Done::Installer(mut child)) => {
+                // Stop sharing and save the log: the installer stops this copy
+                // when it starts installing. Still here after it finished?
+                // Then it didn't get that far: carry on with this version.
+                app.stop_engine();
+                crate::state::flush_logs();
+                match child.wait() {
+                    Ok(st) if st.success() => {
+                        log::info!("the installer finished; the new version is starting");
+                        crate::state::flush_logs();
+                        std::process::exit(0);
+                    }
+                    other => {
+                        let why = match other {
+                            Ok(st) => format!("the installer stopped ({st})"),
+                            Err(e) => format!("couldn't wait for the installer: {e}"),
+                        };
+                        log::error!("updating to {} failed: {why}; still running {}", rel.version, current());
+                        app.start_engine();
+                        set_status(&app, Status::Failed(format!("Update failed: {why}. Edgehop {} is still running.", current())));
+                    }
+                }
+            }
             Ok(Done::Quit) => {
                 app.stop_engine();
                 crate::state::flush_logs();
@@ -546,8 +757,9 @@ pub fn cli(install_it: bool) -> i32 {
     if !install_it {
         return 0;
     }
-    match install_release(&rel, &|s| println!("{s}")) {
-        Ok(Done::Quit) => {
+    let autostart = crate::config::Config::load().autostart;
+    match install_release(&rel, autostart, &|s| println!("{s}")) {
+        Ok(Done::Installer(_)) | Ok(Done::Quit) => {
             println!("the installer takes it from here");
             0
         }
@@ -775,6 +987,25 @@ mod tests {
         let r = parse_release(json, &Kind::Rpm, "x86_64").unwrap();
         assert!(r.asset.is_none());
         assert_eq!(r.manual.as_deref(), Some("this release has no edgehop-0.6.0-1.x86_64.rpm"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installer_tasks_follow_the_settings_now() {
+        let on = installer_tasks(true);
+        assert!(on.starts_with("/MERGETASKS=autostart,"), "{on}");
+        assert!(installer_tasks(false).starts_with("/MERGETASKS=!autostart,"));
+        assert!(on.contains("desktopicon"), "{on}");
+        // The test program isn't the installed copy: it would need the firewall rule.
+        assert!(on.ends_with(",firewall"), "{on}");
+    }
+
+    #[test]
+    fn github_times() {
+        assert_eq!(unix_time("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(unix_time("2000-03-01T00:00:00Z"), Some(951_868_800));
+        assert_eq!(unix_time("2026-11-11T04:30:15Z"), Some(1_794_371_415));
+        assert_eq!(unix_time("soon"), None);
     }
 
     #[test]
