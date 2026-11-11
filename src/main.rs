@@ -31,6 +31,7 @@ mod server;
 mod state;
 mod transfer;
 mod tray;
+mod update;
 #[cfg(windows)]
 mod win32;
 
@@ -101,6 +102,10 @@ fn main() {
         }
         println!("working directory: {}", std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default());
         return;
+    }
+    // Updates from GitHub Releases (see update.rs).
+    if args.iter().any(|a| a == "--check-update" || a == "--update") {
+        std::process::exit(update::cli(args.iter().any(|a| a == "--update")));
     }
     // Check clipboard and input injection on this machine (see selftest.rs).
     if args.iter().any(|a| a == "--self-test") {
@@ -194,6 +199,7 @@ fn main() {
         });
     }
     app.start_engine();
+    update::start_checker(app.clone());
 
     if headless {
         log::info!("running headless (no window); press Ctrl+C to quit");

@@ -64,6 +64,8 @@ pub struct Config {
     /// Linux client: swap Ctrl and Super for keys from the server, because
     /// this computer swaps them (Super works as Ctrl). None = as detected.
     pub swap_ctrl_super: Option<bool>,
+    /// Look for a newer Edgehop on GitHub every few hours.
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -94,6 +96,7 @@ impl Default for Config {
             game_mode_auto: true,
             last_screen: None,
             swap_ctrl_super: None,
+            check_updates: true,
         }
     }
 }

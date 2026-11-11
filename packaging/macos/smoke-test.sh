@@ -93,6 +93,28 @@ if [ -n "$crashes" ]; then
 fi
 pkill -x edgehop
 
+step "Update from inside Edgehop to the newest published release (pretending to be 0.0.1)"
+latest=$(curl -fsSL https://api.github.com/repos/JawshTheDark/edgehop/releases/latest |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')
+upd=$(mktemp -d)
+cp -R "$APP" "$upd/Edgehop.app"
+EDGEHOP_PRETEND_VERSION=0.0.1 "$upd/Edgehop.app/Contents/MacOS/edgehop" --update | tee "$OUT/update.txt" ||
+    fail "edgehop --update"
+version() { /usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$upd/Edgehop.app/Contents/Info.plist" 2>/dev/null; }
+for _ in $(seq 90); do
+    [ "$(version)" = "$latest" ] && break
+    sleep 1
+done
+echo "Edgehop.app is now $(version) (newest release: $latest)"
+[ "$(version)" = "$latest" ] || fail "the update didn't replace Edgehop.app"
+ls "$upd"
+if ls "$upd" | grep -q '\.old-'; then fail "the update left the old Edgehop.app behind"; fi
+if codesign --verify --deep --strict "$upd/Edgehop.app"; then echo "updated app's signature: valid"; else fail "updated app's signature"; fi
+sleep 5
+if pgrep -f "$upd/Edgehop.app" > /dev/null; then echo "the updated Edgehop was opened"; else echo "(the updated Edgehop isn't running)"; fi
+pkill -f "$upd/Edgehop.app" 2> /dev/null
+rm -rf "$upd"
+
 step "Reset permissions (what the button in the app runs)"
 if "$BIN" --reset-permissions; then
     echo "macOS accepted the permission reset"

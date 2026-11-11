@@ -3,6 +3,32 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.5.1] - 2026-11-10
+
+### Updates
+- **Edgehop tells you when there's a new version**: it checks GitHub soon
+  after it starts and every 6 hours, and shows a desktop notification (once per
+  version), a banner at the top of its window, and (on Linux) an *Update to
+  Edgehop x.y.z* entry in the tray menu.
+- **Update now** downloads the new version, checks it against the SHA-256 that
+  GitHub publishes for the file, installs it and restarts Edgehop:
+  - Windows runs the installer silently (your choices from the first install
+    are kept; no admin prompt) and starts Edgehop again in the tray.
+  - macOS swaps Edgehop.app for the new one and reopens it; its permissions
+    carry over.
+  - Linux installs the new .deb or .rpm (asks for your password) and restarts.
+    The login-screen service restarts on the new version too. Installs from
+    the tarball get a link to the download page.
+- Settings → Updates: switch the check off, *Check now*, and a link to all
+  releases. The tray menu has *Check for updates* too. Downloads use the
+  system's own curl (or wget), so its certificates and proxy settings apply.
+- From a terminal: `edgehop --check-update`, `edgehop --update`.
+
+### Fixes
+- Linux: *Restart Edgehop* (and restarts after a problem) quit instead of
+  restarting when Edgehop was started by the desktop's autostart under systemd
+  (as KDE Plasma 6 does). It now starts the new copy as a systemd unit of its own.
+
 ## [0.5.0] - 2026-11-10
 
 ### Linux: type into the login screen

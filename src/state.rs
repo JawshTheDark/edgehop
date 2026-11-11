@@ -75,6 +75,8 @@ pub struct AppState {
     pub game_mode: Mutex<Option<String>>,
     /// Linux: the tray asked for the window while it was closed.
     open_request: (Mutex<bool>, Condvar),
+    /// The newest release, and checking for / installing it.
+    pub update: Mutex<crate::update::UpdateState>,
 }
 
 impl AppState {
@@ -97,6 +99,7 @@ impl AppState {
             window_open: AtomicBool::new(false),
             tray_shown: AtomicBool::new(false),
             game_mode: Mutex::new(None),
+            update: Mutex::new(Default::default()),
             open_request: (Mutex::new(false), Condvar::new()),
         })
     }

@@ -67,21 +67,79 @@ pub fn kill_child_helpers() {
 /// Last resort: start a fresh edgehop and exit this one.
 pub fn restart_self(reason: &str) -> ! {
     log::error!("restarting Edgehop: {reason}");
+    relaunch()
+}
+
+/// Start the newly installed version in place of this one.
+pub fn restart_after_update(version: &str) -> ! {
+    log::info!("restarting into Edgehop {version}");
+    relaunch()
+}
+
+fn relaunch() -> ! {
     crate::platform::restore_cursor();
-    // Under a systemd service (Restart=on-failure) systemd starts us again;
-    // otherwise launch the new copy ourselves.
-    if std::env::var_os("INVOCATION_ID").is_none() {
-        if let Ok(exe) = std::env::current_exe() {
+    // Under a systemd service that restarts us (Restart=on-failure), systemd
+    // starts us again; otherwise launch the new copy ourselves.
+    if !systemd_restarts_us() {
+        // Linux reports a program replaced by an update as "... (deleted)".
+        if let Some(exe) = crate::update::own_exe() {
             let mut args: Vec<String> =
                 std::env::args().skip(1).filter(|a| a != "--minimized" && a != "--restarting").collect();
             args.push("--minimized".into());
             // The new copy waits for this one to exit (one Edgehop at a time).
             args.push("--restarting".into());
-            let _ = std::process::Command::new(exe).args(&args).spawn();
+            let mut cmd = std::process::Command::new(&exe);
+            // Inside a systemd service that won't restart us (e.g. a desktop's
+            // autostart entry), a child would be stopped along with this one:
+            // start the new copy as a unit of its own.
+            #[cfg(target_os = "linux")]
+            if std::env::var_os("INVOCATION_ID").is_some() && which("systemd-run") {
+                cmd = std::process::Command::new("systemd-run");
+                if unsafe { libc::geteuid() } != 0 {
+                    cmd.arg("--user");
+                }
+                cmd.args(["--collect", "--quiet", "--"]).arg(&exe);
+            }
+            if let Err(e) = cmd.args(&args).spawn() {
+                log::error!("couldn't start Edgehop again ({}): {e}", exe.display());
+            }
         }
     }
     crate::state::flush_logs();
     std::process::exit(75);
+}
+
+#[cfg(target_os = "linux")]
+fn which(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
+}
+
+/// Linux: running as a systemd service that starts us again after exit code 75.
+#[cfg(target_os = "linux")]
+fn systemd_restarts_us() -> bool {
+    if std::env::var_os("INVOCATION_ID").is_none() {
+        return false;
+    }
+    let unit = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|c| c.lines().find_map(|l| l.strip_prefix("0::").map(|p| p.rsplit('/').next().unwrap_or("").to_string())));
+    let Some(unit) = unit.filter(|u| u.ends_with(".service")) else { return false };
+    let mut c = std::process::Command::new("systemctl");
+    if unsafe { libc::geteuid() } != 0 {
+        c.arg("--user");
+    }
+    let restart = c
+        .args(["show", "-p", "Restart", "--value", &unit])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    log::info!("running as systemd unit {unit} (Restart={restart})");
+    matches!(restart.as_str(), "on-failure" | "always")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn systemd_restarts_us() -> bool {
+    false
 }
 
 #[cfg(test)]

@@ -15,15 +15,17 @@ pub fn create(app: Arc<AppState>) -> Option<Tray> {
     let menu = Menu::new();
     let open = MenuItem::new("Open Edgehop", true, None);
     let game = MenuItem::new("Game mode on/off (Scroll Lock)", true, None);
+    let updates = MenuItem::new("Check for updates", true, None);
     let restart = MenuItem::new("Restart Edgehop", true, None);
     let quit = MenuItem::new("Quit Edgehop", true, None);
     menu.append(&open).ok()?;
     menu.append(&game).ok()?;
     menu.append(&PredefinedMenuItem::separator()).ok()?;
+    menu.append(&updates).ok()?;
     menu.append(&restart).ok()?;
     menu.append(&quit).ok()?;
     let (open_id, quit_id, restart_id) = (open.id().clone(), quit.id().clone(), restart.id().clone());
-    let game_id = game.id().clone();
+    let (game_id, updates_id) = (game.id().clone(), updates.id().clone());
 
     let a = app.clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
@@ -31,6 +33,9 @@ pub fn create(app: Arc<AppState>) -> Option<Tray> {
             crate::platform::show_window(&a);
         } else if e.id == game_id {
             a.toggle_game_mode("the tray menu");
+        } else if e.id == updates_id {
+            crate::platform::show_window(&a);
+            crate::update::check_now(&a);
         } else if e.id == restart_id {
             a.stop_engine();
             crate::recovery::restart_self("restart requested from the tray");
@@ -92,6 +97,33 @@ impl ksni::Tray for KTray {
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
+        let newer = crate::state::lk(&self.app.update).release.as_ref().map(|r| (r.version.clone(), r.asset.is_some()));
+        let update_item: ksni::MenuItem<Self> = match newer {
+            Some((v, true)) => StandardItem {
+                label: format!("Update to Edgehop {v}"),
+                activate: Box::new(|t: &mut Self| {
+                    crate::platform::show_window(&t.app);
+                    crate::update::install(&t.app);
+                }),
+                ..Default::default()
+            }
+            .into(),
+            Some((v, false)) => StandardItem {
+                label: format!("Edgehop {v} is available…"),
+                activate: Box::new(|t: &mut Self| crate::platform::show_window(&t.app)),
+                ..Default::default()
+            }
+            .into(),
+            None => StandardItem {
+                label: "Check for updates".into(),
+                activate: Box::new(|t: &mut Self| {
+                    crate::platform::show_window(&t.app);
+                    crate::update::check_now(&t.app);
+                }),
+                ..Default::default()
+            }
+            .into(),
+        };
         vec![
             StandardItem {
                 label: "Open Edgehop".into(),
@@ -106,6 +138,7 @@ impl ksni::Tray for KTray {
             }
             .into(),
             MenuItem::Separator,
+            update_item,
             StandardItem {
                 label: "Restart Edgehop".into(),
                 activate: Box::new(|t: &mut Self| {
@@ -125,11 +158,25 @@ impl ksni::Tray for KTray {
     }
 }
 
+/// Linux: the running tray, to rebuild its menu when something in it changes.
+#[cfg(target_os = "linux")]
+static HANDLE: std::sync::Mutex<Option<ksni::Handle<KTray>>> = std::sync::Mutex::new(None);
+
 #[cfg(target_os = "linux")]
 pub fn create(app: Arc<AppState>) -> Option<Tray> {
     let service = ksni::TrayService::new(KTray { app });
+    *crate::state::lk(&HANDLE) = Some(service.handle());
     service.spawn();
     Some(Tray)
+}
+
+/// The menu shows something new (an update): rebuild it. Linux only; the
+/// other systems' menus don't change.
+pub fn refresh() {
+    #[cfg(target_os = "linux")]
+    if let Some(h) = crate::state::lk(&HANDLE).as_ref() {
+        h.update(|_| {});
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]

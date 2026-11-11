@@ -331,6 +331,7 @@ impl eframe::App for Gui {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     egui::Frame::new().inner_margin(Margin { left: 0, right: 14, top: 4, bottom: 8 }).show(ui, |ui| {
+                        self.update_banner(ui);
                         match self.tab {
                             Tab::Screens => self.screens_tab(ui, &cfg),
                             Tab::Computers => self.computers_tab(ui, &cfg),
@@ -1315,6 +1316,94 @@ impl Gui {
                 );
             }
         });
+        ui.add_space(10.0);
+
+        card(ui, "Updates", "", |ui| {
+            row(ui, "Check for updates", "Looks for a newer Edgehop on GitHub every few hours.", |ui| {
+                let mut on = cfg.check_updates;
+                if toggle(ui, &mut on).changed() {
+                    self.app.update_config(|c| c.check_updates = on);
+                    if on {
+                        crate::update::check_now(&self.app);
+                    }
+                }
+            });
+            let status = lk(&self.app.update).status.clone();
+            let detail = match &status {
+                crate::update::Status::Idle => String::new(),
+                crate::update::Status::Checking => "Checking…".into(),
+                crate::update::Status::UpToDate(_) => "Up to date.".into(),
+                crate::update::Status::Available => "An update is available (see the top of this window).".into(),
+                crate::update::Status::Working(s) => s.clone(),
+                crate::update::Status::Failed(e) => e.clone(),
+            };
+            row(ui, &format!("Edgehop {}", crate::update::current()), &detail, |ui| {
+                let busy = matches!(status, crate::update::Status::Checking | crate::update::Status::Working(_));
+                if ui.add_enabled(!busy, egui::Button::new("Check now")).clicked() {
+                    crate::update::check_now(&self.app);
+                }
+                if ui.link("All releases").clicked() {
+                    crate::update::open_page(crate::update::RELEASES_PAGE);
+                }
+            });
+        });
+    }
+
+    /// A newer Edgehop: say so above everything else, with the Update button.
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
+        use crate::update::Status;
+        let (status, rel) = {
+            let u = lk(&self.app.update);
+            (u.status.clone(), u.release.clone())
+        };
+        let Some(rel) = rel else { return };
+        if !matches!(status, Status::Available | Status::Working(_) | Status::Failed(_)) {
+            return;
+        }
+        let p = palette(ui.visuals().dark_mode);
+        egui::Frame::new()
+            .fill(p.card)
+            .stroke(Stroke::new(1.5_f32, ACCENT))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(Margin::symmetric(14, 10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(format!("Edgehop {} is available", rel.version)).strong());
+                        let line = match &status {
+                            Status::Working(s) => s.clone(),
+                            Status::Failed(e) => e.clone(),
+                            _ => match (&rel.asset, &rel.manual) {
+                                (Some(_), _) => format!("You have {}. Updating takes a few seconds; Edgehop restarts by itself.", crate::update::current()),
+                                (None, Some(why)) => format!("You have {}. Download it from the release page ({why}).", crate::update::current()),
+                                (None, None) => format!("You have {}.", crate::update::current()),
+                            },
+                        };
+                        let color = if matches!(status, Status::Failed(_)) { BAD } else { p.muted };
+                        ui.label(RichText::new(line).small().color(color));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Status::Working(_) = status {
+                            ui.spinner();
+                            ui.ctx().request_repaint_after(Duration::from_millis(200));
+                            return;
+                        }
+                        if rel.asset.is_some() {
+                            let label = if matches!(status, Status::Failed(_)) { "Try again" } else { "Update now" };
+                            if primary_button(ui, label).clicked() {
+                                crate::update::install(&self.app);
+                            }
+                        } else if primary_button(ui, "Download").clicked() {
+                            crate::update::open_page(&rel.page);
+                        }
+                        if ui.link("What's new").clicked() {
+                            crate::update::open_page(&rel.page);
+                        }
+                    });
+                });
+            });
+        ui.add_space(12.0);
     }
 
     fn clipboard_row(&mut self, ui: &mut egui::Ui, cfg: &Config) {

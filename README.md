@@ -129,6 +129,7 @@ the changelog section as its notes.
 | Clipboard | Copy, move to the other screen, paste |
 | Mouse too fast/slow on the client | *Mouse speed on other screens* (server) or *Override screen size* (client) |
 | Keep running | Close the window → it stays in the tray. Tick *Start Edgehop when I log in*. |
+| Updates | Edgehop checks GitHub every few hours and says when there's a new version; **Update now** installs it and restarts (Settings → Updates to switch off or check now) |
 
 **Sharing from a Mac**: allow Edgehop under System Settings → Privacy & Security
 → **Accessibility** (*Device Control and Data Access* on newer macOS; the app
