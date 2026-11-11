@@ -64,7 +64,13 @@ Check 'sign-in task kept' ($null -ne (Get-ScheduledTask -TaskName 'Edgehop' -Err
 Check 'desktop icon kept' (Test-Path (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Edgehop.lnk'))
 
 } catch {
-    Check "the update test ran ($_)" $false
+    # GitHub answers only so many questions an hour from one address, and CI's
+    # runners share theirs: being turned away says nothing about Edgehop.
+    if ("$_" -match '\b(403|429)\b|rate limit') {
+        Write-Host "::warning::The update test couldn't run: GitHub is turning away requests from this runner's address ($_)"
+    } else {
+        Check "the update test ran ($_)" $false
+    }
 }
 if ($env:UPDATE_TEST_OPTIONAL -and $failures.Count -gt $failuresBefore) {
     Write-Host "::warning::The update test failed (not required for a release): $($failures[$failuresBefore..($failures.Count - 1)] -join '; ')"

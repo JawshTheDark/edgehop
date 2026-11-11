@@ -101,7 +101,7 @@ latest=$(curl -fsSL https://api.github.com/repos/JawshTheDark/edgehop/releases/l
     python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')
 upd=$(mktemp -d)
 cp -R "$APP" "$upd/Edgehop.app"
-EDGEHOP_PRETEND_VERSION=0.0.1 "$upd/Edgehop.app/Contents/MacOS/edgehop" --update | tee "$OUT/update.txt" ||
+EDGEHOP_PRETEND_VERSION=0.0.1 "$upd/Edgehop.app/Contents/MacOS/edgehop" --update 2>&1 | tee "$OUT/update.txt" ||
     fail "edgehop --update"
 version() { /usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$upd/Edgehop.app/Contents/Info.plist" 2>/dev/null; }
 for _ in $(seq 90); do
@@ -118,6 +118,13 @@ if pgrep -f "$upd/Edgehop.app" > /dev/null; then echo "the updated Edgehop was o
 pkill -f "$upd/Edgehop.app" 2> /dev/null
 rm -rf "$upd"
 
+# GitHub answers only so many questions an hour from one address, and CI's
+# Macs share theirs with everyone's builds: being turned away (403/429) says
+# nothing about Edgehop.
+if [ "$failures" != "$failures_before" ] && grep -Eq 'returned error: (403|429)' "$OUT/update.txt"; then
+    echo "::warning::The update test couldn't run: GitHub is turning away requests from this runner's address (rate limit)"
+    failures="$failures_before"
+fi
 if [ -n "${UPDATE_TEST_OPTIONAL:-}" ] && [ "$failures" != "$failures_before" ]; then
     echo "::warning::The update test failed (not required for a release)"
     failures="$failures_before"
