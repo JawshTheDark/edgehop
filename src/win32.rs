@@ -627,6 +627,51 @@ pub fn raise_thread_priority() -> bool {
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) != 0 }
 }
 
+#[link(name = "shell32")]
+extern "system" {
+    fn SHQueryUserNotificationState(state: *mut i32) -> i32;
+}
+
+/// The program of the window in front (e.g. "game.exe").
+pub fn foreground_program() -> Option<String> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut name = [0u16; 520];
+        let mut len = name.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, 0, name.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(process);
+        ok.then(|| {
+            let path = String::from_utf16_lossy(&name[..len as usize]);
+            path.rsplit('\\').next().unwrap_or(&path).to_string()
+        })
+    }
+}
+
+/// A fullscreen game or app is in front: Windows' own answer (the one Focus
+/// Assist uses), covering exclusive and borderless fullscreen. Its program name.
+pub fn fullscreen_app() -> Option<String> {
+    const QUNS_BUSY: i32 = 2;
+    const QUNS_RUNNING_D3D_FULL_SCREEN: i32 = 3;
+    const QUNS_PRESENTATION_MODE: i32 = 4;
+    let mut state = 0;
+    if unsafe { SHQueryUserNotificationState(&mut state) } != 0 {
+        return None;
+    }
+    if !matches!(state, QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE) {
+        return None;
+    }
+    Some(foreground_program().unwrap_or_else(|| "a fullscreen app".into()))
+}
+
 /// The window in front, for the log: program, title, and whether it runs as
 /// administrator (a normal app's input hooks don't see input meant for those).
 pub fn foreground_description() -> String {

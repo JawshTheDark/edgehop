@@ -27,6 +27,9 @@ computer whose keyboard you're using is the "server".
 - **Finds itself**: clients discover the server on the LAN; no IP typing.
 - **Edge resistance**, a hidden cursor while you're away, and on KDE Plasma a
   dimmed screen that stays bright while media plays.
+- **Game mode**: the mouse stays put while you play, and on Windows Edgehop's
+  mouse hook steps aside entirely so games get untouched input. Turns on by
+  itself for fullscreen games; Scroll Lock toggles it.
 - **Self-healing**: recovers from hangs, dropped connections and crashes on its own.
 - **Share from** Windows, macOS, or Linux (X11, or KDE Plasma on Wayland).
   **Control** Windows, macOS and Linux (X11 *and* Wayland via `uinput`).
@@ -122,6 +125,7 @@ the changelog section as its notes.
 | | |
 |---|---|
 | Come back | Move the mouse off the opposite edge, or press **Scroll Lock** |
+| Game mode | **Scroll Lock** on the sharing computer (F14 on a Mac), the tray menu, or Settings. On Windows it turns on by itself while a fullscreen game (or video) is in front |
 | Clipboard | Copy, move to the other screen, paste |
 | Mouse too fast/slow on the client | *Mouse speed on other screens* (server) or *Override screen size* (client) |
 | Keep running | Close the window → it stays in the tray. Tick *Start Edgehop when I log in*. |

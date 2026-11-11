@@ -71,6 +71,8 @@ pub struct AppState {
     pub window_open: AtomicBool,
     /// The tray icon is showing (Linux: a tray host is running).
     pub tray_shown: AtomicBool,
+    /// Game mode is on, and why (sharing computer).
+    pub game_mode: Mutex<Option<String>>,
     /// Linux: the tray asked for the window while it was closed.
     open_request: (Mutex<bool>, Condvar),
 }
@@ -94,8 +96,22 @@ impl AppState {
             remote_logs: Mutex::new(std::collections::HashMap::new()),
             window_open: AtomicBool::new(false),
             tray_shown: AtomicBool::new(false),
+            game_mode: Mutex::new(None),
             open_request: (Mutex::new(false), Condvar::new()),
         })
+    }
+
+    /// Game mode on or off by hand (sharing computer).
+    pub fn set_game_mode(&self, on: bool, why: &str) {
+        if let Some(Engine::Server(s)) = lk(&self.engine).as_ref() {
+            s.set_game_mode(on, why);
+        }
+    }
+
+    pub fn toggle_game_mode(&self, why: &str) {
+        if let Some(Engine::Server(s)) = lk(&self.engine).as_ref() {
+            s.toggle_game_mode(why);
+        }
     }
 
     /// Ask for the window (it's closed: the main thread opens it).

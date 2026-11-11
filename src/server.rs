@@ -68,6 +68,9 @@ pub trait Desktop: Send {
     /// The mouse moved to a client (true) or came back (false). Linux grabs
     /// the input devices for itself while a client is active.
     fn captured(&mut self, _remote: bool) {}
+    /// Game mode: stop (false) or resume (true) watching the mouse. Windows
+    /// removes its mouse hook entirely, so games get untouched input.
+    fn set_mouse_capture(&mut self, _on: bool) {}
 }
 
 pub enum ClipJob {
@@ -189,6 +192,15 @@ pub struct Core {
     /// Recent pointer reports that made no sense while away (to notice a storm).
     stale: VecDeque<Instant>,
     stale_reported: Option<Instant>,
+    /// Game mode turned on (Some(true)) or off (Some(false)) by hand; None:
+    /// automatic. Off while a game is in front lasts until that game closes.
+    game_manual: Option<bool>,
+    /// Turn game mode on by itself while a fullscreen app is in front.
+    game_auto_enabled: bool,
+    /// The fullscreen app in front, if any (Windows).
+    game_auto: Option<String>,
+    /// Game mode is on: the mouse stays on this computer.
+    game_on: bool,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -247,6 +259,10 @@ impl Core {
             bounce_reported: None,
             stale: VecDeque::new(),
             stale_reported: None,
+            game_manual: None,
+            game_auto_enabled: true,
+            game_auto: None,
+            game_on: false,
         };
         c.apply_config(cfg);
         c
@@ -259,6 +275,77 @@ impl Core {
         self.resistance = cfg.edge_resistance.min(1000) as f64;
         self.clipboard = cfg.clipboard;
         self.command_is_ctrl = cfg!(target_os = "macos") && cfg.ctrl_is_command;
+        if self.game_auto_enabled != cfg.game_mode_auto {
+            self.game_auto_enabled = cfg.game_mode_auto;
+            self.update_game("the automatic setting changed");
+        }
+    }
+
+    // ---- game mode ----
+
+    fn game_wanted(&self) -> bool {
+        match self.game_manual {
+            Some(on) => on,
+            None => self.game_auto_enabled && self.game_auto.is_some(),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn game_mode_on(&self) -> bool {
+        self.game_on
+    }
+
+    fn update_game(&mut self, why: &str) {
+        let on = self.game_wanted();
+        if on == self.game_on {
+            return;
+        }
+        self.game_on = on;
+        log::info!("game mode {}: {why}", if on { "on" } else { "off" });
+        crate::flight::note("game mode", format!("{} ({why})", if on { "on" } else { "off" }));
+        self.desk.set_mouse_capture(!on);
+        if let Some(app) = &self.app {
+            *lk(&app.game_mode) = on.then(|| why.to_string());
+            app.repaint();
+        }
+    }
+
+    /// Turn game mode on or off by hand (Settings, the tray, Scroll Lock).
+    pub fn set_game_mode(&mut self, on: bool, why: &str) {
+        // "Off" only needs remembering while a game would turn it back on.
+        self.game_manual = if on || self.game_auto.is_some() { Some(on) } else { None };
+        if on && self.is_remote() {
+            self.go_home();
+        }
+        self.update_game(why);
+    }
+
+    pub fn toggle_game_mode(&mut self, why: &str) {
+        let on = !self.game_on;
+        self.set_game_mode(on, why);
+    }
+
+    /// The fullscreen app in front changed (None: there isn't one). Windows
+    /// only, for now.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    pub fn set_fullscreen_app(&mut self, app: Option<String>) {
+        if app == self.game_auto {
+            return;
+        }
+        let closed = self.game_auto.take();
+        self.game_auto = app;
+        let why = match (&self.game_auto, closed) {
+            (Some(name), _) => format!("{name} is fullscreen"),
+            (None, Some(name)) => {
+                // Turned off for that game: back to automatic for the next one.
+                if self.game_manual == Some(false) {
+                    self.game_manual = None;
+                }
+                format!("{name} isn't fullscreen any more")
+            }
+            (None, None) => String::new(),
+        };
+        self.update_game(&why);
     }
 
     pub fn is_remote(&self) -> bool {
@@ -503,6 +590,9 @@ impl Core {
 
     pub fn on_mouse_move(&mut self, x: i32, y: i32) -> bool {
         if !self.is_remote() {
+            if self.game_on {
+                return false; // game mode: the mouse stays here
+            }
             self.track_reentry(x, y);
             let hit = self.edge_hit(x, y);
             if self.local_buttons > 0 {
@@ -779,11 +869,11 @@ impl Core {
             crate::keymap::win_to_evdev(scan, extended, vk),
             self.active
         );
-        if !self.is_remote() {
-            return false;
-        }
         if vk == VK_SCROLL {
             return self.on_evdev_key(KEY_SCROLLLOCK, down);
+        }
+        if !self.is_remote() {
+            return false;
         }
         if let Some(code) = crate::keymap::win_to_evdev(scan, extended, vk) {
             self.on_evdev_key(code, down);
@@ -793,6 +883,13 @@ impl Core {
 
     /// A key as a Linux (evdev) key code: from macOS and Linux capture, and from on_key.
     pub fn on_evdev_key(&mut self, code: u16, down: bool) -> bool {
+        if code == KEY_SCROLLLOCK && !self.is_remote() {
+            // Scroll Lock (F14 on a Mac) on this computer: game mode on/off.
+            if down {
+                self.toggle_game_mode("Scroll Lock");
+            }
+            return true;
+        }
         if !self.is_remote() {
             return false;
         }
@@ -1221,6 +1318,9 @@ impl ServerEngine {
                     while !s.stop.load(Ordering::Relaxed) {
                         thread::sleep(Duration::from_secs(1));
                         let mons = crate::platform::monitor_rects();
+                        // Asked before taking the lock the input hook waits on.
+                        #[cfg(windows)]
+                        let fullscreen = crate::win32::fullscreen_app();
                         let start = Instant::now();
                         let mut core = loop {
                             match s.core.try_lock() {
@@ -1237,6 +1337,8 @@ impl ServerEngine {
                         core.set_monitors(mons);
                         core.ping_all();
                         core.check_responsive();
+                        #[cfg(windows)]
+                        core.set_fullscreen_app(fullscreen);
                         drop(core);
                         if capture::look_lost() && last_rehook.map_or(true, |t| t.elapsed() > Duration::from_secs(10)) {
                             #[cfg(windows)]
@@ -1274,6 +1376,14 @@ impl ServerEngine {
 
     pub fn apply_config(&self, cfg: &Config) {
         lk(&self.shared.core).apply_config(cfg);
+    }
+
+    pub fn set_game_mode(&self, on: bool, why: &str) {
+        lk(&self.shared.core).set_game_mode(on, why);
+    }
+
+    pub fn toggle_game_mode(&self, why: &str) {
+        lk(&self.shared.core).toggle_game_mode(why);
     }
 
     pub fn stop(self) {
@@ -1705,6 +1815,13 @@ mod hooks {
         fn set_cursor_visible(&mut self, visible: bool) {
             crate::platform::set_cursor_visible(visible);
         }
+        fn set_mouse_capture(&mut self, on: bool) {
+            MOUSE_OFF.store(!on, Ordering::Relaxed);
+            let thread = HOOK_THREAD.load(Ordering::Relaxed);
+            if thread != 0 {
+                unsafe { PostThreadMessageW(thread, WM_APP_MOUSE_HOOK, 0, 0) };
+            }
+        }
     }
 
     fn shared() -> Option<Arc<Shared>> {
@@ -1761,9 +1878,17 @@ mod hooks {
     static LAST_MOUSE_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static LAST_KEY_TICK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     const WM_APP_REHOOK: u32 = 0x8000 + 1;
+    /// Install or remove the mouse hook to match MOUSE_OFF (game mode).
+    const WM_APP_MOUSE_HOOK: u32 = 0x8000 + 2;
+    /// Game mode: the mouse hook is removed, so games get untouched input.
+    static MOUSE_OFF: AtomicBool = AtomicBool::new(false);
+    static HOOK_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
     /// Windows saw recent input that our hooks never got: they were removed.
     pub fn look_lost() -> bool {
+        if MOUSE_OFF.load(Ordering::Relaxed) {
+            return false; // game mode: mouse input never reaches us, on purpose
+        }
         let last_hook = LAST_HOOK_TICK.load(Ordering::Relaxed);
         if last_hook == 0 {
             return false;
@@ -1796,7 +1921,15 @@ mod hooks {
 
     unsafe fn install() -> (HANDLE, HANDLE) {
         let hmod = GetModuleHandleW(std::ptr::null());
-        (SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, hmod, 0), SetWindowsHookExW(WH_KEYBOARD_LL, key_proc, hmod, 0))
+        (install_mouse(), SetWindowsHookExW(WH_KEYBOARD_LL, key_proc, hmod, 0))
+    }
+
+    /// The mouse hook, unless game mode has it off (then a null handle).
+    unsafe fn install_mouse() -> HANDLE {
+        if MOUSE_OFF.load(Ordering::Relaxed) {
+            return std::ptr::null_mut();
+        }
+        SetWindowsHookExW(WH_MOUSE_LL, mouse_proc, GetModuleHandleW(std::ptr::null()), 0)
     }
 
     /// Windows only waits so long for a hook: past that it delivers the
@@ -1853,8 +1986,9 @@ mod hooks {
             log::warn!("couldn't raise the input thread's priority");
         }
         unsafe {
+            HOOK_THREAD.store(GetCurrentThreadId(), Ordering::Relaxed);
             let (mut mh, mut kh) = install();
-            if mh.is_null() || kh.is_null() {
+            if (mh.is_null() && !MOUSE_OFF.load(Ordering::Relaxed)) || kh.is_null() {
                 log::error!("SetWindowsHookEx failed");
                 if !mh.is_null() {
                     UnhookWindowsHookEx(mh);
@@ -1870,20 +2004,41 @@ mod hooks {
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
                 if msg.message == WM_APP_REHOOK {
-                    UnhookWindowsHookEx(mh);
+                    if !mh.is_null() {
+                        UnhookWindowsHookEx(mh);
+                    }
                     UnhookWindowsHookEx(kh);
                     (mh, kh) = install();
-                    if mh.is_null() || kh.is_null() {
+                    if (mh.is_null() && !MOUSE_OFF.load(Ordering::Relaxed)) || kh.is_null() {
                         log::error!("reinstalling input hooks failed");
+                    }
+                    continue;
+                }
+                if msg.message == WM_APP_MOUSE_HOOK {
+                    let off = MOUSE_OFF.load(Ordering::Relaxed);
+                    if off && !mh.is_null() {
+                        UnhookWindowsHookEx(mh);
+                        mh = std::ptr::null_mut();
+                        log::info!("game mode: mouse hook removed; the mouse goes straight to Windows");
+                    } else if !off && mh.is_null() {
+                        mh = install_mouse();
+                        if mh.is_null() {
+                            log::error!("couldn't put the mouse hook back after game mode");
+                        } else {
+                            log::info!("mouse hook back");
+                        }
                     }
                     continue;
                 }
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            UnhookWindowsHookEx(mh);
+            if !mh.is_null() {
+                UnhookWindowsHookEx(mh);
+            }
             UnhookWindowsHookEx(kh);
         }
+        HOOK_THREAD.store(0, Ordering::Relaxed);
         *lk(&ACTIVE) = None;
         log::info!("input capture stopped");
     }
@@ -2032,6 +2187,75 @@ mod tests {
             sent.iter().any(|m| matches!(m, ToClient::Move { x: 1519, y: 1013 })),
             "pinned in the bottom-right corner"
         );
+    }
+
+    #[test]
+    fn game_mode_keeps_the_mouse_here() {
+        let (mut core, rx, _) = setup(true);
+        core.set_game_mode(true, "test");
+        assert!(!core.on_mouse_move(960, 1079), "pushing the edge passes through");
+        assert!(!core.on_mouse_move(960, 1085));
+        assert_eq!(core.active, "pc", "and the mouse stays on the PC");
+        assert!(rx.try_recv().is_err(), "nothing goes to the Surface");
+        core.set_game_mode(false, "test");
+        assert!(core.on_mouse_move(960, 1079));
+        assert_eq!(core.active, "surface");
+    }
+
+    #[test]
+    fn scroll_lock_toggles_game_mode_here_and_goes_home_from_away() {
+        let (mut core, rx, _) = setup(true);
+        assert!(core.on_key(0x91, 0x46, false, true), "Scroll Lock here is Edgehop's");
+        assert!(core.game_mode_on());
+        core.on_key(0x91, 0x46, false, false);
+        core.on_key(0x91, 0x46, false, true);
+        assert!(!core.game_mode_on(), "pressed again: off");
+        // On the other computer it still brings the mouse home (no game mode).
+        core.on_mouse_move(960, 1079);
+        let _ = enter_pos(&rx);
+        core.on_key(0x91, 0x46, false, true);
+        assert_eq!(core.active, "pc");
+        assert!(!core.game_mode_on());
+    }
+
+    #[test]
+    fn fullscreen_games_turn_game_mode_on_by_themselves() {
+        let (mut core, _rx, _) = setup(true);
+        core.set_fullscreen_app(Some("game.exe".into()));
+        assert!(core.game_mode_on());
+        // Turned off for this game...
+        core.toggle_game_mode("Scroll Lock");
+        assert!(!core.game_mode_on());
+        core.set_fullscreen_app(Some("game.exe".into()));
+        assert!(!core.game_mode_on(), "stays off while that game runs");
+        // ...and back to automatic once it closes.
+        core.set_fullscreen_app(None);
+        core.set_fullscreen_app(Some("other.exe".into()));
+        assert!(core.game_mode_on(), "the next game turns it on again");
+        core.set_fullscreen_app(None);
+        assert!(!core.game_mode_on());
+    }
+
+    #[test]
+    fn a_game_starting_doesnt_pull_the_mouse_back() {
+        let (mut core, rx, _) = setup(true);
+        core.on_mouse_move(960, 1079);
+        let _ = enter_pos(&rx);
+        core.set_fullscreen_app(Some("video.exe".into()));
+        assert_eq!(core.active, "surface", "still on the Surface");
+    }
+
+    #[test]
+    fn a_storm_of_nonsense_positions_is_reported() {
+        let (mut core, rx, _) = setup(true);
+        assert!(core.on_mouse_move(960, 1079));
+        let _ = enter_pos(&rx);
+        for i in 0..STALE_STORM - 1 {
+            core.on_mouse_move(3000 + i as i32, 2000);
+        }
+        assert!(core.stale_reported.is_none(), "a few are normal right after crossing");
+        core.on_mouse_move(3100, 2000);
+        assert!(core.stale_reported.is_some(), "this many in 2 s is reported as an error");
     }
 
     #[test]

@@ -3,6 +3,25 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.4.0] - 2026-11-10
+
+### Game mode
+- **The mouse stays on the sharing computer**: edges don't lead anywhere, so
+  whipping the mouse around in a game can't land you on another screen.
+- **On Windows, Edgehop's mouse hook steps aside completely** while game mode
+  is on: games get raw, untouched mouse input with nothing in between (no added
+  latency, nothing for anti-cheat to notice). The keyboard hook stays, for the
+  toggle key.
+- **Turns on by itself** while a fullscreen game, video or presentation is in
+  front (Windows' own fullscreen detection, as Focus Assist uses), and off
+  again when it closes. It never pulls the mouse back from another computer.
+  Settings → Game mode → *Turn on for fullscreen games* switches this off.
+- **Scroll Lock** on the sharing computer turns it on and off (F14 on a Mac
+  keyboard). Pressed during a fullscreen game, it stays off until that game
+  closes. Scroll Lock on another computer still brings the mouse home.
+- Also in the tray menu and in Settings; a *Game mode* pill in the header
+  says when it's on and why, and every change is logged with the reason.
+
 ## [0.3.0] - 2026-11-10
 
 ### Windows installer

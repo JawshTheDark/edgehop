@@ -383,6 +383,10 @@ impl Gui {
                         (true, false, _) => (WARN, "Connecting".to_string()),
                     };
                     pill(ui, color, &label);
+                    if let Some(why) = lk(&self.app.game_mode).clone() {
+                        pill(ui, ACCENT, "Game mode");
+                        ui.label(RichText::new(why).small().color(p.muted));
+                    }
                     if running && cfg.role == Role::Server {
                         let active = lk(&self.app.active_screen).clone();
                         if !active.is_empty() {
@@ -1064,6 +1068,39 @@ impl Gui {
                             }
                         },
                     );
+                });
+                ui.add_space(10.0);
+                card(ui, "Game mode", "", |ui| {
+                    let now = lk(&self.app.game_mode).clone();
+                    row(
+                        ui,
+                        "Game mode",
+                        "The mouse stays on this computer, and Edgehop's mouse hook steps aside so games get \
+                         untouched input. Scroll Lock (F14 on a Mac) turns it on and off.",
+                        |ui| {
+                            let mut on = now.is_some();
+                            if toggle(ui, &mut on).changed() {
+                                self.app.set_game_mode(on, if on { "turned on in Settings" } else { "turned off in Settings" });
+                            }
+                        },
+                    );
+                    if cfg!(windows) {
+                        row(
+                            ui,
+                            "Turn on for fullscreen games",
+                            "Also fullscreen videos and presentations; off again when they close. You can still \
+                             leave with Scroll Lock.",
+                            |ui| {
+                                let mut auto = cfg.game_mode_auto;
+                                if toggle(ui, &mut auto).changed() {
+                                    self.app.update_config(|c| c.game_mode_auto = auto);
+                                }
+                            },
+                        );
+                    }
+                    if let Some(why) = now {
+                        ui.label(RichText::new(format!("On: {why}")).small().color(p.muted));
+                    }
                 });
                 ui.add_space(10.0);
                 if cfg!(target_os = "macos") {

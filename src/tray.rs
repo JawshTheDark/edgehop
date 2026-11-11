@@ -14,18 +14,23 @@ pub fn create(app: Arc<AppState>) -> Option<Tray> {
 
     let menu = Menu::new();
     let open = MenuItem::new("Open Edgehop", true, None);
+    let game = MenuItem::new("Game mode on/off (Scroll Lock)", true, None);
     let restart = MenuItem::new("Restart Edgehop", true, None);
     let quit = MenuItem::new("Quit Edgehop", true, None);
     menu.append(&open).ok()?;
+    menu.append(&game).ok()?;
     menu.append(&PredefinedMenuItem::separator()).ok()?;
     menu.append(&restart).ok()?;
     menu.append(&quit).ok()?;
     let (open_id, quit_id, restart_id) = (open.id().clone(), quit.id().clone(), restart.id().clone());
+    let game_id = game.id().clone();
 
     let a = app.clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         if e.id == open_id {
             crate::platform::show_window(&a);
+        } else if e.id == game_id {
+            a.toggle_game_mode("the tray menu");
         } else if e.id == restart_id {
             a.stop_engine();
             crate::recovery::restart_self("restart requested from the tray");
@@ -91,6 +96,12 @@ impl ksni::Tray for KTray {
             StandardItem {
                 label: "Open Edgehop".into(),
                 activate: Box::new(|t: &mut Self| crate::platform::show_window(&t.app)),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Game mode on/off (Scroll Lock)".into(),
+                activate: Box::new(|t: &mut Self| t.app.toggle_game_mode("the tray menu")),
                 ..Default::default()
             }
             .into(),

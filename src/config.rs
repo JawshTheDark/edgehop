@@ -55,6 +55,9 @@ pub struct Config {
     pub screen_override: Option<(i32, i32)>,
     /// Mac: Ctrl from the server's keyboard acts as Command (Ctrl+C copies).
     pub ctrl_is_command: bool,
+    /// Sharing computer: game mode turns on by itself while a fullscreen game
+    /// or app is in front (Windows).
+    pub game_mode_auto: bool,
 }
 
 impl Default for Config {
@@ -82,6 +85,7 @@ impl Default for Config {
             trusted_server: None,
             screen_override: None,
             ctrl_is_command: cfg!(target_os = "macos"),
+            game_mode_auto: true,
         }
     }
 }
