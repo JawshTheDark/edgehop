@@ -344,8 +344,81 @@ pub fn tap_loop(sink: Sink, ready: mpsc::Sender<usize>, stop: Arc<AtomicBool>) {
 }
 
 /// The server's input capture thread.
+/// While the mouse is on another computer, the Mac's own (hidden) pointer
+/// still moves. Movement for the other screen comes from macOS's per-event
+/// deltas, which are exact as long as Edgehop isn't moving the pointer
+/// itself. Only when the hidden pointer nears a screen edge (where it would
+/// stop, and could trigger hot corners or the Dock) is it put back in the
+/// middle; the event right after that is measured from where it was put. On
+/// real hardware some macOS versions don't keep a pointer moved this way:
+/// that's detected, logged as an error, and parking is turned off.
+#[derive(Default)]
+struct Parker {
+    /// Where we last put the pointer, if the next event hasn't arrived yet.
+    pending: Option<(i32, i32)>,
+    /// Warps that didn't stick, in a row.
+    failed: u32,
+    /// Parking turned off: macOS doesn't keep the pointer where we put it.
+    off: bool,
+    was_away: bool,
+}
+
+/// Re-centre once the hidden pointer is this close to an edge of the main display.
+const PARK_MARGIN: i32 = 250;
+
+impl Parker {
+    /// Movement for the other screen from this event.
+    fn motion(&mut self, x: i32, y: i32, dx: i32, dy: i32) -> (i32, i32) {
+        let Some((tx, ty)) = self.pending.take() else { return (dx, dy) };
+        // macOS's delta for this event counts our warp as movement: measure
+        // from where we put the pointer instead, if it stayed there.
+        // Fixed slack: macOS's delta can't be trusted here (it may count the warp).
+        const SLACK: i32 = 200;
+        if (x - tx).abs() <= SLACK && (y - ty).abs() <= SLACK {
+            self.failed = 0;
+            crate::flight::rec("mac parked", "x y tx ty ok", &[x as i64, y as i64, tx as i64, ty as i64, 1]);
+            return (x - tx, y - ty);
+        }
+        self.failed += 1;
+        crate::flight::rec("mac parked", "x y tx ty ok", &[x as i64, y as i64, tx as i64, ty as i64, 0]);
+        log::error!(
+            "macOS didn't keep the pointer where Edgehop put it: put at ({tx}, {ty}), next event at ({x}, {y}) \
+             with macOS delta ({dx}, {dy}) ({} in a row)",
+            self.failed
+        );
+        if self.failed >= 3 && !self.off {
+            self.off = true;
+            log::error!(
+                "macOS keeps ignoring Edgehop moving the pointer; it won't park the hidden pointer any more \
+                 (movement still works; the hidden pointer may touch screen edges while you're on another computer)"
+            );
+            std::thread::spawn(|| crate::flight::log_dump("macOS isn't keeping the parked pointer"));
+        }
+        (0, 0)
+    }
+
+    /// Put the hidden pointer back in the middle if it's near an edge (or
+    /// just left for another computer).
+    fn maybe_park(&mut self, x: i32, y: i32, entering: bool) {
+        if self.off {
+            return;
+        }
+        let b = unsafe { CGDisplayBounds(CGMainDisplayID()) };
+        let (l, t) = (b.origin.x as i32, b.origin.y as i32);
+        let (r, bt) = (l + b.size.width as i32, t + b.size.height as i32);
+        let near_edge = x < l + PARK_MARGIN || x >= r - PARK_MARGIN || y < t + PARK_MARGIN || y >= bt - PARK_MARGIN;
+        if entering || near_edge {
+            let (cx, cy) = main_display_center();
+            if warp(cx, cy) {
+                self.pending = Some((cx, cy));
+            }
+        }
+    }
+}
+
 pub fn run(s: Arc<Shared>, ready: mpsc::Sender<usize>, _drags: mpsc::Sender<Vec<String>>) {
     let stop = s.stop.clone();
+    let mut parker = Parker::default();
     let sink: Sink = Box::new(move |input| {
         if s.stop.load(Ordering::Relaxed) {
             return false;
@@ -353,13 +426,30 @@ pub fn run(s: Arc<Shared>, ready: mpsc::Sender<usize>, _drags: mpsc::Sender<Vec<
         let Some(mut core) = try_core(&s) else { return false };
         match input {
             Input::Move { x, y, dx, dy } => {
-                // Position, never macOS's delta fields: those count our own
-                // warps (parking the pointer) as movement, which flung the
-                // pointer back and forth between screens. While away, the
-                // switching logic measures how far the pointer got from the
-                // parked spot, like on Windows, and drops bogus jumps.
-                log::trace!("pointer at ({x}, {y}), macOS delta ({dx}, {dy})");
-                core.on_mouse_move(x, y)
+                let away = core.is_remote();
+                if !away {
+                    parker.was_away = false;
+                    parker.pending = None;
+                    let took = core.on_mouse_move(x, y);
+                    if core.is_remote() {
+                        // Just left for another computer from here.
+                        parker.was_away = true;
+                        parker.maybe_park(x, y, true);
+                    }
+                    return took;
+                }
+                let (mx, my) = parker.motion(x, y, dx, dy);
+                let (cx, cy) = core.desk.center();
+                crate::flight::rec("mac away", "x y mx my", &[x as i64, y as i64, mx as i64, my as i64]);
+                let took = core.on_mouse_move(cx + mx, cy + my);
+                if core.is_remote() {
+                    parker.maybe_park(x, y, !parker.was_away);
+                    parker.was_away = true;
+                } else {
+                    parker.was_away = false;
+                    parker.pending = None;
+                }
+                took
             }
             Input::Button { button, down } => core.on_button(button, down),
             Input::Wheel { dx, dy } => core.on_wheel(dx, dy),
@@ -396,11 +486,46 @@ pub fn main_display_center() -> (i32, i32) {
     ((b.origin.x + b.size.width / 2.0) as i32, (b.origin.y + b.size.height / 2.0) as i32)
 }
 
-pub fn warp(x: i32, y: i32) {
-    unsafe {
-        CGWarpMouseCursorPosition(CGPoint { x: x as f64 + 0.5, y: y as f64 + 0.5 });
-        // Without this, macOS ignores the mouse for a quarter second after a warp.
-        CGAssociateMouseAndMouseCursorPosition(1);
+/// Move the pointer without generating events. Returns whether macOS says it
+/// did; failures are logged (with macOS's error code) and recorded.
+pub fn warp(x: i32, y: i32) -> bool {
+    no_pause_after_warp();
+    let err = unsafe { CGWarpMouseCursorPosition(CGPoint { x: x as f64 + 0.5, y: y as f64 + 0.5 }) };
+    let now = pointer();
+    crate::flight::rec("mac warp", "x y err at_x at_y", &[x as i64, y as i64, err as i64, now.0 as i64, now.1 as i64]);
+    if err != 0 {
+        log::error!("macOS refused to move the pointer to ({x}, {y}): CGWarpMouseCursorPosition error {err}");
+        return false;
+    }
+    if (now.0 - x).abs() > 2 || (now.1 - y).abs() > 2 {
+        log::error!("asked macOS to move the pointer to ({x}, {y}); it's at ({}, {})", now.0, now.1);
+        return false;
+    }
+    true
+}
+
+/// macOS normally ignores the real mouse for a quarter of a second after a
+/// warp. Turn that off once (the old global switch, looked up at run time;
+/// otherwise the per-warp re-association trick).
+fn no_pause_after_warp() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    static FALLBACK: AtomicBool = AtomicBool::new(false);
+    DONE.call_once(|| unsafe {
+        let f = libc::dlsym(libc::RTLD_DEFAULT, c"CGSetLocalEventsSuppressionInterval".as_ptr());
+        if f.is_null() {
+            log::warn!("CGSetLocalEventsSuppressionInterval isn't available; re-associating after each warp instead");
+            FALLBACK.store(true, Ordering::Relaxed);
+        } else {
+            let f: extern "C" fn(f64) -> i32 = std::mem::transmute(f);
+            let err = f(0.0);
+            log::info!("pointer pause after warps turned off (CGSetLocalEventsSuppressionInterval -> {err})");
+        }
+    });
+    if FALLBACK.load(Ordering::Relaxed) {
+        let err = unsafe { CGAssociateMouseAndMouseCursorPosition(1) };
+        if err != 0 {
+            log::warn!("CGAssociateMouseAndMouseCursorPosition error {err}");
+        }
     }
 }
 
@@ -441,12 +566,16 @@ fn allow_hiding_in_background() {
 
 pub fn set_pointer_visible(visible: bool) {
     allow_hiding_in_background();
-    unsafe {
+    let err = unsafe {
         if visible {
-            CGDisplayShowCursor(CGMainDisplayID());
+            CGDisplayShowCursor(CGMainDisplayID())
         } else {
-            CGDisplayHideCursor(CGMainDisplayID());
+            CGDisplayHideCursor(CGMainDisplayID())
         }
+    };
+    crate::flight::rec("mac cursor", "visible err", &[visible as i64, err as i64]);
+    if err != 0 {
+        log::error!("macOS refused to {} the pointer: error {err}", if visible { "show" } else { "hide" });
     }
 }
 
@@ -458,9 +587,13 @@ impl Desktop for MacDesktop {
         main_display_center()
     }
     fn set_cursor(&mut self, x: i32, y: i32) {
-        if pointer() != (x, y) {
-            warp(x, y);
+        // Parking at the centre while away is decided by the Parker above,
+        // from the events themselves; this only places the pointer when the
+        // mouse comes back.
+        if (x, y) == main_display_center() || pointer() == (x, y) {
+            return;
         }
+        warp(x, y);
     }
     fn cursor(&self) -> (i32, i32) {
         pointer()
@@ -478,5 +611,33 @@ impl Drop for MacDesktop {
         if self.hidden {
             set_pointer_visible(true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Parker;
+
+    #[test]
+    fn movement_comes_from_macos_deltas_until_the_pointer_is_parked() {
+        let mut p = Parker::default();
+        assert_eq!(p.motion(900, 500, 3, -2), (3, -2));
+        // Parked at the centre: the next event's delta counts the warp, so
+        // measure from where the pointer was put instead.
+        p.pending = Some((1720, 720));
+        assert_eq!(p.motion(1725, 718, 1930, 36), (5, -2));
+        assert_eq!(p.motion(1730, 718, 5, 0), (5, 0), "back to deltas after that");
+    }
+
+    #[test]
+    fn parking_turns_off_when_macos_ignores_it() {
+        let mut p = Parker::default();
+        for _ in 0..3 {
+            p.pending = Some((1720, 720));
+            // The hidden pointer is still out by the edge: the warp didn't stick.
+            assert_eq!(p.motion(3439, 600, 2000, -100), (0, 0), "a bogus jump is dropped");
+        }
+        assert!(p.off, "after three misses Edgehop stops parking");
+        assert_eq!(p.motion(3439, 610, 0, 10), (0, 10), "and keeps using macOS's deltas");
     }
 }

@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "edgehop"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "arboard",
  "base64",

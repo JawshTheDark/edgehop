@@ -3,6 +3,24 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.2.7] - 2026-11-10
+
+### Sharing from a Mac
+- Fixes the pointer "swooping" and most movement being lost while on the other
+  computer (seen on macOS 27). Edgehop kept moving the Mac's hidden pointer
+  back to the middle of the screen, macOS didn't keep it there, and every
+  report then looked like a huge jump and was thrown away. Movement now comes
+  from macOS's own per-event movement, and the hidden pointer is only put back
+  in the middle when it nears a screen edge. Edgehop checks that each move
+  stuck; if macOS keeps ignoring them, it stops trying and says so.
+
+### Errors in the log
+- Every macOS pointer call is checked: a refused or ignored move or hide is
+  logged as an error with macOS's error code and where the pointer really is.
+- On any computer, 20 or more nonsense pointer reports within 2 seconds is
+  logged as one error explaining what's happening, with the input flight
+  recorder, instead of a page of "ignoring stale mouse position" lines.
+
 ## [0.2.6] - 2026-11-10
 
 ### Windows

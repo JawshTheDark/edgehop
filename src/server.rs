@@ -186,6 +186,9 @@ pub struct Core {
     /// When the pointer last switched screens (to notice it bouncing).
     switches: VecDeque<Instant>,
     bounce_reported: Option<Instant>,
+    /// Recent pointer reports that made no sense while away (to notice a storm).
+    stale: VecDeque<Instant>,
+    stale_reported: Option<Instant>,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -194,6 +197,8 @@ const VK_SCROLL: u32 = 0x91;
 /// this far from it, or for this long.
 const REENTRY_PX: i32 = 6;
 const REENTRY_TIME: Duration = Duration::from_millis(500);
+/// This many nonsense pointer reports within 2 s means parking isn't working.
+const STALE_STORM: usize = 20;
 /// This many switches within the window looks like the pointer bouncing.
 const BOUNCE_SWITCHES: usize = 6;
 const BOUNCE_WINDOW: Duration = Duration::from_secs(3);
@@ -240,6 +245,8 @@ impl Core {
             reentry: None,
             switches: VecDeque::new(),
             bounce_reported: None,
+            stale: VecDeque::new(),
+            stale_reported: None,
         };
         c.apply_config(cfg);
         c
@@ -546,7 +553,28 @@ impl Core {
         // far from the parked spot is stale (from before parking): re-park, skip.
         let limit = if self.parked { 600 } else { 200 };
         if dx.abs() > limit || dy.abs() > limit {
-            log::info!("ignoring stale mouse position ({x}, {y}); parked at ({cx0}, {cy0})");
+            let now = Instant::now();
+            self.stale.push_back(now);
+            while self.stale.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(2)) {
+                self.stale.pop_front();
+            }
+            if self.stale.len() <= 3 {
+                log::info!("ignoring stale mouse position ({x}, {y}); parked at ({cx0}, {cy0})");
+            } else {
+                log::debug!("ignoring stale mouse position ({x}, {y}); parked at ({cx0}, {cy0})");
+            }
+            if self.stale.len() >= STALE_STORM && self.stale_reported.map_or(true, |t| now.duration_since(t) > Duration::from_secs(60)) {
+                self.stale_reported = Some(now);
+                log::error!(
+                    "{} pointer reports in 2 s were far from where the pointer was parked at ({cx0}, {cy0}), \
+                     latest ({x}, {y}): this computer isn't keeping the pointer parked, so movement on {} is being dropped",
+                    self.stale.len(),
+                    self.active
+                );
+                let _ = thread::Builder::new()
+                    .name("flight-dump".into())
+                    .spawn(|| crate::flight::log_dump("pointer reports keep making no sense"));
+            }
             crate::flight::rec("stale", "x y dx dy limit", &[x as i64, y as i64, dx as i64, dy as i64, limit as i64]);
             self.desk.set_cursor(cx0, cy0);
             return true;
