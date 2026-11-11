@@ -74,6 +74,7 @@ fn ctrl_is_command() -> bool {
 
 /// The key to hold with C or V to copy or paste on this computer, as sent to
 /// [`Injector::key`]: Ctrl, except on a Mac (Command, which is Ctrl when Ctrl acts as Command).
+#[cfg_attr(target_os = "macos", allow(dead_code))] // a Mac reads the drag pasteboard instead
 pub fn copy_modifier() -> u16 {
     if cfg!(target_os = "macos") && !ctrl_is_command() {
         125
@@ -191,7 +192,7 @@ pub mod linux {
     impl Device {
         fn open(name: &str, product: u16, setup: impl FnOnce(libc::c_int)) -> Result<Device, String> {
             let path = CString::new("/dev/uinput").unwrap();
-            let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
             if fd < 0 {
                 return Err(format!(
                     "Can't open /dev/uinput ({}). Install the edgehop package (it adds a udev rule), \
@@ -307,7 +308,14 @@ pub mod linux {
 
     impl Injector for Uinput {
         fn screen_size(&self) -> (i32, i32) {
-            (self.w, self.h)
+            // Asked again at each connection: the resolution or the monitors
+            // may have changed since Edgehop started.
+            let (w, h) = detect_screen();
+            if w > 0 && h > 0 {
+                (w, h)
+            } else {
+                (self.w, self.h)
+            }
         }
         fn set_screen_size(&mut self, w: i32, h: i32) {
             if w > 0 && h > 0 {
@@ -623,6 +631,8 @@ mod macos {
         buttons: [bool; 6],
         flags: u64,
         last_click: (u8, Instant, i64),
+        /// Where that click was: a second click somewhere else isn't a double-click.
+        last_click_at: CGPoint,
         wheel: WheelAcc,
     }
 
@@ -641,6 +651,7 @@ mod macos {
                 buttons: [false; 6],
                 flags: 0,
                 last_click: (0, Instant::now() - Duration::from_secs(10), 0),
+                last_click_at: CGPoint { x: 0.0, y: 0.0 },
                 wheel: WheelAcc::default(),
             })
         }
@@ -692,8 +703,10 @@ mod macos {
             }
             if down {
                 let (lb, lt, n) = self.last_click;
-                let count = if lb == button && lt.elapsed() < Duration::from_millis(450) { n + 1 } else { 1 };
+                let near = (self.pos.x - self.last_click_at.x).abs() <= 4.0 && (self.pos.y - self.last_click_at.y).abs() <= 4.0;
+                let count = if lb == button && near && lt.elapsed() < Duration::from_millis(450) { n + 1 } else { 1 };
                 self.last_click = (button, Instant::now(), count);
+                self.last_click_at = self.pos;
             }
             let e = unsafe { CGEventCreateMouseEvent(std::ptr::null(), kind, self.pos, btn) };
             if !e.is_null() {
@@ -705,7 +718,8 @@ mod macos {
         fn wheel(&mut self, dx: i32, dy: i32) {
             let (nx, ny) = self.wheel.add(dx, dy);
             if nx != 0 || ny != 0 {
-                let e = unsafe { CGEventCreateScrollWheelEvent2(std::ptr::null(), 1, 2, ny, nx, 0) };
+                // Quartz: positive is up, and *left*; on the wire positive is right.
+                let e = unsafe { CGEventCreateScrollWheelEvent2(std::ptr::null(), 1, 2, ny, -nx, 0) };
                 self.post(e);
             }
         }

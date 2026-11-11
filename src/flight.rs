@@ -52,6 +52,26 @@ pub fn rec(what: &'static str, fields: &'static str, v: &[i64]) {
     push(Entry { ms: now_ms(), what, fields, v: vals, text: String::new() });
 }
 
+/// Keys that type something (letters, digits, punctuation, space, the number
+/// pad), by Linux key code. The recorder notes *that* one was pressed, never
+/// which: it ends up in logs and in diagnostics reports people share, and
+/// would otherwise hold whatever was typed, passwords included. Modifiers,
+/// function keys and navigation keys keep their codes: they're what switching
+/// problems are about.
+pub fn types_text(evdev: u16) -> bool {
+    matches!(evdev, 2..=13 | 16..=27 | 30..=41 | 43..=53 | 55 | 57 | 71..=83 | 86 | 98)
+}
+
+/// The key code to record: 0 for keys that type something.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn key_id(evdev: u16) -> i64 {
+    if types_text(evdev) {
+        0
+    } else {
+        evdev as i64
+    }
+}
+
 /// Record a decision or rare event, in words.
 pub fn note(what: &'static str, text: impl Into<String>) {
     push(Entry { ms: now_ms(), what, fields: "", v: [0; 5], text: text.into() });

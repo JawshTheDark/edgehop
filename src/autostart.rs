@@ -1,8 +1,13 @@
 //! "Start at login" for each OS.
 
 pub fn set(enabled: bool) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // (Linux calls a program replaced by an update "... (deleted)".)
+    let exe = crate::update::own_exe().ok_or("can't tell where Edgehop is")?;
     let exe = exe.to_string_lossy().to_string();
+    if enabled && exe.contains("/AppTranslocation/") {
+        // macOS is running a temporary copy; that path is gone after a restart.
+        return Err("move Edgehop.app to your Applications folder and open it from there first".into());
+    }
     imp(enabled, &exe)
 }
 
@@ -99,9 +104,14 @@ fn imp(enabled: bool, exe: &str) -> Result<(), String> {
     let file = dir.join("edgehop.desktop");
     if enabled {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        // Under systemd: as a user service, so it's restarted if it ever dies.
+        let run = if std::path::Path::new("/run/systemd/system").exists() {
+            format!("systemd-run --user --collect --unit=edgehop -p Restart=on-failure -p RestartSec=2 \"{exe}\" --minimized")
+        } else {
+            format!("\"{exe}\" --minimized")
+        };
         let body = format!(
-            // Run as a systemd user service so it's restarted if it ever dies.
-            "[Desktop Entry]\nType=Application\nName=Edgehop\nExec=systemd-run --user --collect --unit=edgehop -p Restart=on-failure -p RestartSec=2 {exe} --minimized\nIcon=edgehop\nX-GNOME-Autostart-enabled=true\n"
+            "[Desktop Entry]\nType=Application\nName=Edgehop\nExec={run}\nIcon=edgehop\nX-GNOME-Autostart-enabled=true\n"
         );
         std::fs::write(&file, body).map_err(|e| e.to_string())
     } else {

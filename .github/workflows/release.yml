@@ -49,6 +49,7 @@ jobs:
         shell: pwsh
         run: |
           ./packaging/windows/build-installer.ps1
+          $env:UPDATE_TEST_OPTIONAL = '1'
           ./packaging/windows/test-installer.ps1
       - uses: actions/upload-artifact@v4
         with:
@@ -130,7 +131,7 @@ jobs:
         run: UNIVERSAL=1 bash packaging/macos/build-app.sh
       - name: Smoke test the app (launch, clipboard, pointer, keyboard)
         run: |
-          if [ -f packaging/macos/smoke-test.sh ]; then bash packaging/macos/smoke-test.sh; fi
+          if [ -f packaging/macos/smoke-test.sh ]; then UPDATE_TEST_OPTIONAL=1 bash packaging/macos/smoke-test.sh; fi
       - name: Upload macOS screenshots and logs
         if: always()
         uses: actions/upload-artifact@v4

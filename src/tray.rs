@@ -53,6 +53,7 @@ pub fn create(app: Arc<AppState>) -> Option<Tray> {
     let icon = Icon::from_rgba(crate::icon::rgba(32), 32, 32).ok()?;
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
         .with_tooltip("Edgehop")
         .with_icon(icon)
         .build()

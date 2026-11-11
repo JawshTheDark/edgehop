@@ -12,7 +12,7 @@ use crate::win32::*;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::Duration;
 
 #[repr(C)]
@@ -150,7 +150,9 @@ const LWA_ALPHA: u32 = 2;
 static HWND: AtomicIsize = AtomicIsize::new(0);
 /// Files found in the current drag were already reported.
 static REPORTED: AtomicBool = AtomicBool::new(false);
-static SINK: OnceLock<Mutex<Sender<Vec<String>>>> = OnceLock::new();
+/// Where to report what a drag carries: the engine running now (it changes
+/// each time sharing is restarted).
+static SINK: Mutex<Option<Sender<Vec<String>>>> = Mutex::new(None);
 
 unsafe extern "system" fn qi(this: *mut DropTarget, iid: *const GUID, out: *mut *mut c_void) -> i32 {
     if same(&*iid, &IID_IUNKNOWN) || same(&*iid, &IID_IDROPTARGET) {
@@ -195,8 +197,8 @@ unsafe extern "system" fn drag_enter(_t: *mut DropTarget, data: *mut IDataObject
     *effect = DROPEFFECT_COPY;
     if !REPORTED.swap(true, Ordering::SeqCst) {
         log::info!("drag reached the edge carrying {} item(s)", files.len());
-        if let Some(tx) = SINK.get() {
-            let _ = crate::state::lk(tx).send(files);
+        if let Some(tx) = SINK.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = tx.send(files);
         }
     }
     S_OK
@@ -232,7 +234,7 @@ unsafe extern "system" fn wndproc(hwnd: HANDLE, msg: u32, w: usize, l: isize) ->
 
 /// Create the drop-target window. Must run on the input thread (it has a message loop).
 pub fn init(sink: Sender<Vec<String>>) {
-    let _ = SINK.set(Mutex::new(sink));
+    *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
     unsafe {
         let hr = OleInitialize(std::ptr::null_mut());
         if hr < 0 {

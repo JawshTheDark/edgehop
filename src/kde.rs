@@ -66,6 +66,11 @@ const POINTER_SCRIPT: &str = r#"// edgehop: report the pointer when it reaches a
 
 pub type PointerFn = Box<dyn Fn(i32, i32) + Send + Sync>;
 static POINTER: Mutex<Option<PointerFn>> = Mutex::new(None);
+/// Where "which window is under the pointer" answers go: the current Kde.
+/// The D-Bus service itself is published once per run; a second one (after
+/// sharing restarts) would only queue for the name and never be called.
+static WINDOW_REPLIES: Mutex<Option<mpsc::Sender<WinInfo>>> = Mutex::new(None);
+static SERVE: std::sync::Once = std::sync::Once::new();
 
 #[derive(Debug, Clone)]
 pub struct WinInfo {
@@ -112,16 +117,16 @@ impl Kde {
         let conn = Connection::new_session().map_err(|e| log::warn!("KDE hooks off: no session bus: {e}")).ok()?;
 
         let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("kde-dbus".into())
-            .spawn(move || loop {
+        *lk(&WINDOW_REPLIES) = Some(tx);
+        SERVE.call_once(|| {
+            let _ = std::thread::Builder::new().name("kde-dbus".into()).spawn(move || loop {
                 // If the session bus drops us (e.g. after a Plasma restart), publish again.
-                if let Err(e) = serve(tx.clone()) {
+                if let Err(e) = serve() {
                     log::warn!("KDE hooks: can't publish {SERVICE}: {e}; retrying");
                 }
                 std::thread::sleep(Duration::from_secs(3));
-            })
-            .ok()?;
+            });
+        });
 
         let script = crate::files::received_root().with_file_name("edgehop-window-at.js");
         if let Some(dir) = script.parent() {
@@ -365,17 +370,19 @@ fn displays(conn: &Connection) -> Vec<String> {
 }
 
 /// Publish org.edgehop.Client so the KWin script can report back.
-fn serve(tx: mpsc::Sender<WinInfo>) -> Result<(), dbus::Error> {
+fn serve() -> Result<(), dbus::Error> {
     let c = Connection::new_session()?;
     c.request_name(SERVICE, false, true, false)?;
     let mut cr = dbus_crossroads::Crossroads::new();
-    let iface = cr.register(SERVICE, |b: &mut dbus_crossroads::IfaceBuilder<mpsc::Sender<WinInfo>>| {
+    let iface = cr.register(SERVICE, |b: &mut dbus_crossroads::IfaceBuilder<()>| {
         b.method(
             "WindowAt",
             ("class", "caption", "pid", "desktop"),
             (),
-            |_, tx, (class, caption, _pid, desktop): (String, String, String, String)| {
-                let _ = tx.send(WinInfo { class, caption, desktop: desktop == "1" });
+            |_, _, (class, caption, _pid, desktop): (String, String, String, String)| {
+                if let Some(tx) = lk(&WINDOW_REPLIES).as_ref() {
+                    let _ = tx.send(WinInfo { class, caption, desktop: desktop == "1" });
+                }
                 Ok(())
             },
         );
@@ -386,7 +393,7 @@ fn serve(tx: mpsc::Sender<WinInfo>) -> Result<(), dbus::Error> {
             Ok(())
         });
     });
-    cr.insert("/", &[iface], tx);
+    cr.insert("/", &[iface], ());
     cr.serve(&c)
 }
 

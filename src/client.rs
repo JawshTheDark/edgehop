@@ -15,6 +15,8 @@ use std::thread;
 use std::time::Duration;
 
 pub struct ClientEngine {
+    /// The client thread has finished (held keys released, "away" undone).
+    done: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     current: Arc<Mutex<Option<TcpStream>>>,
 }
@@ -23,6 +25,13 @@ pub struct ClientEngine {
 /// The login-screen service sets this while the signed-in user's own Edgehop
 /// runs: don't connect (the server would take the connection from theirs).
 pub static STAND_DOWN: AtomicBool = AtomicBool::new(false);
+/// Keyboard and mouse only: no clipboard, no files, no logs, no pairing. Set
+/// by the login-screen service, which runs as root: a server must never be
+/// able to make it read or write files.
+pub static INPUT_ONLY: AtomicBool = AtomicBool::new(false);
+/// `--accept-pairing` (for a computer with no screen to click on): trust the
+/// first server that answers, as every client did before 0.6.
+pub static ACCEPT_PAIRING: AtomicBool = AtomicBool::new(false);
 
 struct Liveness {
     /// `recovery::now_ms()` when the loop last handled a message.
@@ -37,22 +46,34 @@ impl ClientEngine {
         let current = Arc::new(Mutex::new(None));
         let live = Arc::new(Liveness { progress: AtomicU64::new(now_ms()), connected: AtomicBool::new(false) });
         let (st, cur, lv) = (stop.clone(), current.clone(), live.clone());
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
         thread::Builder::new()
             .name("client".into())
-            .spawn(move || run(app, st, cur, lv))
+            .spawn(move || {
+                run(app, st, cur, lv);
+                d.store(true, Ordering::Relaxed);
+            })
             .expect("spawn client thread");
         let (st, cur) = (stop.clone(), current.clone());
         thread::Builder::new()
             .name("client-watchdog".into())
             .spawn(move || watchdog(st, cur, live))
             .expect("spawn watchdog");
-        ClientEngine { stop, current }
+        ClientEngine { stop, current, done }
     }
 
     pub fn stop(self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(s) = lk(&self.current).take() {
             let _ = s.shutdown(Shutdown::Both);
+        }
+        // Give the client thread a moment to let go of held keys and undo
+        // "away" (hidden pointer, dimmed screen): callers often exit right
+        // after this, and those would otherwise be left as they are.
+        let start = std::time::Instant::now();
+        while !self.done.load(Ordering::Relaxed) && start.elapsed() < Duration::from_millis(2500) {
+            thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -132,12 +153,18 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
         );
         inject::set_key_fix(fix);
     }
-    let mut injector = match inject::create() {
-        Ok(i) => i,
-        Err(e) => {
-            log::error!("{e}");
-            app.set_status(e, false);
-            return;
+    let mut injector = loop {
+        match inject::create() {
+            Ok(i) => break i,
+            Err(e) => {
+                log::error!("{e}");
+                app.set_status(e, false);
+                // It may come good (a device node appearing at boot, a permission granted).
+                sleep_unless_stopped(&stop, Duration::from_secs(10));
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
         }
     };
     // Keys and buttons we pressed on this computer; released whenever a
@@ -148,7 +175,11 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
             sleep_unless_stopped(&stop, Duration::from_millis(500));
             continue;
         }
-        let result = session(&app, &stop, &current, injector.as_mut(), hooks.as_deref(), &away_tx, &mut held, &live);
+        // A crash in here must still release what's held, below.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session(&app, &stop, &current, injector.as_mut(), hooks.as_deref(), &away_tx, &mut held, &live)
+        }))
+        .unwrap_or_else(|_| Err(io::Error::other("the connection handler crashed")));
         live.connected.store(false, Ordering::Relaxed);
         for k in held.keys.drain() {
             injector.key(k, false);
@@ -170,9 +201,16 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
             }
         };
         *lk(&app.pairing_code) = None;
+        *lk(&app.pair_with) = None;
         *lk(&current) = None;
         let _ = away_tx.send(None);
         sleep_unless_stopped(&stop, wait);
+    }
+    // Stopping: undo "away" here and now (the helper thread may not get to it
+    // before the program exits).
+    drop(away_tx);
+    if let Some(h) = &hooks {
+        crate::recovery::guard("desktop hooks", || h.back());
     }
 }
 
@@ -324,6 +362,31 @@ fn session(
     }
     *lk(&app.key_mismatch) = None;
 
+    // A computer this one hasn't paired with gets nothing until the user
+    // says so *here*, having compared the code on both screens. The code
+    // comes from this connection's own handshake, never from the other side:
+    // a computer in the middle would make the two screens show different
+    // codes. Until then nothing it sends is acted on: anything on the network
+    // can answer a search and claim to be the server.
+    let mut confirmed = cfg.trusted_server.is_some();
+    let mut welcomed: Option<String> = None;
+    if !confirmed {
+        if INPUT_ONLY.load(Ordering::Relaxed) {
+            return Err(io::Error::other("not paired with this server (pair in Edgehop first)"));
+        }
+        let who = lk(&app.discovered)
+            .iter()
+            .find(|d| d.addr == addr)
+            .map(|d| format!("{} ({})", d.info.name, addr.ip()))
+            .unwrap_or_else(|| addr.to_string());
+        *lk(&app.pair_answer) = ACCEPT_PAIRING.load(Ordering::Relaxed).then_some(true);
+        *lk(&app.pair_with) = Some(who.clone());
+        *lk(&app.pairing_code) = Some(code.clone());
+        log::info!("{who} isn't paired with this computer yet; pairing code {code}");
+        app.set_status(format!("Pair with {who}? Check that it shows code {code}"), false);
+        app.attention();
+    }
+
     let (w, h) = cfg.screen_override.unwrap_or_else(|| inj.screen_size());
     inj.set_screen_size(w, h);
     if cfg.screen_override.is_none() && cfg.last_screen != Some((w, h)) {
@@ -340,7 +403,14 @@ fn session(
     // 3. Pairing (if new) then the event loop. The sender is shared with
     // background threads that answer drags and stream files.
     let tx = Arc::new(Mutex::new(tx));
-    rx.set_read_timeout(None)?;
+    // Pairing waits for people (the server gives up after 3 minutes); a
+    // paired server answers at once.
+    rx.set_read_timeout(Some(Duration::from_secs(if confirmed { 20 } else { 200 })))?;
+    // What the last drag off this screen carried: the only files the server
+    // may then ask for.
+    let grabbed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    #[cfg(target_os = "macos")]
+    let mut drag_count = crate::mac_files::drag_change_count();
     let dialer = Dialer { addr, key: cfg.private_key_bytes(), server_key: remote_key.clone() };
     let Held { keys, buttons } = held;
     // Shared with the background clipboard threads.
@@ -348,15 +418,78 @@ fn session(
     let mut server_name = String::from("server");
 
     loop {
-        let msg = rx.recv::<ToClient>()?;
+        let mut msg = match rx.recv::<ToClient>() {
+            Ok(m) => m,
+            // A message this version doesn't know (a newer Edgehop on the server).
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                log::debug!("the server sent a message this version doesn't understand: {e}");
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         live.progress.store(now_ms(), Ordering::Relaxed);
         if !matches!(msg, ToClient::Ping | ToClient::Move { .. }) {
             log::trace!("<- {}", crate::proto::brief(&msg));
         }
+        if !confirmed {
+            match *lk(&app.pair_answer) {
+                Some(true) => confirmed = true,
+                Some(false) => {
+                    *lk(&app.pairing_code) = None;
+                    app.set_status("Pairing cancelled", false);
+                    return Ok(Duration::from_secs(15));
+                }
+                None => {}
+            }
+            if !confirmed {
+                match msg {
+                    ToClient::Ping => lk(&tx).send(&ToServer::Pong)?,
+                    ToClient::PairRejected => {
+                        *lk(&app.pairing_code) = None;
+                        app.set_status("The server declined pairing", false);
+                        return Ok(Duration::from_secs(15));
+                    }
+                    ToClient::Welcome { server_name: n } => {
+                        app.set_status(format!("{n} approved. Check the code and click Pair on this computer"), false);
+                        app.attention();
+                        welcomed = Some(n);
+                    }
+                    // Its copy of the code is not to be shown: ours is the one that counts.
+                    _ => {}
+                }
+                continue;
+            }
+            // Just confirmed here. If the server already welcomed us, that counts now.
+            if let Some(n) = welcomed.take() {
+                if matches!(msg, ToClient::Ping) {
+                    lk(&tx).send(&ToServer::Pong)?;
+                }
+                msg = ToClient::Welcome { server_name: n };
+            } else if !matches!(msg, ToClient::Welcome { .. } | ToClient::PairRejected | ToClient::Ping) {
+                app.set_status("Waiting for approval on the server", false);
+                continue;
+            }
+        }
+        if INPUT_ONLY.load(Ordering::Relaxed) {
+            match msg {
+                ToClient::FilesGrab => {
+                    lk(&tx).send(&ToServer::FilesGrabbed { files: Vec::new() })?;
+                    continue;
+                }
+                ToClient::FilesSend { .. }
+                | ToClient::OpenData { .. }
+                | ToClient::ClipboardFiles { .. }
+                | ToClient::DropOffer { .. }
+                | ToClient::Clipboard { .. }
+                | ToClient::ClipboardImage { .. }
+                | ToClient::GetLogs
+                | ToClient::SetLogLevel { .. } => continue,
+                _ => {}
+            }
+        }
         match msg {
-            ToClient::PairPending { code: c } => {
-                *lk(&app.pairing_code) = Some(c.clone());
-                app.set_status(format!("Waiting for approval on the server — code {c}"), false);
+            ToClient::PairPending { .. } => {
+                app.set_status("Waiting for approval on the server", false);
             }
             ToClient::PairRejected => {
                 *lk(&app.pairing_code) = None;
@@ -365,6 +498,7 @@ fn session(
             }
             ToClient::Welcome { server_name: n } => {
                 *lk(&app.pairing_code) = None;
+                *lk(&app.pair_with) = None;
                 server_name = n.clone();
                 if app.cfg().trusted_server.as_ref().map(|t| &t.key) != Some(&remote_key) {
                     let (n2, k) = (n.clone(), remote_key.clone());
@@ -390,6 +524,11 @@ fn session(
             ToClient::Button { button, down } => {
                 if down {
                     buttons.insert(button);
+                    // Mac: a drag that starts after this press changes the drag pasteboard.
+                    #[cfg(target_os = "macos")]
+                    if button == crate::proto::BTN_LEFT {
+                        drag_count = crate::mac_files::drag_change_count();
+                    }
                 } else {
                     buttons.remove(&button);
                 }
@@ -515,34 +654,68 @@ fn session(
                 });
             }
             ToClient::FilesGrab => {
-                // A drag here was pushed off the edge. Cancel it in the file
-                // manager (Esc) and copy the selection it was dragging (Ctrl+C).
-                if let Some(false) = hooks.and_then(|h| h.drag_source_ok()) {
-                    log::info!("drag off the edge isn't from a file manager; not carrying it");
-                    lk(&tx).send(&ToServer::FilesGrabbed { files: Vec::new() })?;
-                    continue;
-                }
-                let probe = crate::clipboard::Probe::start();
-                // Esc cancels the drag; give the file manager a moment, then Ctrl+C.
-                inj.key(1, true);
-                inj.key(1, false);
-                thread::sleep(Duration::from_millis(200));
-                let modifier = inject::copy_modifier();
-                for (code, down) in [(modifier, true), (46, true), (46, false), (modifier, false)] {
-                    inj.key(code, down);
-                }
-                let tx2 = tx.clone();
-                thread::spawn(move || {
-                    let found = probe.files();
-                    probe.restore();
-                    let files: Vec<String> =
-                        found.unwrap_or_default().iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                lk(&grabbed).clear();
+                // Mac: the drag pasteboard says what the drag carries; nothing
+                // needs typing into whatever app the drag came from.
+                #[cfg(target_os = "macos")]
+                {
+                    let files: Vec<String> = if crate::mac_files::drag_change_count() != drag_count {
+                        crate::mac_files::drag_files().iter().map(|p| p.to_string_lossy().into_owned()).collect()
+                    } else {
+                        Vec::new()
+                    };
                     log::info!("drag off the edge carries {} item(s)", files.len());
-                    let _ = lk(&tx2).send(&ToServer::FilesGrabbed { files });
-                });
+                    if !files.is_empty() {
+                        // Esc cancels the drag here; it carries on on the other computer.
+                        inj.key(1, true);
+                        inj.key(1, false);
+                    }
+                    *lk(&grabbed) = files.clone();
+                    lk(&tx).send(&ToServer::FilesGrabbed { files })?;
+                }
+                // Elsewhere: cancel the drag in the file manager (Esc) and copy
+                // the selection it was dragging (Ctrl+C).
+                #[cfg(not(target_os = "macos"))]
+                {
+                    if let Some(false) = hooks.and_then(|h| h.drag_source_ok()) {
+                        log::info!("drag off the edge isn't from a file manager; not carrying it");
+                        lk(&tx).send(&ToServer::FilesGrabbed { files: Vec::new() })?;
+                        continue;
+                    }
+                    let probe = crate::clipboard::Probe::start();
+                    // Esc cancels the drag; give the file manager a moment, then Ctrl+C.
+                    inj.key(1, true);
+                    inj.key(1, false);
+                    thread::sleep(Duration::from_millis(200));
+                    let modifier = inject::copy_modifier();
+                    for (code, down) in [(modifier, true), (46, true), (46, false), (modifier, false)] {
+                        inj.key(code, down);
+                    }
+                    let (tx2, grabbed2) = (tx.clone(), grabbed.clone());
+                    thread::spawn(move || {
+                        let found = probe.files();
+                        probe.restore();
+                        let files: Vec<String> =
+                            found.unwrap_or_default().iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                        log::info!("drag off the edge carries {} item(s)", files.len());
+                        *lk(&grabbed2) = files.clone();
+                        let _ = lk(&tx2).send(&ToServer::FilesGrabbed { files });
+                    });
+                }
             }
             ToClient::FilesSend { paths } => {
                 // A drag from here was dropped on the server: offer the files.
+                // Only what that drag carried: the server names the paths, and
+                // must not be able to ask for any file it likes.
+                let carried = std::mem::take(&mut *lk(&grabbed));
+                let asked = paths.len();
+                let paths: Vec<String> = paths.into_iter().filter(|p| carried.contains(p)).collect();
+                if paths.len() != asked {
+                    log::warn!("{server_name} asked for {} file(s) that weren't in the drag; not sending those", asked - paths.len());
+                }
+                if paths.is_empty() {
+                    continue;
+                }
                 let (tx2, me) = (tx.clone(), cfg.name.clone());
                 thread::spawn(move || {
                     let paths: Vec<std::path::PathBuf> = paths.into_iter().map(Into::into).collect();
@@ -626,7 +799,10 @@ fn session(
                     let dest = folder.clone().unwrap_or_else(transfer::new_drop_dir);
                     match fetch_from_server(&app2, &d, &manifest, &dest) {
                         Ok(paths) => {
-                            crate::clipboard::set_files(&paths);
+                            // In a folder already: leave the clipboard alone.
+                            if folder.is_none() {
+                                crate::clipboard::set_files(&paths);
+                            }
                             transfer::mark_received(&paths);
                             let msg = match &folder {
                                 Some(dir) => format!("{} dropped into {}", manifest.describe(), dir.display()),

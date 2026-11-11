@@ -176,6 +176,17 @@ extern "system" {
     pub fn GetProcAddress(module: HANDLE, name: *const u8) -> *mut c_void;
 }
 
+#[link(name = "user32")]
+extern "system" {
+    fn GetAsyncKeyState(vk: i32) -> i16;
+}
+
+/// Is any mouse button physically down right now?
+pub fn any_mouse_button_down() -> bool {
+    // VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2
+    [1, 2, 4, 5, 6].iter().any(|&vk| unsafe { GetAsyncKeyState(vk) } < 0)
+}
+
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

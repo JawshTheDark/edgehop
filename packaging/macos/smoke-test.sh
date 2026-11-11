@@ -94,6 +94,9 @@ fi
 pkill -x edgehop
 
 step "Update from inside Edgehop to the newest published release (pretending to be 0.0.1)"
+# Needs GitHub's API and the last release's files: a release build sets
+# UPDATE_TEST_OPTIONAL so trouble there can't block shipping a fix.
+failures_before="$failures"
 latest=$(curl -fsSL https://api.github.com/repos/JawshTheDark/edgehop/releases/latest |
     python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))')
 upd=$(mktemp -d)
@@ -114,6 +117,11 @@ sleep 5
 if pgrep -f "$upd/Edgehop.app" > /dev/null; then echo "the updated Edgehop was opened"; else echo "(the updated Edgehop isn't running)"; fi
 pkill -f "$upd/Edgehop.app" 2> /dev/null
 rm -rf "$upd"
+
+if [ -n "${UPDATE_TEST_OPTIONAL:-}" ] && [ "$failures" != "$failures_before" ]; then
+    echo "::warning::The update test failed (not required for a release)"
+    failures="$failures_before"
+fi
 
 step "Reset permissions (what the button in the app runs)"
 if "$BIN" --reset-permissions; then

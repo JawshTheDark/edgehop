@@ -3,6 +3,104 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.6.0] - 2026-11-11
+
+A full review of the code: what it found, fixed.
+
+### Pairing and security
+- **Pairing is confirmed on both computers.** A computer that hadn't paired
+  yet used to trust whichever "server" answered first on the network, with no
+  question asked, and act on its keyboard and mouse at once. Now it shows
+  *Pair with …?* and the code, and does nothing a new computer sends until you
+  click **The codes match: pair** there (and approve it on the sharing
+  computer, as before). The code shown is worked out from the connection
+  itself, not sent by the other side, so a computer in the middle can't make
+  both screens agree. For a computer with no screen to click on:
+  `edgehop --accept-pairing`.
+- **A server can only ask for the files you dragged.** A client would offer
+  any path the server named. It now only sends what the drag it just reported
+  was carrying.
+- **The login-screen service (Linux) only types.** It runs as root; it now
+  ignores everything to do with files, the clipboard and logs, uses the
+  settings of the account that switched it on (not whichever account's file
+  is newest), reads that file without following links or waiting on pipes,
+  and stands by if those settings stop being a paired client's. Switching it
+  on from Settings records whose settings to use (`edgehop --login-service
+  on`). Removing the package stops and disables it.
+- A computer can no longer take over another's name (and with it its place
+  on the desktop and its connection): a second computer with the same name
+  gets a name of its own.
+- The settings file (it holds this computer's private key) is saved readable
+  by you only, and written safely (complete on disk before it replaces the
+  old one, one save at a time).
+- Limits on what an unpaired computer can make the sharing computer do: small
+  first message, a handful of pairing requests at once, one per address.
+- File transfers check that the sizes add up before setting space aside,
+  refuse absurd sizes, piece requests and image dimensions, and never write
+  over or into an existing file.
+- The input recorder no longer notes *which* letter, digit or punctuation key
+  was pressed, only that one was: recorder dumps go into logs and diagnostics
+  reports. Modifier and function keys keep their codes.
+- The updater refuses a download GitHub publishes no checksum for, only
+  accepts plain version numbers, and uses Windows' own `curl.exe`.
+
+### Keys and buttons
+- **Right Shift on a Windows keyboard** now reaches the other computer
+  (Windows reports it differently from its scancode table; it was dropped).
+- **A key held while the mouse crosses** is released on both computers.
+  Before, the computer you left never saw the release (Ctrl, Shift or Alt
+  stuck down there until pressed again). On a Linux sharing computer the
+  keyboard itself is made to report the release, which works on every
+  desktop.
+- **Game mode turning on by itself no longer strands the mouse.** If a
+  fullscreen app came to the front on the sharing computer while the mouse
+  was on another, Windows stopped watching the mouse: the pointer over there
+  froze. It now waits until the mouse is back.
+- **A mouse-button release Windows never told Edgehop about** (after a click
+  in an administrator's window) no longer stops the pointer leaving the
+  screen until Edgehop is restarted.
+- Holding Scroll Lock toggles once, not on every repeat.
+- Linux sharing computer: releases lost when the system drops input events
+  are made up for; a keyboard that reappears under another device's old path
+  is picked up; a monitor query can no longer stall the input thread.
+- Mac client: horizontal scrolling went the wrong way; two quick clicks in
+  different places are no longer a double-click; dragging files off a Mac
+  client reads the drag itself and types nothing into the app.
+
+### Things that stopped working after a restart of sharing
+- Dragging files from a Windows sharing computer, the folder under the
+  pointer on KDE, and game mode's switch all kept talking to the previous
+  run of the engine after Stop/Start, a rename or a failed update.
+
+### Settings and files
+- **A damaged settings file is kept, not silently replaced.** A typo from
+  editing by hand, a half-written file after a power cut or a file from a
+  newer version used to reset Edgehop to a new identity with no pairings, and
+  save over the old file. It's now set aside as `config.json.bad-…` and the
+  log says so.
+- *Screen size override* is saved and applied (edits were shown but never
+  kept).
+- A screen to the left of or above a monitor stays attached when its size
+  changes (it could drift out of reach).
+- A failed file transfer leaves no full-size, half-empty files behind; files
+  with names that collide on the receiving computer are refused; the
+  clipboard keeps a copied picture when a drag is checked for files.
+- Old received files are cleared out every few hours, not only at startup.
+
+### Starting, stopping, updating
+- Quitting, logging out or shutting down releases held keys, shows the
+  pointer and undoes screen dimming first (Edgehop used to exit before the
+  client had done so).
+- Windows: if the tray isn't ready when Edgehop starts hidden at sign-in, it
+  waits for it instead of ending up with no window and no icon; a left click
+  on the tray icon opens the window without also opening the menu.
+- Linux and macOS: two copies started in the same instant can't both run.
+- Updating from the single-file Windows `.exe` ends with the installed
+  Edgehop running (it used to end with nothing running).
+- The update banner stays up when a later check can't reach GitHub.
+- A newer or older Edgehop on the other side no longer drops the connection
+  over a message this version doesn't know.
+
 ## [0.5.3] - 2026-11-11
 
 ### Fixes

@@ -32,6 +32,10 @@ $running = Get-Process edgehop -ErrorAction SilentlyContinue
 Write-Host "info  Edgehop running after a silent install: $([bool]$running)"
 
 Write-Host '== Updating from inside Edgehop to the newest published release (pretending to be 0.0.1)'
+# This part needs GitHub's API and the last release's files: a release build
+# sets UPDATE_TEST_OPTIONAL so trouble there can't block shipping a fix.
+$failuresBefore = $failures.Count
+try {
 $latest = (Invoke-RestMethod 'https://api.github.com/repos/JawshTheDark/edgehop/releases/latest' -Headers @{ 'User-Agent' = 'edgehop-ci' }).tag_name.TrimStart('v')
 # Edgehop's log: the installer should start Edgehop again after updating.
 $log = Join-Path $env:LOCALAPPDATA 'edgehop\cache\edgehop.log'
@@ -58,6 +62,14 @@ Check "the installer started Edgehop again after the update (running: $running, 
 if (Test-Path $log) { Write-Host '-- end of edgehop.log:'; Get-Content $log -Tail 8 | ForEach-Object { Write-Host "   $_" } }
 Check 'sign-in task kept' ($null -ne (Get-ScheduledTask -TaskName 'Edgehop' -ErrorAction SilentlyContinue))
 Check 'desktop icon kept' (Test-Path (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Edgehop.lnk'))
+
+} catch {
+    Check "the update test ran ($_)" $false
+}
+if ($env:UPDATE_TEST_OPTIONAL -and $failures.Count -gt $failuresBefore) {
+    Write-Host "::warning::The update test failed (not required for a release): $($failures[$failuresBefore..($failures.Count - 1)] -join '; ')"
+    $failures = @($failures | Select-Object -First $failuresBefore)
+}
 
 Write-Host '== Uninstalling silently'
 $p = Start-Process (Join-Path $app 'unins000.exe') -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru

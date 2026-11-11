@@ -60,7 +60,7 @@ Filename: "{app}\edgehop.exe"; Parameters: "--autostart off"; Flags: runhidden w
 Filename: "{app}\edgehop.exe"; Parameters: "--firewall on"; StatusMsg: "Allowing Edgehop through Windows Firewall..."; Flags: runhidden shellexec waituntilterminated; Verb: runas; Tasks: firewall
 ; Afterwards: open it (or, for a silent install such as an update, start it in the tray).
 Filename: "{app}\edgehop.exe"; Description: "Open Edgehop"; Flags: postinstall nowait skipifsilent
-Filename: "{app}\edgehop.exe"; Parameters: "--minimized"; Flags: nowait; Check: WizardSilent
+Filename: "{app}\edgehop.exe"; Parameters: "--minimized --restarting"; Flags: nowait; Check: WizardSilent
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/f /im edgehop.exe"; Flags: runhidden; RunOnceId: "StopEdgehop"

@@ -119,16 +119,19 @@ pub fn set_clipboard_files(paths: &[PathBuf]) -> bool {
 
 /// Goes up each time a drag starts.
 pub fn drag_change_count() -> isize {
-    let pb = drag();
-    if pb.is_null() {
-        return -1;
-    }
-    unsafe { msg_send![pb, changeCount] }
+    // In a pool of its own: this runs on long-lived threads, once per click.
+    autoreleasepool(|_| {
+        let pb = drag();
+        if pb.is_null() {
+            return -1;
+        }
+        unsafe { msg_send![pb, changeCount] }
+    })
 }
 
 /// What the current (or last) drag carries.
 pub fn drag_files() -> Vec<PathBuf> {
-    files_on(drag())
+    autoreleasepool(|_| files_on(drag()))
 }
 
 /// Self-test: put files on the drag pasteboard as a Finder drag would.

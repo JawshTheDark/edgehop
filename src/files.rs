@@ -29,12 +29,25 @@ pub fn collect(abs: &Path, rel: String, out: &mut Vec<(PathBuf, String, bool, u6
 pub fn safe_rel(rel: &str) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for part in rel.split('/') {
-        let bad = part.is_empty()
-            || part == "."
-            || part == ".."
-            || part.chars().any(|c| c.is_control() || matches!(c, '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'));
+        let bad = part.is_empty() || part == "." || part == ".." || part.chars().any(|c| c.is_control() || c == '\\');
         if bad {
             return None;
+        }
+        // Characters and names Windows can't have in a file name are fine
+        // elsewhere; here they'd fail the whole transfer (or open a device).
+        if cfg!(windows) {
+            let stem = part.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+            let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+                || (stem.len() == 4
+                    && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                    && stem.as_bytes()[3].is_ascii_digit());
+            if device
+                || part.ends_with('.')
+                || part.ends_with(' ')
+                || part.chars().any(|c| matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+            {
+                return None;
+            }
         }
         out.push(part);
     }

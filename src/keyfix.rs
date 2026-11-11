@@ -189,7 +189,7 @@ fn quoted(s: &str) -> Vec<String> {
 
 fn system_options() -> Vec<String> {
     if let Ok(t) = std::fs::read_to_string("/etc/X11/xorg.conf.d/00-keyboard.conf") {
-        for line in t.lines() {
+        for line in t.lines().filter(|l| !l.trim_start().starts_with('#')) {
             let parts: Vec<&str> = line.split('"').collect();
             if parts.len() >= 4 && parts[1] == "XkbOptions" {
                 return parts[3].split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
@@ -217,14 +217,18 @@ fn keyd() -> Option<(Vec<(u16, u16)>, String)> {
     if !process_running("keyd") {
         return None;
     }
-    let mut text = String::new();
+    // Each file is a configuration of its own, for the keyboards in its own
+    // [ids]: only one that says "all keyboards" applies to Edgehop's.
+    let mut all = (Vec::new(), "no configuration for all keyboards".to_string());
     for e in std::fs::read_dir("/etc/keyd").ok()?.flatten() {
         if e.path().extension().is_some_and(|x| x == "conf") {
-            text.push_str(&std::fs::read_to_string(e.path()).unwrap_or_default());
-            text.push('\n');
+            let (fix, what) = parse_keyd(&std::fs::read_to_string(e.path()).unwrap_or_default());
+            if what.contains("(all keyboards)") {
+                all = (fix, what);
+            }
         }
     }
-    Some(parse_keyd(&text))
+    Some(all)
 }
 
 /// The modifier a keyd action ends up as: 'C', 'M', 'A' or 'S'.

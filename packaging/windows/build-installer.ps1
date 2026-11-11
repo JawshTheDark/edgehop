@@ -18,7 +18,8 @@ if (-not (Test-Path $iscc)) { throw "Inno Setup 6 not found at $iscc" }
 
 New-Item -ItemType Directory -Force dist | Out-Null
 $icon = Join-Path $root 'dist\edgehop.ico'
-& $exe --write-ico $icon
+Start-Process $exe -ArgumentList '--write-ico', "`"$icon`"" -Wait
+if (-not (Test-Path $icon)) { throw "edgehop --write-ico didn't write $icon" }
 & $iscc /Qp "/DAppVersion=$version" "/DExe=$exe" "/DIcon=$icon" "/O$(Join-Path $root 'dist')" packaging\windows\edgehop.iss
 if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
 Write-Host "Built dist\Edgehop-Setup-$version.exe"

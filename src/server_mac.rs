@@ -60,7 +60,6 @@ extern "C" {
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: *mut c_void, mode: *const c_void);
     fn CFRunLoopRunInMode(mode: *const c_void, seconds: f64, return_after_source_handled: bool) -> i32;
-    fn CFRunLoopStop(rl: CFRunLoopRef);
     fn CFRelease(p: *const c_void);
     fn CFStringCreateWithCString(alloc: *const c_void, s: *const std::ffi::c_char, encoding: u32) -> *const c_void;
     static kCFRunLoopCommonModes: *const c_void;
@@ -297,7 +296,7 @@ fn record(input: Input, took: bool) {
         }
         Input::Button { button, down } => crate::flight::rec("mac button", "button down took", &[button as i64, down as i64, t]),
         Input::Wheel { dx, dy } => crate::flight::rec("mac wheel", "dx dy took", &[dx as i64, dy as i64, t]),
-        Input::Key { code, down } => crate::flight::rec("mac key", "code down took", &[code as i64, down as i64, t]),
+        Input::Key { code, down } => crate::flight::rec("mac key", "code down took", &[crate::flight::key_id(code), down as i64, t]),
         Input::Other => crate::flight::rec("mac other", "took", &[t]),
         Input::Gesture(g) => crate::flight::rec("mac gesture", "type took", &[g as i64, t]),
     }
@@ -350,7 +349,7 @@ pub fn tap_loop(sink: Sink, ready: mpsc::Sender<usize>, stop: Arc<AtomicBool>) {
         log::info!("input capture running (Quartz event tap)");
         let _ = ready.send(run_loop as usize);
         while !stop.load(Ordering::Relaxed) {
-            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.5, false);
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);
         }
         CGEventTapEnable(tap, false);
         CFMachPortInvalidate(tap);
@@ -555,11 +554,10 @@ pub fn run(s: Arc<Shared>, ready: mpsc::Sender<usize>, drags: mpsc::Sender<Vec<S
     tap_loop(sink, ready, stop);
 }
 
-pub fn stop(run_loop: usize) {
-    if run_loop != 0 {
-        unsafe { CFRunLoopStop(run_loop as CFRunLoopRef) };
-    }
-}
+/// The tap's loop checks the engine's stop flag ten times a second and ends
+/// by itself. (Stopping its run loop from here could reach a loop that had
+/// already ended, and been freed, in the meantime.)
+pub fn stop(_run_loop: usize) {}
 
 /// macOS re-enables a paused tap through the callback; nothing to watch here.
 pub fn look_lost() -> bool {

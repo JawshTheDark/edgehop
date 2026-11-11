@@ -98,6 +98,10 @@ pub struct Handshaked {
 impl FrameSender {
     pub fn send<T: Serialize>(&mut self, msg: &T) -> io::Result<()> {
         let body = serde_json::to_vec(msg).map_err(err)?;
+        if body.len() > MAX_APP_MSG {
+            // The other side would refuse it and close the connection.
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "message too large to send"));
+        }
         let mut plain = Vec::with_capacity(4 + body.len());
         plain.extend_from_slice(&(body.len() as u32).to_be_bytes());
         plain.extend_from_slice(&body);
@@ -153,14 +157,22 @@ impl FrameReceiver {
     }
 
     pub fn recv<T: DeserializeOwned>(&mut self) -> io::Result<T> {
+        self.recv_limited(MAX_APP_MSG)
+    }
+
+    /// Like `recv`, for a peer not trusted yet: refuse a message over `max`
+    /// bytes before buffering it. A message that arrives whole but isn't one
+    /// this version knows is an `InvalidData` error; the stream stays in step.
+    pub fn recv_limited<T: DeserializeOwned>(&mut self, max: usize) -> io::Result<T> {
         loop {
             if self.pending.len() >= 4 {
                 let n = u32::from_be_bytes(self.pending[..4].try_into().unwrap()) as usize;
-                if n > MAX_APP_MSG {
+                if n > max.min(MAX_APP_MSG) {
                     return Err(err("message too large"));
                 }
                 if self.pending.len() >= 4 + n {
-                    let msg = serde_json::from_slice(&self.pending[4..4 + n]).map_err(err);
+                    let msg = serde_json::from_slice(&self.pending[4..4 + n])
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
                     self.pending.drain(..4 + n);
                     return msg;
                 }
@@ -302,7 +314,9 @@ pub fn discover(wait: Duration) -> Vec<Discovered> {
         if let Ok((n, src)) = sock.recv_from(&mut buf) {
             if let Ok(info) = serde_json::from_slice::<Announce>(&buf[..n]) {
                 let addr = SocketAddr::new(src.ip(), info.port);
-                if !found.iter().any(|d| d.info.key == info.key) {
+                // Per key *and* address: an impostor announcing the real
+                // server's key from its own address must not hide the real one.
+                if found.len() < 32 && !found.iter().any(|d| d.info.key == info.key && d.addr == addr) {
                     found.push(Discovered { addr, info });
                 }
             }
