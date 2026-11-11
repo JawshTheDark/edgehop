@@ -40,6 +40,13 @@ jobs:
           else
             echo "::warning::no uinput module on this $(uname -m) runner; sharing self-test skipped"
           fi
+      # The installer builds, installs everything it should, and uninstalls cleanly.
+      - name: Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./packaging/windows/build-installer.ps1
+          ./packaging/windows/test-installer.ps1
       # The .deb and .rpm build, and the .rpm installs and runs on real Fedora.
       - name: Linux packages
         if: runner.os == 'Linux'

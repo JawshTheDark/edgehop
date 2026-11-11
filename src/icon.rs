@@ -145,3 +145,25 @@ pub fn png(size: u32) -> Vec<u8> {
     chunk(&mut out, b"IEND", &[]);
     out
 }
+
+/// A Windows .ico with the icon at every size Windows asks for (PNG entries).
+pub fn ico() -> Vec<u8> {
+    const SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
+    let images: Vec<Vec<u8>> = SIZES.iter().map(|&s| png(s)).collect();
+    let mut out = vec![0, 0, 1, 0];
+    out.extend_from_slice(&(SIZES.len() as u16).to_le_bytes());
+    let mut offset = 6 + 16 * SIZES.len() as u32;
+    for (&size, image) in SIZES.iter().zip(&images) {
+        let side = if size >= 256 { 0 } else { size as u8 }; // 0 means 256
+        out.extend_from_slice(&[side, side, 0, 0]);
+        out.extend_from_slice(&1u16.to_le_bytes()); // colour planes
+        out.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+        out.extend_from_slice(&(image.len() as u32).to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        offset += image.len() as u32;
+    }
+    for image in &images {
+        out.extend_from_slice(image);
+    }
+    out
+}

@@ -4,7 +4,8 @@ use crate::net::Discovered;
 use crate::{client, server};
 use std::collections::VecDeque;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 pub fn lk<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -66,6 +67,12 @@ pub struct AppState {
     pub transfer: Mutex<Option<TransferStatus>>,
     /// Logs sent by other computers for a diagnostics report.
     pub remote_logs: Mutex<std::collections::HashMap<String, String>>,
+    /// The window is open (on Linux it closes into the tray and opens anew).
+    pub window_open: AtomicBool,
+    /// The tray icon is showing (Linux: a tray host is running).
+    pub tray_shown: AtomicBool,
+    /// Linux: the tray asked for the window while it was closed.
+    open_request: (Mutex<bool>, Condvar),
 }
 
 impl AppState {
@@ -85,7 +92,32 @@ impl AppState {
             engine: Mutex::new(None),
             transfer: Mutex::new(None),
             remote_logs: Mutex::new(std::collections::HashMap::new()),
+            window_open: AtomicBool::new(false),
+            tray_shown: AtomicBool::new(false),
+            open_request: (Mutex::new(false), Condvar::new()),
         })
+    }
+
+    /// Ask for the window (it's closed: the main thread opens it).
+    pub fn request_window(&self) {
+        let (flag, cv) = &self.open_request;
+        *lk(flag) = true;
+        cv.notify_all();
+    }
+
+    /// Block until something asks for the window.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn wait_for_window_request(&self) {
+        let (flag, cv) = &self.open_request;
+        let mut g = lk(flag);
+        while !*g {
+            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        *g = false;
+    }
+
+    pub fn tray_is_shown(&self) -> bool {
+        self.tray_shown.load(Ordering::Relaxed)
     }
 
     pub fn repaint(&self) {
@@ -298,12 +330,34 @@ impl log::Log for Logger {
             Some(tx) => {
                 let _ = tx.send(LogMsg::Line(r.level(), line));
             }
-            None => eprintln!("{line}"),
+            None => print_err(&line),
         }
     }
     fn flush(&self) {
         flush_logs();
     }
+}
+
+/// Write a line to stderr, ignoring failure. (`eprintln!` panics when the
+/// write fails, which is what happens to a program Task Scheduler starts.)
+pub fn print_err(line: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// Copy log lines to stderr only where someone reads it: a terminal, or the
+/// systemd journal. Elsewhere it may be a pipe nobody empties, which would
+/// eventually block.
+/// Why the log file couldn't be opened, if it couldn't.
+static LOG_OPEN_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn log_open_error() -> Option<String> {
+    lk(&LOG_OPEN_ERROR).clone()
+}
+
+fn echo_to_stderr() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal() || std::env::var_os("INVOCATION_ID").is_some()
 }
 
 /// Wait (briefly) until every line logged so far is on disk. Call before exiting.
@@ -337,8 +391,11 @@ fn write_logs(rx: std::sync::mpsc::Receiver<LogMsg>, file: Option<std::fs::File>
                 LogMsg::Flush(done) => waiting.push(done),
             }
         }
+        let echo = echo_to_stderr();
         for l in &lines {
-            eprintln!("{}", l.text);
+            if echo {
+                print_err(&l.text);
+            }
             if size > ROTATE_AT {
                 // Keep one previous file; start a fresh one.
                 if let Some(mut w) = out.take() {
@@ -407,7 +464,13 @@ pub fn init_logger(app: Arc<AppState>, args: &[String]) {
         let _ = std::fs::create_dir_all(dir);
     }
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+    let file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            *lk(&LOG_OPEN_ERROR) = Some(e.to_string());
+            None
+        }
+    };
     let (tx, rx) = std::sync::mpsc::channel();
     if std::thread::Builder::new().name("log-writer".into()).spawn(move || write_logs(rx, file, size)).is_ok() {
         let _ = LOG_TX.set(tx);

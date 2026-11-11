@@ -48,6 +48,7 @@ pub fn create(app: Arc<AppState>) -> Option<Tray> {
         .build()
         .map_err(|e| log::warn!("tray icon unavailable: {e}"))
         .ok()?;
+    log::info!("tray icon ready");
     Some(Tray { _icon: tray })
 }
 
@@ -74,6 +75,15 @@ impl ksni::Tray for KTray {
     }
     fn activate(&mut self, _x: i32, _y: i32) {
         crate::platform::show_window(&self.app);
+    }
+    fn watcher_online(&self) {
+        log::info!("tray icon is showing");
+        self.app.tray_shown.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn watcher_offine(&self) -> bool {
+        log::warn!("the desktop's tray went away; closing the window will quit Edgehop until it's back");
+        self.app.tray_shown.store(false, std::sync::atomic::Ordering::Relaxed);
+        true // keep the service: the tray may come back
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;

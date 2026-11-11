@@ -199,6 +199,8 @@ pub fn run(app: Arc<AppState>, minimized: bool) -> eframe::Result<()> {
     let icon = egui::IconData { rgba: crate::icon::rgba(64), width: 64, height: 64 };
     let mut vp = egui::ViewportBuilder::default()
         .with_title(WINDOW_TITLE)
+        // Wayland/X11: matches edgehop.desktop, so the desktop shows Edgehop's icon.
+        .with_app_id("edgehop")
         .with_inner_size([900.0, 680.0])
         .with_min_inner_size([680.0, 520.0])
         .with_icon(Arc::new(icon));
@@ -206,7 +208,11 @@ pub fn run(app: Arc<AppState>, minimized: bool) -> eframe::Result<()> {
         vp = vp.with_visible(false);
     }
     let options = eframe::NativeOptions { viewport: vp, ..Default::default() };
-    eframe::run_native("edgehop", options, Box::new(move |cc| Ok(Box::new(Gui::new(cc, app, minimized)))))
+    let a = app.clone();
+    let result = eframe::run_native("edgehop", options, Box::new(move |cc| Ok(Box::new(Gui::new(cc, a, minimized)))));
+    app.window_open.store(false, std::sync::atomic::Ordering::Relaxed);
+    *lk(&app.ctx) = None;
+    result
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -241,6 +247,12 @@ struct Gui {
 impl Gui {
     fn new(cc: &eframe::CreationContext<'_>, app: Arc<AppState>, minimized: bool) -> Gui {
         *lk(&app.ctx) = Some(cc.egui_ctx.clone());
+        app.window_open.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Windows: the tray icon now, not on the first frame (a window that
+        // starts hidden in the tray may not draw a frame until it's shown).
+        // Linux: the tray outlives the window and is made at startup.
+        // macOS: on the first frame, once the app is running.
+        let tray = if cfg!(windows) { tray::create(app.clone()) } else { None };
         apply_theme(&cc.egui_ctx);
         let cfg = app.cfg();
         let logo = cc.egui_ctx.load_texture(
@@ -250,8 +262,8 @@ impl Gui {
         );
         Gui {
             app,
-            tray: None,
-            tray_tried: false,
+            tray,
+            tray_tried: !cfg!(target_os = "macos"),
             logo: Some(logo),
             tab: if cfg.role == Role::Server { Tab::Screens } else { Tab::Connection },
             name_edit: cfg.name.clone(),
@@ -294,9 +306,13 @@ impl eframe::App for Gui {
             self.start_minimized = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.tray.is_some() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            platform::hide_window(ctx);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.tray.is_some() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                platform::hide_window(ctx);
+            } else if platform::CLOSE_TO_TRAY && self.app.tray_is_shown() {
+                log::info!("window closed; Edgehop keeps running in the tray");
+            }
         }
 
         let cfg = self.app.cfg();
@@ -1170,9 +1186,9 @@ impl Gui {
             if let Some(m) = &self.message {
                 ui.colored_label(WARN, m);
             }
-            if self.tray.is_some() {
+            if self.tray.is_some() || (platform::CLOSE_TO_TRAY && self.app.tray_is_shown()) {
                 ui.label(
-                    RichText::new(if HIDE_TO_TRAY {
+                    RichText::new(if HIDE_TO_TRAY || platform::CLOSE_TO_TRAY {
                         "Closing the window keeps Edgehop running in the system tray."
                     } else {
                         "Closing the window minimizes it; quit from the tray icon."

@@ -44,6 +44,12 @@ jobs:
           Copy-Item target/release/edgehop.exe, packaging/windows/install.ps1, packaging/windows/uninstall.ps1, README.md $dir
           Compress-Archive -Path $dir -DestinationPath "dist/Edgehop-$env:TAG-windows-x64.zip"
           Copy-Item target/release/edgehop.exe "dist/edgehop-$env:TAG-windows-x64.exe"
+      - name: Installer
+        if: hashFiles('packaging/windows/edgehop.iss') != ''
+        shell: pwsh
+        run: |
+          ./packaging/windows/build-installer.ps1
+          ./packaging/windows/test-installer.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows
@@ -164,7 +170,7 @@ jobs:
           cat >> notes.md <<'EOF'
 
           ### Downloads
-          - **Windows**: `Edgehop-…-windows-x64.zip`. Unzip, then right-click `install.ps1` → *Run with PowerShell*. (Or run the bare `.exe`.)
+          - **Windows**: `Edgehop-Setup-….exe`. Run it: Start menu and desktop icons, starts in the tray when you sign in, uninstall from Apps & Features. (Or the `.zip`, or the bare `.exe`.)
           - **Ubuntu / Debian**: `edgehop_…_amd64.deb` (`arm64` for ARM). `sudo apt install ./edgehop_*.deb`, then log out and back in once.
           - **Fedora**: `edgehop-…x86_64.rpm` (`aarch64` for ARM, e.g. Asahi). `sudo dnf install ./edgehop-*.rpm`, then log out and back in once.
           - **Other Linux**: the `.tar.gz` for your CPU. Unpack it and run `./install.sh`.

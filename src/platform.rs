@@ -9,6 +9,10 @@ pub const WINDOW_TITLE: &str = "Edgehop — keyboard & mouse sharing";
 /// Elsewhere the window minimizes instead (restoring a hidden window is unreliable).
 pub const HIDE_TO_TRAY: bool = cfg!(windows);
 
+/// On Linux the window is closed (not hidden) into the tray, and a new one
+/// opens from the tray icon: hidden windows don't reliably come back there.
+pub const CLOSE_TO_TRAY: bool = cfg!(target_os = "linux");
+
 pub fn init_dpi() {
     #[cfg(windows)]
     unsafe {
@@ -25,7 +29,149 @@ pub fn init_dpi() {
     }
 }
 
+/// Proof that this is the only Edgehop running (held for the whole run).
+pub struct InstanceGuard {
+    #[cfg(windows)]
+    _mutex: crate::win32::HANDLE,
+    #[cfg(unix)]
+    listener: Option<std::os::unix::net::UnixListener>,
+}
+
+/// Claim "the one Edgehop running". If another copy has it, ask that one to
+/// show its window and return None. `restarting`: we're replacing ourselves,
+/// so wait for the old copy to exit instead.
+#[cfg(windows)]
+pub fn single_instance(restarting: bool) -> Option<InstanceGuard> {
+    use crate::win32::*;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(attributes: *const std::ffi::c_void, initial_owner: i32, name: *const u16) -> HANDLE;
+        fn GetLastError() -> u32;
+        fn WaitForSingleObject(handle: HANDLE, ms: u32) -> u32;
+        fn CloseHandle(handle: HANDLE) -> i32;
+    }
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_ABANDONED: u32 = 0x80;
+    unsafe {
+        let name = wide("Local\\Edgehop.Running");
+        let mutex = CreateMutexW(std::ptr::null(), 1, name.as_ptr());
+        if mutex.is_null() {
+            return Some(InstanceGuard { _mutex: mutex }); // can't tell: run
+        }
+        if GetLastError() != ERROR_ALREADY_EXISTS {
+            return Some(InstanceGuard { _mutex: mutex });
+        }
+        let r = WaitForSingleObject(mutex, if restarting { 15_000 } else { 0 });
+        if r == WAIT_OBJECT_0 || r == WAIT_ABANDONED {
+            return Some(InstanceGuard { _mutex: mutex });
+        }
+        CloseHandle(mutex);
+        let title = wide(WINDOW_TITLE);
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if !hwnd.is_null() {
+            ShowWindow(hwnd, SW_SHOW);
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+        None
+    }
+}
+
+/// Linux/macOS: a socket in the user's runtime folder; the running copy
+/// listens on it and shows its window when asked.
+#[cfg(unix)]
+pub fn single_instance(restarting: bool) -> Option<InstanceGuard> {
+    use std::io::Write;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    let path = instance_socket();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if restarting { 15 } else { 0 });
+    loop {
+        match UnixStream::connect(&path) {
+            Ok(mut other) => {
+                if std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    continue;
+                }
+                let _ = other.write_all(b"show\n");
+                crate::state::print_err("Edgehop is already running; showing its window.");
+                return None;
+            }
+            Err(_) => {
+                // Nobody listening: a leftover from a run that crashed.
+                let _ = std::fs::remove_file(&path);
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                return Some(InstanceGuard { listener: UnixListener::bind(&path).ok() });
+            }
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn single_instance(_restarting: bool) -> Option<InstanceGuard> {
+    Some(InstanceGuard {})
+}
+
+#[cfg(unix)]
+fn instance_socket() -> std::path::PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) => std::path::PathBuf::from(dir).join("edgehop.sock"),
+        None => crate::files::received_root().with_file_name("edgehop.sock"),
+    }
+}
+
+impl InstanceGuard {
+    /// Show the window when another copy of Edgehop is started.
+    pub fn listen(&mut self, app: std::sync::Arc<AppState>) {
+        #[cfg(unix)]
+        if let Some(listener) = self.listener.as_ref().and_then(|l| l.try_clone().ok()) {
+            let _ = std::thread::Builder::new().name("instance".into()).spawn(move || {
+                for conn in listener.incoming().flatten() {
+                    drop(conn);
+                    log::info!("Edgehop was opened again; showing the window");
+                    show_window(&app);
+                }
+            });
+        }
+        #[cfg(not(unix))]
+        let _ = app;
+    }
+}
+
+/// Windows Firewall: let other computers reach this copy of Edgehop on
+/// private and domain networks (off: remove the rule). Needs admin.
+#[cfg(windows)]
+pub fn set_firewall_rule(on: bool) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let netsh = |raw: String| {
+        std::process::Command::new("netsh").raw_arg(raw).creation_flags(CREATE_NO_WINDOW).output()
+    };
+    let _ = netsh("advfirewall firewall delete rule name=\"Edgehop\"".into());
+    let _ = netsh("advfirewall firewall delete rule name=\"kvmlink\"".into());
+    if !on {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let out = netsh(format!(
+        "advfirewall firewall add rule name=\"Edgehop\" dir=in action=allow program=\"{}\" enable=yes profile=private,domain",
+        exe.display()
+    ))
+    .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!("netsh: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    }
+}
+
 pub fn show_window(app: &AppState) {
+    if CLOSE_TO_TRAY && !app.window_open.load(std::sync::atomic::Ordering::Relaxed) {
+        app.request_window();
+        return;
+    }
     #[cfg(windows)]
     unsafe {
         use crate::win32::*;

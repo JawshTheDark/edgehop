@@ -72,8 +72,11 @@ pub fn restart_self(reason: &str) -> ! {
     // otherwise launch the new copy ourselves.
     if std::env::var_os("INVOCATION_ID").is_none() {
         if let Ok(exe) = std::env::current_exe() {
-            let mut args: Vec<String> = std::env::args().skip(1).filter(|a| a != "--minimized").collect();
+            let mut args: Vec<String> =
+                std::env::args().skip(1).filter(|a| a != "--minimized" && a != "--restarting").collect();
             args.push("--minimized".into());
+            // The new copy waits for this one to exit (one Edgehop at a time).
+            args.push("--restarting".into());
             let _ = std::process::Command::new(exe).args(&args).spawn();
         }
     }

@@ -110,7 +110,7 @@ impl Config {
                     let _ = std::fs::create_dir_all(dir);
                 }
                 if std::fs::copy(&old, &path).is_ok() {
-                    eprintln!("migrated settings from {}", old.display());
+                    crate::state::print_err(&format!("migrated settings from {}", old.display()));
                 }
             }
         }

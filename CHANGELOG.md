@@ -3,6 +3,35 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.3.0] - 2026-11-10
+
+### Windows installer
+- **`Edgehop-Setup-<version>.exe`**: installs for you without admin rights,
+  with Start menu and desktop icons, an entry in Apps & Features to uninstall
+  it, and an option to add the Windows Firewall rule (that step asks for admin
+  once). Running a newer one updates Edgehop in place.
+- **Starts at sign-in, in the tray.** Windows was seen skipping its "Run" list
+  at sign-in, so Edgehop now starts through Task Scheduler instead (the switch in
+  Settings uses it too, and moves you over from the old way).
+- `edgehop.exe` carries its icon, so Explorer, the taskbar and shortcuts show
+  Edgehop's icon instead of a blank program.
+
+### Tray and windows
+- Starting in the tray works: the Windows tray icon is created right away, not
+  when the window first draws (a window that starts hidden may never draw).
+- **Linux: closing the window keeps Edgehop in the tray** (it used to stay
+  minimized on the taskbar); the tray icon opens a fresh window. Started at
+  login it starts in the tray. If the desktop has no tray, closing quits.
+- **Linux: the window has Edgehop's icon** (it showed a generic "W" on Wayland).
+- One Edgehop at a time: opening it again brings up the one that's running.
+
+### Fixes
+- Edgehop could stop logging for good when started by Task Scheduler or
+  another program without a console: writing a log line to the (missing)
+  console made the log writer give up. It now only echoes to a real terminal or
+  the systemd journal, and says so if it can't open the log file.
+- `edgehop --paths` prints where settings and the log live.
+
 ## [0.2.7] - 2026-11-10
 
 ### Sharing from a Mac

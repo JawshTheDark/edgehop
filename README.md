@@ -42,7 +42,7 @@ Grab the latest build from the
 
 | Computer | File | Install |
 |---|---|---|
-| Windows | `Edgehop-<version>-windows-x64.zip` | Unzip, right-click `install.ps1` → *Run with PowerShell* |
+| Windows | `Edgehop-Setup-<version>.exe` | Run it. Start menu and desktop icons; starts in the tray when you sign in; uninstall from *Apps & Features* |
 | macOS (Apple silicon and Intel) | `Edgehop-<version>-macos-universal.zip` | Move `Edgehop.app` to Applications |
 | Ubuntu / Debian | `edgehop_<version>_amd64.deb` (`_arm64` for ARM) | `sudo apt install ./edgehop_*.deb`, then **log out and back in once** |
 | Fedora | `edgehop-<version>-1.x86_64.rpm` (`.aarch64` for ARM, e.g. Asahi Linux on a Mac) | `sudo dnf install ./edgehop-*.rpm`, then **log out and back in once** |
@@ -53,9 +53,11 @@ on Windows, SmartScreen's *More info → Run anyway*; on macOS, right-click the
 app → *Open* (or *Open Anyway* under Privacy & Security). On macOS, also allow
 Edgehop under System Settings → Privacy & Security → **Accessibility**.
 
-The Windows installer copies the app to `%LOCALAPPDATA%\Programs\Edgehop`, adds a
-Start Menu entry, and asks for admin once to allow it through the firewall on
-**Private** networks. Make sure your Wi-Fi/Ethernet is set to *Private* in
+The Windows installer needs no admin rights: it installs for you to
+`%LOCALAPPDATA%\Programs\Edgehop`, adds Start menu and desktop icons, sets Edgehop
+to start in the tray when you sign in (through Task Scheduler), and, if you
+leave that option ticked, asks for admin once to allow it through the firewall on
+**Private** networks. Running it again updates Edgehop in place. Make sure your Wi-Fi/Ethernet is set to *Private* in
 Windows settings. The Linux packages add udev rules so your user can create
 virtual input devices and read keyboards and mice (that's why you log out and
 in once). For clipboard sharing on Linux, install `wl-clipboard` (Wayland) or
@@ -69,8 +71,12 @@ Needs Rust (`rustup`) and the Visual Studio C++ Build Tools.
 
 ```powershell
 cargo build --release
-powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1
+powershell -ExecutionPolicy Bypass -File packaging\windows\build-installer.ps1
 ```
+
+That makes `dist\Edgehop-Setup-<version>.exe` (it installs Inno Setup with
+Chocolatey if needed). `packaging\windows\install.ps1` still installs a build
+directly, without an installer.
 
 ### Ubuntu
 

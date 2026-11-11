@@ -41,7 +41,7 @@ fn main() {
     if let Some(i) = args.iter().position(|a| a == "--bench-serve") {
         let path = std::path::PathBuf::from(args.get(i + 1).expect("--bench-serve <file or folder>"));
         if let Err(e) = transfer::bench_serve(&path) {
-            eprintln!("bench: {e}");
+            state::print_err(&format!("bench: {e}"));
         }
         return;
     }
@@ -50,7 +50,7 @@ fn main() {
         let counts: Vec<usize> = args[i + 2..].iter().filter_map(|a| a.parse().ok()).collect();
         for n in if counts.is_empty() { vec![4] } else { counts } {
             if let Err(e) = transfer::bench_fetch(host, n) {
-                eprintln!("bench with {n} connection(s): {e}");
+                state::print_err(&format!("bench with {n} connection(s): {e}"));
             }
         }
         return;
@@ -59,6 +59,35 @@ fn main() {
         let path = args.get(i + 1).map(String::as_str).unwrap_or("edgehop.png");
         let size = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(256).clamp(16, 1024);
         std::fs::write(path, icon::png(size)).expect("write icon");
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--write-ico") {
+        let path = args.get(i + 1).map(String::as_str).unwrap_or("edgehop.ico");
+        std::fs::write(path, icon::ico()).expect("write icon");
+        return;
+    }
+    // Windows Firewall rule for this copy of Edgehop (the installer runs this as admin).
+    #[cfg(windows)]
+    if let Some(i) = args.iter().position(|a| a == "--firewall") {
+        let on = args.get(i + 1).map(String::as_str) != Some("off");
+        match platform::set_firewall_rule(on) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                state::print_err(&e);
+                std::process::exit(1);
+            }
+        }
+    }
+    // Where Edgehop keeps things, and whether it can write its log (diagnostics).
+    if args.iter().any(|a| a == "--paths") {
+        let log = state::log_path();
+        println!("settings: {}", config::Config::path().display());
+        println!("log:      {}", log.display());
+        match std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+            Ok(_) => println!("log opens for writing: yes"),
+            Err(e) => println!("log opens for writing: no ({e})"),
+        }
+        println!("working directory: {}", std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default());
         return;
     }
     // Check clipboard and input injection on this machine (see selftest.rs).
@@ -75,9 +104,33 @@ fn main() {
         std::process::exit(if done.iter().all(|(_, ok)| *ok) { 0 } else { 1 });
     }
 
-    let cfg = config::Config::load();
+    let mut cfg = config::Config::load();
+    // Start at sign-in on or off (the installer and uninstaller run this).
+    if let Some(i) = args.iter().position(|a| a == "--autostart") {
+        let on = args.get(i + 1).map(String::as_str) != Some("off");
+        let result = autostart::set(on);
+        if result.is_ok() {
+            cfg.autostart = on;
+            cfg.save();
+        }
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                state::print_err(&e);
+                std::process::exit(1);
+            }
+        }
+    }
+    // One Edgehop at a time: opening it again brings up the one that's running.
+    let Some(mut instance) = platform::single_instance(args.iter().any(|a| a == "--restarting")) else {
+        return;
+    };
     let app = state::AppState::new(cfg);
     state::init_logger(app.clone(), &args);
+    instance.listen(app.clone());
+    if let Some(e) = state::log_open_error() {
+        log::error!("can't write the log file {}: {e}", state::log_path().display());
+    }
     log::info!(
         "Edgehop {} starting on {} (config: {})",
         env!("CARGO_PKG_VERSION"),
@@ -120,11 +173,13 @@ fn main() {
     }
 
     files::cleanup_old();
-    // Keep "start at login" pointing at this copy of the app (after updates, renames, moves).
+    // Keep "start at login" pointing at this copy of the app (after updates,
+    // renames, moves), off the startup path.
     if app.cfg().autostart {
-        if let Err(e) = autostart::set(true) {
-            log::warn!("couldn't refresh start-at-login: {e}");
-        }
+        std::thread::spawn(|| match autostart::set(true) {
+            Ok(()) => log::debug!("start at sign-in is set up"),
+            Err(e) => log::warn!("couldn't refresh start at sign-in: {e}"),
+        });
     }
     app.start_engine();
 
@@ -135,9 +190,43 @@ fn main() {
         }
     }
 
-    if let Err(e) = gui::run(app.clone(), minimized) {
-        eprintln!("GUI failed: {e}");
-    }
+    run_windows(&app, minimized);
     app.stop_engine();
     state::flush_logs();
+}
+
+/// Show the window, until Edgehop quits. On Linux the window closes into the
+/// tray and a new one opens from the tray icon (a hidden window doesn't
+/// reliably come back there); with --minimized, it starts in the tray.
+fn run_windows(app: &std::sync::Arc<state::AppState>, minimized: bool) {
+    if !platform::CLOSE_TO_TRAY {
+        if let Err(e) = gui::run(app.clone(), minimized) {
+            log::error!("the window failed: {e}");
+        }
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    let _tray = tray::create(app.clone());
+    // The desktop needs a moment to pick up the tray icon.
+    let start = std::time::Instant::now();
+    while minimized && !app.tray_is_shown() && start.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let mut open = !minimized || !app.tray_is_shown();
+    if !open {
+        log::info!("started in the tray");
+    }
+    loop {
+        if open {
+            // No tray to come back to: start minimized rather than invisible.
+            if let Err(e) = gui::run(app.clone(), minimized && !app.tray_is_shown()) {
+                log::error!("the window failed: {e}");
+            }
+        }
+        if !app.tray_is_shown() {
+            return; // closing the window quits when there's no tray
+        }
+        app.wait_for_window_request();
+        open = true;
+    }
 }

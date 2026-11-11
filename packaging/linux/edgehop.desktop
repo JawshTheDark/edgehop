@@ -5,6 +5,7 @@ GenericName=Keyboard & Mouse Sharing
 Comment=Control this computer with another computer's keyboard and mouse
 Exec=edgehop
 Icon=edgehop
+StartupWMClass=edgehop
 Categories=Utility;Network;
 Keywords=kvm;synergy;barrier;mouse;keyboard;share;
 StartupNotify=false
