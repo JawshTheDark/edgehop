@@ -153,11 +153,16 @@ fn run(app: Arc<AppState>, stop: Arc<AtomicBool>, current: Arc<Mutex<Option<TcpS
         );
         inject::set_key_fix(fix);
     }
+    let mut said = String::new();
     let mut injector = loop {
         match inject::create() {
             Ok(i) => break i,
             Err(e) => {
-                log::error!("{e}");
+                // Said once, not every ten seconds for as long as it lasts.
+                if e != said {
+                    log::error!("{e}");
+                    said = e.clone();
+                }
                 app.set_status(e, false);
                 // It may come good (a device node appearing at boot, a permission granted).
                 sleep_unless_stopped(&stop, Duration::from_secs(10));
