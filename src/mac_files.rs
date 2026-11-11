@@ -173,16 +173,13 @@ fn under(x: i32, y: i32) -> Under {
             if px < bx || py < by || px >= bx + bw || py >= by + bh {
                 continue;
             }
-            if num(w, "kCGWindowAlpha") <= 0.0 {
+            // Only ordinary app windows: the menu bar, the Dock and invisible
+            // system overlays sit on other layers.
+            if num(w, "kCGWindowLayer") as i64 != 0 || num(w, "kCGWindowAlpha") <= 0.0 {
                 continue;
             }
             let owner = text(msg_send![w, objectForKey: nsstring("kCGWindowOwnerName")]);
-            let layer = num(w, "kCGWindowLayer") as i64;
-            found = if layer == 0 && owner == "Finder" {
-                Under::Finder
-            } else {
-                Under::Other(format!("{owner} (layer {layer})"))
-            };
+            found = if owner == "Finder" { Under::Finder } else { Under::Other(owner) };
             break;
         }
         CFRelease(list as *const c_void);
