@@ -2458,7 +2458,9 @@ mod tests {
         // Its release must reach this computer too (or Ctrl stays stuck here)...
         assert!(!core.on_evdev_key(29, false), "the release is let through here");
         // ...and the other one, which may have seen the key repeat.
-        assert!(rx.try_iter().any(|m| matches!(m, ToClient::Key { code: 29, down: false })));
+        // (A Mac sends its Ctrl as the Windows key: Command is its Ctrl.)
+        let sent = if core.command_is_ctrl { 125 } else { 29 };
+        assert!(rx.try_iter().any(|m| matches!(m, ToClient::Key { code, down: false } if code == sent)));
         // Keys pressed over there stay over there.
         assert!(core.on_evdev_key(30, true));
         assert!(core.on_evdev_key(30, false));

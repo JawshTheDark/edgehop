@@ -126,8 +126,13 @@ mod tests {
 
     #[test]
     fn unsafe_paths_are_rejected() {
-        for bad in ["../x", "a/../../b", "/etc/passwd", "C:/x", "a\\b", "", "a//b", "a/./b"] {
+        for bad in ["../x", "a/../../b", "/etc/passwd", "a\\b", "", "a//b", "a/./b"] {
             assert!(safe_rel(bad).is_none(), "{bad:?} should be rejected");
+        }
+        // What only Windows can't have in a name is only refused there:
+        // "C:" is an ordinary folder name on Linux and macOS.
+        for windows_only in ["C:/x", "NUL", "aux.txt", "a/com1", "what?.txt", "ends with dot."] {
+            assert_eq!(safe_rel(windows_only).is_none(), cfg!(windows), "{windows_only:?}");
         }
         assert_eq!(safe_rel("folder/sub/file.txt").unwrap(), PathBuf::from("folder").join("sub").join("file.txt"));
     }
