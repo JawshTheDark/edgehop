@@ -184,8 +184,12 @@ pub fn show_window(app: &AppState) {
         }
     }
     if let Some(ctx) = lk(&app.ctx).as_ref() {
+        // Windows: also tell the window library it's visible again (it's applied
+        // on the next frame, which the line above makes happen). It only acts
+        // on changes to what it remembers, so without this, the next "hide"
+        // looks like nothing to do and the X button does nothing.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         if !HIDE_TO_TRAY {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -196,6 +200,19 @@ pub fn show_window(app: &AppState) {
 pub fn hide_window(ctx: &egui::Context) {
     if HIDE_TO_TRAY {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        // And hide it directly: the window may have been shown by another
+        // copy of Edgehop (opened again from the desktop icon), which the
+        // window library never hears about.
+        #[cfg(windows)]
+        unsafe {
+            use crate::win32::*;
+            let title = wide(WINDOW_TITLE);
+            let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+            if !hwnd.is_null() {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+        log::debug!("window hidden; Edgehop keeps running in the tray");
     } else {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
     }

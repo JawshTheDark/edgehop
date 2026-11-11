@@ -3,6 +3,15 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.5.3] - 2026-11-11
+
+### Fixes
+- **Windows: the X button closes the window into the tray again.** After the
+  window was opened from the tray (or by opening Edgehop again), X did
+  nothing: Edgehop brought the window back directly, so the window library
+  still thought it was hidden and ignored the request to hide it. Showing now
+  tells it too, and closing hides the window directly as well.
+
 ## [0.5.2] - 2026-11-10
 
 Edge cases in updating, restarting and the login-screen service.
