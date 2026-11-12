@@ -732,6 +732,39 @@ pub fn foreground_description() -> String {
     }
 }
 
+/// Does the window at (x, y) belong to a program running as administrator
+/// (or one we aren't allowed to look at, which comes to the same)? Windows
+/// doesn't show a normal program's mouse hook the mouse while it's over one.
+/// Not for the input hook: finding the window can wait on that window.
+pub fn elevated_at(x: i32, y: i32) -> bool {
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION: u32 = 20;
+    unsafe {
+        let hwnd = WindowFromPoint(POINT { x, y });
+        if hwnd.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return true;
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        let elevated = if OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0 {
+            let mut elevated = 0u32;
+            let mut ret = 0u32;
+            let ok = GetTokenInformation(token, TOKEN_ELEVATION, &mut elevated as *mut u32 as *mut _, 4, &mut ret) != 0;
+            CloseHandle(token);
+            ok && elevated != 0
+        } else {
+            true
+        };
+        CloseHandle(process);
+        elevated
+    }
+}
+
 /// Top-level window that currently has focus.
 pub fn foreground_root() -> isize {
     unsafe { GetAncestor(GetForegroundWindow(), 2) as isize }

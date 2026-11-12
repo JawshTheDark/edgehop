@@ -5,6 +5,16 @@ Each release's section below becomes its notes on the
 
 ## [0.6.1] - 2026-11-11
 
+### Windows: the pointer could go invisible
+- With a window that runs as administrator on screen (Task Manager, for
+  one), moving the mouse to another computer could leave this computer's
+  pointer hidden but still moving, with nothing reaching the other computer.
+  Windows doesn't show a normal program the mouse while it's over such a
+  window, and that's where Edgehop parked the hidden pointer. Now it parks
+  somewhere clear of those windows, and if this computer's input stops
+  reaching Edgehop anyway while the mouse is away, the pointer comes back
+  here, visible, within a couple of seconds.
+
 ### Screen layout
 - **A computer can sit next to another computer**, not only next to this
   computer's monitors: drag it against the other one's edge and the pointer

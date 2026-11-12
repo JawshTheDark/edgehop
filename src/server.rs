@@ -1203,6 +1203,30 @@ impl Core {
         }
     }
 
+    /// This computer's own keyboard and mouse have stopped reaching Edgehop
+    /// while the mouse is on another computer (on Windows: the pointer is
+    /// over a window that runs as administrator, like Task Manager, or one
+    /// is in front). Nothing gets to the other computer any more, and this
+    /// one's pointer moves about hidden: bring it back where it can be seen.
+    pub fn capture_lost(&mut self, seen: &str) -> bool {
+        if !self.is_remote() {
+            return false;
+        }
+        log::warn!(
+            "this computer's keyboard and mouse stopped reaching Edgehop while the mouse was on {}; bringing it back to {}. {seen}",
+            self.active,
+            self.me
+        );
+        if let Some(app) = &self.app {
+            app.set_status(
+                "The mouse came back here: Windows doesn't let Edgehop see the mouse over a window that runs as administrator",
+                true,
+            );
+        }
+        self.go_home();
+        true
+    }
+
     pub fn ping_all(&self) {
         for s in self.clients.values() {
             let _ = s.tx.send(ToClient::Ping);
@@ -1441,6 +1465,8 @@ impl ServerEngine {
                         // Asked before taking the lock the input hook waits on.
                         #[cfg(windows)]
                         let fullscreen = crate::win32::fullscreen_app();
+                        #[cfg(windows)]
+                        capture::refresh_park(&mons);
                         let start = Instant::now();
                         let mut core = loop {
                             match s.core.try_lock() {
@@ -1457,6 +1483,13 @@ impl ServerEngine {
                         core.set_monitors(mons);
                         core.ping_all();
                         core.check_responsive();
+                        if core.is_remote() && capture::look_lost() {
+                            #[cfg(windows)]
+                            let seen = capture::loss_report();
+                            #[cfg(not(windows))]
+                            let seen = String::new();
+                            core.capture_lost(&seen);
+                        }
                         #[cfg(windows)]
                         core.set_fullscreen_app(fullscreen);
                         #[cfg(windows)]
@@ -1962,14 +1995,55 @@ mod hooks {
         "Could not install keyboard/mouse hooks".into()
     }
 
-    pub struct WinDesktop;
+    pub struct WinDesktop {
+        /// Where the hidden pointer is parked, for as long as the mouse is away.
+        park: Option<(i32, i32)>,
+    }
+
+    /// Where to park the hidden pointer the next time the mouse leaves:
+    /// x in the high half, y in the low half; u64::MAX until first worked out.
+    static PARK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    fn park_spot() -> (i32, i32) {
+        match PARK.load(Ordering::Relaxed) {
+            u64::MAX => primary_center(),
+            v => ((v >> 32) as u32 as i32, v as u32 as i32),
+        }
+    }
+
+    /// Choose the parking spot: the middle of the main monitor, unless a
+    /// window running as administrator is there. Windows doesn't show our
+    /// mouse hook the mouse while it's over one (Task Manager, say), so a
+    /// pointer parked on it would run loose on this computer, invisible, with
+    /// nothing reaching the other one. Run by the watchdog, never by the
+    /// input hook.
+    pub fn refresh_park(mons: &[Monitor]) {
+        let middle = primary_center();
+        let mut spots = vec![middle];
+        let mut order: Vec<&Monitor> = mons.iter().filter(|m| m.primary).collect();
+        order.extend(mons.iter().filter(|m| !m.primary));
+        for m in order {
+            for (fx, fy) in [(0.5, 0.5), (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+                spots.push(((m.rect.l + m.rect.w() * fx) as i32, (m.rect.t + m.rect.h() * fy) as i32));
+            }
+        }
+        let (x, y) = spots.iter().copied().find(|&(x, y)| !elevated_at(x, y)).unwrap_or(middle);
+        let packed = ((x as u32 as u64) << 32) | y as u32 as u64;
+        if PARK.swap(packed, Ordering::Relaxed) != packed && (x, y) != middle {
+            log::info!("a window running as administrator covers the middle of the main monitor; the hidden pointer will wait at ({x}, {y}) instead");
+        }
+    }
 
     impl Desktop for WinDesktop {
         fn monitors(&self) -> Vec<Monitor> {
             crate::platform::monitor_rects()
         }
         fn center(&self) -> (i32, i32) {
-            primary_center()
+            self.park.unwrap_or_else(park_spot)
+        }
+        fn captured(&mut self, remote: bool) {
+            // One spot for the whole time away: movement is measured from it.
+            self.park = remote.then(park_spot);
         }
         fn set_cursor(&mut self, x: i32, y: i32) {
             unsafe {
@@ -2008,7 +2082,7 @@ mod hooks {
     }
 
     pub fn desktop() -> Box<dyn Desktop> {
-        Box::new(WinDesktop)
+        Box::new(WinDesktop { park: None })
     }
 
     fn handle_mouse(msg: u32, ms: &MSLLHOOKSTRUCT) -> bool {
@@ -2618,6 +2692,17 @@ mod tests {
         assert_eq!(placed.len(), 1, "placed");
         assert_eq!((placed[0].x, placed[0].y), (0.0, 1080.0));
         assert!(core.ensure_placed("surface").is_empty(), "unchanged second time");
+    }
+
+    #[test]
+    fn losing_this_computers_input_while_away_brings_the_mouse_back() {
+        let (mut core, rx, _) = setup(true);
+        assert!(!core.capture_lost(""), "nothing to do while the mouse is here");
+        core.on_mouse_move(500, 1079);
+        assert_eq!(core.active, "surface");
+        assert!(core.capture_lost("test"));
+        assert_eq!(core.active, "pc");
+        assert!(rx.try_iter().any(|m| matches!(m, ToClient::Leave)), "the Surface is told the mouse left");
     }
 
     /// A friend's setup: one monitor, "fedora" stretched below it, and
