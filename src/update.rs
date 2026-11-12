@@ -734,6 +734,28 @@ fn writable(_dir: &Path) -> bool {
     true
 }
 
+/// Left behind by an update started from the window, for the new version to
+/// find: it opens its window too. Started in the tray (as it is after
+/// signing in), Edgehop would seem to have vanished halfway through.
+fn reopen_marker() -> PathBuf {
+    crate::state::log_path().with_file_name("reopen-window-after-update")
+}
+
+/// Is the marker there, and recent? Either way it's used up.
+fn take_marker(path: &Path, max_age: std::time::Duration) -> bool {
+    let fresh = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < max_age);
+    std::fs::remove_file(path).is_ok() && fresh
+}
+
+/// Starting up: did an update, clicked in the window, just restart Edgehop?
+pub fn reopen_window_after_update() -> bool {
+    take_marker(&reopen_marker(), std::time::Duration::from_secs(600))
+}
+
 /// The Update button: download, install, then quit or restart into the new version.
 pub fn install(app: &Arc<AppState>) {
     // Claim it in one step, so a double click starts one update.
@@ -758,6 +780,10 @@ pub fn install(app: &Arc<AppState>) {
         log::info!("updating from {} to {}", current(), rel.version);
         let a = app.clone();
         let say = move |s: String| set_status(&a, Status::Working(s));
+        // Written first: an installer may stop this copy the moment it starts.
+        if let Err(e) = std::fs::write(reopen_marker(), current()) {
+            log::debug!("couldn't note that the window was open: {e}");
+        }
         match install_release(&rel, app.cfg().autostart, &say) {
             Ok(Done::Installer(mut child)) => {
                 // Stop sharing and save the log: the installer stops this copy
@@ -777,6 +803,7 @@ pub fn install(app: &Arc<AppState>) {
                             Err(e) => format!("couldn't wait for the installer: {e}"),
                         };
                         log::error!("updating to {} failed: {why}; still running {}", rel.version, current());
+                        let _ = std::fs::remove_file(reopen_marker());
                         app.start_engine();
                         set_status(&app, Status::Failed(format!("Update failed: {why}. Edgehop {} is still running.", current())));
                     }
@@ -793,6 +820,7 @@ pub fn install(app: &Arc<AppState>) {
             }
             Err(e) => {
                 log::error!("updating to {} failed: {e}", rel.version);
+                let _ = std::fs::remove_file(reopen_marker());
                 set_status(&app, Status::Failed(format!("Update failed: {e}")));
             }
         }
@@ -1060,6 +1088,15 @@ mod tests {
     #[test]
     fn installer_tasks_follow_the_settings_now() {
         let on = installer_tasks(true);
+        // (and, while here: the note an update leaves for the new version)
+        let note = std::env::temp_dir().join(format!("edgehop-test-reopen-{}", std::process::id()));
+        assert!(!take_marker(&note, std::time::Duration::from_secs(600)), "nothing left: start as asked");
+        std::fs::write(&note, "x").unwrap();
+        assert!(take_marker(&note, std::time::Duration::from_secs(600)), "just updated from the window: open it");
+        assert!(!note.exists(), "used up, so the next start is in the tray again");
+        std::fs::write(&note, "x").unwrap();
+        assert!(!take_marker(&note, std::time::Duration::ZERO), "an old one doesn't count");
+        assert!(!note.exists());
         assert!(on.starts_with("/MERGETASKS=autostart,"), "{on}");
         assert!(installer_tasks(false).starts_with("/MERGETASKS=!autostart,"));
         assert!(on.contains("desktopicon"), "{on}");

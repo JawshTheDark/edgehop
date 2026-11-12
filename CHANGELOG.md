@@ -5,6 +5,13 @@ Each release's section below becomes its notes on the
 
 ## [0.6.2] - 2026-11-11
 
+### Updating
+- **The window comes back after an update.** Clicking *Update now* used to
+  end with Edgehop restarted in the tray, window gone, which looked like a
+  crash. The new version now opens its window again. (This is done by the
+  version doing the updating, so you'll see it from the update after this
+  one.)
+
 ### Mac
 - **The Dock icon is the same size as other apps'.** Edgehop replaced its
   Dock icon with a small edge-to-edge picture when it started, which the Dock

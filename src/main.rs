@@ -156,6 +156,13 @@ fn main() {
     let app = state::AppState::new(cfg);
     state::init_logger(app.clone(), &args);
     instance.listen(app.clone());
+    // Restarted by an update that was clicked in the window: open the window
+    // again, even though restarts and installers start Edgehop in the tray.
+    let reopen = update::reopen_window_after_update();
+    if reopen && minimized {
+        log::info!("just updated from the window: opening it again instead of starting in the tray");
+    }
+    let minimized = minimized && !reopen;
     if let Some(problem) = config::Config::load_problem() {
         log::error!("{problem}");
     }
