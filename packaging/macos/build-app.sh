@@ -27,12 +27,13 @@ rm -rf "$APP" dist/edgehop.app
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/edgehop"
 
-# App icon, drawn by the binary itself.
+# App icon, drawn by the binary itself, on Apple's icon grid ("mac": clear
+# space round the artwork, so it's the same size as other apps' icons).
 ICONSET=$(mktemp -d)/Edgehop.iconset
 mkdir -p "$ICONSET"
 for s in 16 32 128 256 512; do
-    "$RUN" --write-icon "$ICONSET/icon_${s}x${s}.png" "$s"
-    "$RUN" --write-icon "$ICONSET/icon_${s}x${s}@2x.png" "$((s * 2))"
+    "$RUN" --write-icon "$ICONSET/icon_${s}x${s}.png" "$s" mac
+    "$RUN" --write-icon "$ICONSET/icon_${s}x${s}@2x.png" "$((s * 2))" mac
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/Edgehop.icns"
 

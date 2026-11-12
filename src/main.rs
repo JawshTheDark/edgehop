@@ -69,7 +69,9 @@ fn main() {
     if let Some(i) = args.iter().position(|a| a == "--write-icon") {
         let path = args.get(i + 1).map(String::as_str).unwrap_or("edgehop.png");
         let size = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(256).clamp(16, 1024);
-        std::fs::write(path, icon::png(size)).expect("write icon");
+        // "mac": on Apple's icon grid (clear space round the artwork), for the app bundle.
+        let mac = args.get(i + 3).map(String::as_str) == Some("mac");
+        std::fs::write(path, if mac { icon::png_mac(size) } else { icon::png(size) }).expect("write icon");
         return;
     }
     // Linux: the login-screen service (see login_screen.rs).
@@ -154,6 +156,13 @@ fn main() {
     let app = state::AppState::new(cfg);
     state::init_logger(app.clone(), &args);
     instance.listen(app.clone());
+    // Restarted by an update that was clicked in the window: open the window
+    // again, even though restarts and installers start Edgehop in the tray.
+    let reopen = update::reopen_window_after_update();
+    if reopen && minimized {
+        log::info!("just updated from the window: opening it again instead of starting in the tray");
+    }
+    let minimized = minimized && !reopen;
     if let Some(problem) = config::Config::load_problem() {
         log::error!("{problem}");
     }

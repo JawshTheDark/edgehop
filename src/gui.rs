@@ -196,7 +196,15 @@ fn code_boxes(ui: &mut egui::Ui, code: &str) {
 // ---------------------------------------------------------------------------
 
 pub fn run(app: Arc<AppState>, minimized: bool) -> eframe::Result<()> {
-    let icon = egui::IconData { rgba: crate::icon::rgba(64), width: 64, height: 64 };
+    // Mac: no icon set from here (an empty one means "leave it alone"). The
+    // Dock then shows the app bundle's own icon, at full resolution and the
+    // same size as every other app's; one set from here replaces it with
+    // this small edge-to-edge picture, which the Dock draws larger than the rest.
+    let icon = if cfg!(target_os = "macos") {
+        egui::IconData::default()
+    } else {
+        egui::IconData { rgba: crate::icon::rgba(64), width: 64, height: 64 }
+    };
     let mut vp = egui::ViewportBuilder::default()
         .with_title(WINDOW_TITLE)
         // Wayland/X11: matches edgehop.desktop, so the desktop shows Edgehop's icon.
