@@ -1,6 +1,6 @@
 [package]
 name = "edgehop"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "Share one keyboard and mouse across every computer on your network"
 license = "MIT"

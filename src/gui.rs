@@ -547,7 +547,7 @@ impl Gui {
         card(
             ui,
             "Screen layout",
-            "Drag a computer against any monitor edge. Moving the mouse off that edge lands at the matching spot on the other screen.",
+            "Drag a computer against the edge of a monitor, or of another computer. Moving the mouse off that edge lands at the matching spot on the other screen.",
             |ui| self.layout_canvas(ui, cfg, &mons, &connected, &active),
         );
         ui.add_space(10.0);
@@ -556,8 +556,10 @@ impl Gui {
             ui.label(RichText::new("Tip:").small().strong().color(muted));
             ui.label(
                 RichText::new(
-                    "Right-click a computer to stretch it corner-to-corner or place it automatically. \
-                     Scroll Lock always brings the mouse back here.",
+                    "A stretched computer fills the whole edge. To slide one anywhere along an edge at its real \
+                     size, right-click it and turn stretching off. A computer placed against another one is \
+                     reached through it, so only while that one is connected. Scroll Lock always brings the \
+                     mouse back here.",
                 )
                 .small()
                 .color(muted),
@@ -706,7 +708,11 @@ impl Gui {
             if ir.drag_stopped() {
                 dropped = self.dragging.take();
             }
-            let ir = ir.on_hover_text(format!("{} — drag onto a monitor edge · right-click for options", s.name));
+            let ir = ir.on_hover_text(format!(
+                "{} — drag against a monitor or another computer · right-click to {}",
+                s.name,
+                if s.fit { "slide it freely along the edge" } else { "stretch it along the whole edge" }
+            ));
             ir.context_menu(|ui| {
                 let mut fit = s.fit;
                 if ui.checkbox(&mut fit, "Stretch along the whole edge (corners line up)").clicked() {
@@ -728,7 +734,8 @@ impl Gui {
         let mut save: Option<ScreenPos> = None;
         let others = |name: &str| -> Vec<Rect> { screens.iter().filter(|o| o.name != name).map(|o| o.rect()).collect() };
         if let Some(d) = dropped {
-            // Snap to the nearest monitor edge; a drop that fits nowhere is undone.
+            // Snap to the nearest edge (a monitor's or another computer's); a
+            // drop that fits nowhere is undone.
             save = crate::layout::snap(mons, &others(&d.name), &d);
         }
         if let Some((q, auto)) = refit {
@@ -739,9 +746,9 @@ impl Gui {
             };
         }
         if let Some(pos) = save {
+            // Computers attached to the one that moved come along if it left them behind.
             self.app.update_config(|c| {
-                c.screens.retain(|s| s.name != pos.name);
-                c.screens.push(pos);
+                crate::layout::place(mons, &mut c.screens, pos);
             });
         }
 

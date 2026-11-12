@@ -3,6 +3,23 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.6.1] - 2026-11-11
+
+### Screen layout
+- **A computer can sit next to another computer**, not only next to this
+  computer's monitors: drag it against the other one's edge and the pointer
+  goes straight from one to the other. (Crossing between two computers
+  already worked; the layout just couldn't be arranged that way.) A computer
+  placed like this is reached through the one it's attached to, so only while
+  that one is connected.
+- Moving a computer that others are attached to no longer leaves them
+  floating where the pointer can't get to them: they attach again at the
+  nearest free edge. The same when a computer's resolution changes.
+- When every monitor edge is taken, a new computer is placed next to one
+  that's already there rather than off to the side, out of reach.
+- The tips under the layout say how to slide a computer anywhere along an
+  edge (right-click it and turn stretching off).
+
 ## [0.6.0] - 2026-11-11
 
 A full review of the code: what it found, fixed.

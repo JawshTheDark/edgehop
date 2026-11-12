@@ -1120,25 +1120,23 @@ impl Core {
         old
     }
 
-    /// Make sure a connected client has a place next to a monitor and that its
-    /// stored size is current. Returns the placement to save if it changed.
-    pub fn ensure_placed(&mut self, name: &str) -> Option<ScreenPos> {
-        let (w, h) = self.clients.get(name).map(|s| (s.w, s.h))?;
+    /// Make sure a connected client has a place next to a monitor (or next to
+    /// another computer) and that its stored size is current. Returns the
+    /// placements to save: its own if it changed, then those of any screens
+    /// attached to it that had to move with it.
+    pub fn ensure_placed(&mut self, name: &str) -> Vec<ScreenPos> {
+        let Some((w, h)) = self.clients.get(name).map(|s| (s.w, s.h)) else { return Vec::new() };
         if self.mons.is_empty() {
             // Normally kept current by the watchdog, off the input path.
             self.mons = self.desk.monitors();
         }
+        let others: Vec<Rect> = self.screens.iter().filter(|p| p.name != name).map(|p| p.rect()).collect();
         let updated = match self.screens.iter().find(|p| p.name == name) {
-            Some(p) if p.w == w && p.h == h => return None,
-            Some(p) => crate::layout::resize(p, &self.mons, w, h),
-            None => {
-                let others: Vec<Rect> = self.screens.iter().map(|p| p.rect()).collect();
-                crate::layout::auto_place(&self.mons, &others, name, w, h)
-            }
+            Some(p) if p.w == w && p.h == h => return Vec::new(),
+            Some(p) => crate::layout::resize(p, &self.mons, &others, w, h),
+            None => crate::layout::auto_place(&self.mons, &others, name, w, h),
         };
-        self.screens.retain(|p| p.name != name);
-        self.screens.push(updated.clone());
-        Some(updated)
+        crate::layout::place(&self.mons, &mut self.screens, updated)
     }
 
     pub fn remove_client(&mut self, name: &str, id: u64) {
@@ -1671,11 +1669,15 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     let slot = Slot { id, tx: mtx, bulk: bulk.clone(), last_seen: last_seen.clone(), w: width, h: height, clip_gen: 0 };
     let replaced = lk(&s.core).add_client(&name, slot);
     let placed = lk(&s.core).ensure_placed(&name);
-    if let Some(pos) = placed {
-        log::info!("{name} placed at ({}, {}) scale {:.3}", pos.x, pos.y, pos.scale);
+    if !placed.is_empty() {
+        for pos in &placed {
+            log::info!("{} placed at ({}, {}) scale {:.3}", pos.name, pos.x, pos.y, pos.scale);
+        }
         app.update_config(|c| {
-            c.screens.retain(|p| p.name != pos.name);
-            c.screens.push(pos);
+            for pos in placed {
+                c.screens.retain(|p| p.name != pos.name);
+                c.screens.push(pos);
+            }
         });
     }
     if let Some(old) = replaced {
@@ -2612,9 +2614,77 @@ mod tests {
         let mut core = Core::new(&cfg, Box::new(FakeDesk { mons: user_monitors(), cursor }), None);
         let (tx, _rx) = mpsc::channel();
         core.add_client("surface", Slot { id: 1, tx, bulk: Bulk::new(), last_seen: Arc::new(AtomicU64::new(now_ms())), w: 1520, h: 1014, clip_gen: 0 });
-        let p = core.ensure_placed("surface").expect("placed");
-        assert_eq!((p.x, p.y), (0.0, 1080.0));
-        assert!(core.ensure_placed("surface").is_none(), "unchanged second time");
+        let placed = core.ensure_placed("surface");
+        assert_eq!(placed.len(), 1, "placed");
+        assert_eq!((placed[0].x, placed[0].y), (0.0, 1080.0));
+        assert!(core.ensure_placed("surface").is_empty(), "unchanged second time");
+    }
+
+    /// A friend's setup: one monitor, "fedora" stretched below it, and
+    /// "delacroix" attached to fedora's left edge (touching no monitor).
+    fn two_laptops() -> (Core, mpsc::Receiver<ToClient>, mpsc::Receiver<ToClient>) {
+        use crate::layout::{attach, snap, Side};
+        let mut cfg = Config::default();
+        cfg.name = "pc".into();
+        cfg.edge_resistance = 0;
+        let mons = vec![Monitor { rect: Rect::new(0.0, 0.0, 3440.0, 1440.0), label: "1".into(), primary: true }];
+        let (x, y, scale) = attach(&mons[0].rect, Side::Bottom, 3072, 1920, true, None);
+        let fedora = ScreenPos { name: "fedora".into(), x, y, scale, w: 3072, h: 1920, fit: true };
+        let dropped = ScreenPos { name: "delacroix".into(), x: -1500.0, y: 1900.0, scale: 1.0, w: 1408, h: 881, fit: true };
+        let delacroix = snap(&mons, &[fedora.rect()], &dropped).expect("fits left of fedora");
+        cfg.screens = vec![fedora, delacroix];
+        let cursor = Arc::new(Mutex::new((0, 0)));
+        let mut core = Core::new(&cfg, Box::new(FakeDesk { mons, cursor }), None);
+        let slot = |id, tx, w, h| Slot { id, tx, bulk: Bulk::new(), last_seen: Arc::new(AtomicU64::new(now_ms())), w, h, clip_gen: 0 };
+        let (ftx, frx) = mpsc::channel();
+        let (dtx, drx) = mpsc::channel();
+        core.add_client("fedora", slot(1, ftx, 3072, 1920));
+        core.add_client("delacroix", slot(2, dtx, 1408, 881));
+        (core, frx, drx)
+    }
+
+    #[test]
+    fn the_pointer_goes_from_one_computer_straight_to_another() {
+        let (mut core, frx, drx) = two_laptops();
+        assert!(!core.on_mouse_move(0, 700), "nothing left of the monitor");
+        assert!(core.on_mouse_move(1720, 1439), "down off the monitor");
+        assert_eq!(core.active, "fedora");
+        let _ = enter_pos(&frx);
+        // Halfway down fedora, then out through its left edge.
+        for _ in 0..6 {
+            assert!(core.on_mouse_move(960, 540 + 160));
+        }
+        for _ in 0..40 {
+            assert!(core.on_mouse_move(960 - 100, 540));
+        }
+        assert_eq!(core.active, "delacroix", "left of fedora is delacroix");
+        assert!(frx.try_iter().any(|m| matches!(m, ToClient::Leave)));
+        let (x, y) = enter_pos(&drx);
+        assert_eq!(x, 1407, "arrives on its right edge");
+        assert!((438..=442).contains(&y), "halfway down fedora is halfway down delacroix, got {y}");
+        // Up from delacroix there is nothing (the monitor is up and to the right).
+        for _ in 0..30 {
+            assert!(core.on_mouse_move(960, 540 - 100));
+        }
+        assert_eq!(core.active, "delacroix");
+        // And back out of its right edge is fedora again, on its left edge.
+        for _ in 0..30 {
+            assert!(core.on_mouse_move(960 + 100, 540));
+        }
+        assert_eq!(core.active, "fedora");
+        assert_eq!(enter_pos(&frx).0, 0);
+    }
+
+    #[test]
+    fn a_computer_behind_one_that_is_gone_is_not_entered() {
+        let (mut core, frx, _drx) = two_laptops();
+        core.on_mouse_move(1720, 1439);
+        let _ = enter_pos(&frx);
+        core.remove_client("delacroix", 2);
+        for _ in 0..40 {
+            assert!(core.on_mouse_move(960 - 100, 540));
+        }
+        assert_eq!(core.active, "fedora", "delacroix isn't connected");
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Screen geometry. Everything lives in one coordinate space: the server's own
 //! desktop pixels (the same coordinates Windows uses for its monitors). Each
 //! client screen is a rectangle in that space, attached to the edge of a
-//! monitor, so crossing an edge is plain geometry and position is continuous.
+//! monitor or of another client screen, so crossing an edge is plain geometry
+//! and position is continuous.
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
@@ -122,14 +123,48 @@ fn collides(r: &Rect, mons: &[Monitor], others: &[Rect]) -> bool {
     mons.iter().any(|m| m.rect.overlaps(r)) || others.iter().any(|o| o.overlaps(r))
 }
 
-/// First free monitor edge, starting with the primary monitor.
+/// Sharing part of an edge (a corner alone doesn't count).
+fn touches(a: &Rect, b: &Rect) -> bool {
+    let beside = a.t < b.b - 0.5 && b.t < a.b - 0.5; // shares some height
+    let stacked = a.l < b.r - 0.5 && b.l < a.r - 0.5; // shares some width
+    (beside && ((a.r - b.l).abs() < 1.0 || (a.l - b.r).abs() < 1.0))
+        || (stacked && ((a.b - b.t).abs() < 1.0 || (a.t - b.b).abs() < 1.0))
+}
+
+/// Which of `rects` are joined to a monitor, directly or through each other:
+/// the pointer can get to those from this computer.
+fn joined(mons: &[Monitor], rects: &[Rect]) -> Vec<bool> {
+    let mut ok: Vec<bool> = rects.iter().map(|r| mons.iter().any(|m| touches(&m.rect, r))).collect();
+    loop {
+        let more: Vec<usize> = (0..rects.len())
+            .filter(|&i| !ok[i] && (0..rects.len()).any(|j| ok[j] && touches(&rects[j], &rects[i])))
+            .collect();
+        if more.is_empty() {
+            return ok;
+        }
+        for i in more {
+            ok[i] = true;
+        }
+    }
+}
+
+/// What a screen can be attached to: the monitors (main one first), then the
+/// other screens that are themselves joined to a monitor.
+fn anchors(mons: &[Monitor], others: &[Rect]) -> Vec<Rect> {
+    let mut out: Vec<Rect> = mons.iter().filter(|m| m.primary).map(|m| m.rect).collect();
+    out.extend(mons.iter().filter(|m| !m.primary).map(|m| m.rect));
+    let ok = joined(mons, others);
+    out.extend(others.iter().zip(ok).filter(|(_, ok)| *ok).map(|(r, _)| *r));
+    out
+}
+
+/// First free edge: the main monitor's, then the other monitors', then those
+/// of the screens already placed.
 pub fn auto_place(mons: &[Monitor], others: &[Rect], name: &str, w: i32, h: i32) -> ScreenPos {
     let (w, h) = if w > 0 && h > 0 { (w, h) } else { (1920, 1080) };
-    let mut order: Vec<&Monitor> = mons.iter().filter(|m| m.primary).collect();
-    order.extend(mons.iter().filter(|m| !m.primary));
-    for m in &order {
+    for m in &anchors(mons, others) {
         for side in SIDES {
-            let c = candidate(name, &m.rect, side, w, h, true, None);
+            let c = candidate(name, m, side, w, h, true, None);
             if !collides(&c.rect(), mons, others) {
                 return c;
             }
@@ -140,18 +175,19 @@ pub fn auto_place(mons: &[Monitor], others: &[Rect], name: &str, w: i32, h: i32)
     ScreenPos { name: name.into(), x: right, y: 0.0, scale: 1.0, w, h, fit: false }
 }
 
-/// After a drag: attach the screen to the nearest monitor edge where it fits.
+/// After a drag: attach the screen to the nearest edge where it fits, of a
+/// monitor or of another screen (one the pointer can already get to).
 pub fn snap(mons: &[Monitor], others: &[Rect], pos: &ScreenPos) -> Option<ScreenPos> {
     let cur = pos.rect();
     let (cx, cy) = cur.center();
     let mut best: Option<(f64, ScreenPos)> = None;
-    for m in mons {
+    for m in &anchors(mons, others) {
         for side in SIDES {
             let along = match side {
                 Side::Top | Side::Bottom => cur.l,
                 Side::Left | Side::Right => cur.t,
             };
-            let c = candidate(&pos.name, &m.rect, side, pos.w, pos.h, pos.fit, Some(along));
+            let c = candidate(&pos.name, m, side, pos.w, pos.h, pos.fit, Some(along));
             let r = c.rect();
             if collides(&r, mons, others) {
                 continue;
@@ -167,29 +203,60 @@ pub fn snap(mons: &[Monitor], others: &[Rect], pos: &ScreenPos) -> Option<Screen
 }
 
 /// Keep a placement consistent when the client's resolution changes: same
-/// fit, and still touching the monitor edge it was attached to (a screen to
-/// the left of or above a monitor would otherwise drift away from it as it
-/// shrinks, and past a small gap the pointer can no longer cross).
-pub fn resize(pos: &ScreenPos, mons: &[Monitor], w: i32, h: i32) -> ScreenPos {
+/// fit, and still touching the edge it was attached to, of a monitor or of
+/// another screen (a screen to the left of or above what it's attached to
+/// would otherwise drift away from it as it shrinks, and past a small gap the
+/// pointer can no longer cross).
+pub fn resize(pos: &ScreenPos, mons: &[Monitor], others: &[Rect], w: i32, h: i32) -> ScreenPos {
     let mut p = pos.clone();
     let old = pos.rect();
+    // Not the screens that are only attached to this one: they follow it.
+    let anchors = anchors(mons, others);
     let beside = |m: &Rect| old.t < m.b && m.t < old.b; // shares some height
     let stacked = |m: &Rect| old.l < m.r && m.l < old.r; // shares some width
     if p.fit {
         let horizontal_edge =
-            mons.iter().any(|m| stacked(&m.rect) && ((old.t - m.rect.b).abs() < 1.0 || (old.b - m.rect.t).abs() < 1.0));
+            anchors.iter().any(|m| stacked(m) && ((old.t - m.b).abs() < 1.0 || (old.b - m.t).abs() < 1.0));
         p.scale = if horizontal_edge { old.w() / w.max(1) as f64 } else { old.h() / h.max(1) as f64 };
     }
     p.w = w;
     p.h = h;
     let new = p.rect();
-    if mons.iter().any(|m| beside(&m.rect) && (old.r - m.rect.l).abs() < 1.0) {
-        p.x = old.r - new.w(); // left of a monitor: keep the right edge in place
+    if anchors.iter().any(|m| beside(m) && (old.r - m.l).abs() < 1.0) {
+        p.x = old.r - new.w(); // left of it: keep the right edge in place
     }
-    if mons.iter().any(|m| stacked(&m.rect) && (old.b - m.rect.t).abs() < 1.0) {
-        p.y = old.b - new.h(); // above a monitor: keep the bottom edge in place
+    if anchors.iter().any(|m| stacked(m) && (old.b - m.t).abs() < 1.0) {
+        p.y = old.b - new.h(); // above it: keep the bottom edge in place
     }
     p
+}
+
+/// Put `new` into `screens` in place of that screen's old placement. Screens
+/// that were joined to a monitor only through it, and no longer touch it
+/// where it is now, are attached again at the nearest free edge. Returns
+/// every placement that changed, `new` first.
+pub fn place(mons: &[Monitor], screens: &mut Vec<ScreenPos>, new: ScreenPos) -> Vec<ScreenPos> {
+    let reachable = |screens: &[ScreenPos]| -> Vec<String> {
+        let rects: Vec<Rect> = screens.iter().map(|s| s.rect()).collect();
+        let ok = joined(mons, &rects);
+        screens.iter().zip(ok).filter(|(_, ok)| *ok).map(|(s, _)| s.name.clone()).collect()
+    };
+    let before = reachable(screens);
+    screens.retain(|s| s.name != new.name);
+    screens.push(new.clone());
+    let mut changed = vec![new.clone()];
+    for name in before.iter().filter(|n| **n != new.name) {
+        if reachable(screens).contains(name) {
+            continue;
+        }
+        let Some(i) = screens.iter().position(|s| &s.name == name) else { continue };
+        let others: Vec<Rect> = screens.iter().filter(|s| &s.name != name).map(|s| s.rect()).collect();
+        if let Some(p) = snap(mons, &others, &screens[i]) {
+            screens[i] = p.clone();
+            changed.push(p);
+        }
+    }
+    changed
 }
 
 #[cfg(test)]
@@ -227,14 +294,93 @@ pub mod tests {
     fn a_screen_left_of_a_monitor_stays_attached_when_it_shrinks() {
         let mons = vec![Monitor { rect: Rect::new(0.0, 0.0, 1920.0, 1080.0), label: "1".into(), primary: true }];
         let left = ScreenPos { name: "s".into(), x: -1920.0, y: 0.0, scale: 1.0, w: 1920, h: 1080, fit: false };
-        let p = resize(&left, &mons, 1280, 720);
+        let p = resize(&left, &mons, &[], 1280, 720);
         assert_eq!(p.rect().r, 0.0, "its right edge still touches the monitor");
         let above = ScreenPos { name: "s".into(), x: 0.0, y: -1200.0, scale: 1.0, w: 1920, h: 1200, fit: false };
-        let p = resize(&above, &mons, 1920, 1080);
+        let p = resize(&above, &mons, &[], 1920, 1080);
         assert_eq!(p.rect().b, 0.0, "its bottom edge still touches the monitor");
         // To the right or below, the touching edge is the one that doesn't move.
         let right = ScreenPos { name: "s".into(), x: 1920.0, y: 0.0, scale: 1.0, w: 1920, h: 1080, fit: false };
-        assert_eq!(resize(&right, &mons, 1280, 720).x, 1920.0);
+        assert_eq!(resize(&right, &mons, &[], 1280, 720).x, 1920.0);
+    }
+
+    /// A friend's setup: one wide monitor, a laptop ("fedora") stretched
+    /// below it, and a second laptop ("delacroix") to go left of that one.
+    fn wide_monitor() -> Vec<Monitor> {
+        vec![Monitor { rect: Rect::new(0.0, 0.0, 3440.0, 1440.0), label: "1".into(), primary: true }]
+    }
+    fn fedora() -> ScreenPos {
+        candidate("fedora", &wide_monitor()[0].rect, Side::Bottom, 3072, 1920, true, None)
+    }
+
+    #[test]
+    fn a_screen_snaps_to_the_edge_of_another_screen() {
+        let mons = wide_monitor();
+        let fedora = fedora().rect();
+        // Dropped left of fedora, below and left of the monitor.
+        let dragged = ScreenPos { name: "delacroix".into(), x: -1500.0, y: 1900.0, scale: 1.0, w: 1408, h: 881, fit: false };
+        let p = snap(&mons, &[fedora], &dragged).unwrap();
+        assert_eq!(p.rect().r, fedora.l, "its right edge is fedora's left edge");
+        assert_eq!(p.y, 1900.0, "keeps where you dropped it along the edge");
+        // Stretched, it covers fedora's whole left edge.
+        let p = snap(&mons, &[fedora], &ScreenPos { fit: true, ..dragged }).unwrap();
+        assert!((p.rect().t - fedora.t).abs() < 1e-6 && (p.rect().b - fedora.b).abs() < 1e-6);
+        assert!((p.rect().r - fedora.l).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_screen_never_snaps_to_one_the_pointer_cannot_reach() {
+        let mons = wide_monitor();
+        // A screen floating far away from every monitor is nothing to attach to.
+        let adrift = Rect::xywh(9000.0, 9000.0, 1920.0, 1080.0);
+        let dragged = ScreenPos { name: "s".into(), x: 7000.0, y: 9000.0, scale: 1.0, w: 1920, h: 1080, fit: false };
+        let p = snap(&mons, &[adrift], &dragged).unwrap();
+        assert!(touches(&p.rect(), &mons[0].rect), "attached to the monitor instead: {p:?}");
+    }
+
+    #[test]
+    fn a_screen_left_behind_is_attached_again() {
+        let mons = wide_monitor();
+        let fedora = fedora();
+        let delacroix =
+            snap(&mons, &[fedora.rect()], &ScreenPos { name: "delacroix".into(), x: -1500.0, y: 1900.0, scale: 1.0, w: 1408, h: 881, fit: false })
+                .unwrap();
+        let mut screens = vec![fedora.clone(), delacroix.clone()];
+        // fedora moves to the right of the monitor: delacroix would be left floating.
+        let moved = candidate("fedora", &mons[0].rect, Side::Right, 3072, 1920, true, None);
+        let changed = place(&mons, &mut screens, moved.clone());
+        assert_eq!(changed[0], moved);
+        assert_eq!(changed.len(), 2, "delacroix moved too");
+        let rects: Vec<Rect> = screens.iter().map(|s| s.rect()).collect();
+        assert_eq!(joined(&mons, &rects), vec![true, true], "both can be reached: {screens:?}");
+        assert!(!rects[0].overlaps(&rects[1]) && !rects.iter().any(|r| r.overlaps(&mons[0].rect)));
+        // A move that leaves it attached changes nothing else.
+        let mut screens = vec![fedora.clone(), delacroix.clone()];
+        let nudged = ScreenPos { w: 3000, ..fedora.clone() };
+        assert_eq!(place(&mons, &mut screens, nudged).len(), 1);
+        assert!(screens.contains(&delacroix));
+    }
+
+    #[test]
+    fn a_screen_attached_to_another_follows_its_edge_when_it_shrinks() {
+        let mons = wide_monitor();
+        let fedora = fedora().rect();
+        let left = snap(&mons, &[fedora], &ScreenPos { name: "d".into(), x: -1500.0, y: 1900.0, scale: 1.0, w: 1408, h: 881, fit: false })
+            .unwrap();
+        let p = resize(&left, &mons, &[fedora], 1280, 800);
+        assert_eq!(p.rect().r, fedora.l, "its right edge still touches fedora");
+    }
+
+    #[test]
+    fn with_every_monitor_edge_taken_a_new_screen_goes_next_to_another_screen() {
+        let mons = wide_monitor();
+        let mut rects: Vec<Rect> = Vec::new();
+        for i in 0..5 {
+            let p = auto_place(&mons, &rects, &format!("s{i}"), 1920, 1080);
+            assert!(!collides(&p.rect(), &mons, &rects));
+            rects.push(p.rect());
+        }
+        assert_eq!(joined(&mons, &rects), vec![true; 5], "the fifth is still reachable");
     }
 
     #[test]
