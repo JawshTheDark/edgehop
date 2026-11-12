@@ -1120,25 +1120,23 @@ impl Core {
         old
     }
 
-    /// Make sure a connected client has a place next to a monitor and that its
-    /// stored size is current. Returns the placement to save if it changed.
-    pub fn ensure_placed(&mut self, name: &str) -> Option<ScreenPos> {
-        let (w, h) = self.clients.get(name).map(|s| (s.w, s.h))?;
+    /// Make sure a connected client has a place next to a monitor (or next to
+    /// another computer) and that its stored size is current. Returns the
+    /// placements to save: its own if it changed, then those of any screens
+    /// attached to it that had to move with it.
+    pub fn ensure_placed(&mut self, name: &str) -> Vec<ScreenPos> {
+        let Some((w, h)) = self.clients.get(name).map(|s| (s.w, s.h)) else { return Vec::new() };
         if self.mons.is_empty() {
             // Normally kept current by the watchdog, off the input path.
             self.mons = self.desk.monitors();
         }
+        let others: Vec<Rect> = self.screens.iter().filter(|p| p.name != name).map(|p| p.rect()).collect();
         let updated = match self.screens.iter().find(|p| p.name == name) {
-            Some(p) if p.w == w && p.h == h => return None,
-            Some(p) => crate::layout::resize(p, &self.mons, w, h),
-            None => {
-                let others: Vec<Rect> = self.screens.iter().map(|p| p.rect()).collect();
-                crate::layout::auto_place(&self.mons, &others, name, w, h)
-            }
+            Some(p) if p.w == w && p.h == h => return Vec::new(),
+            Some(p) => crate::layout::resize(p, &self.mons, &others, w, h),
+            None => crate::layout::auto_place(&self.mons, &others, name, w, h),
         };
-        self.screens.retain(|p| p.name != name);
-        self.screens.push(updated.clone());
-        Some(updated)
+        crate::layout::place(&self.mons, &mut self.screens, updated)
     }
 
     pub fn remove_client(&mut self, name: &str, id: u64) {
@@ -1203,6 +1201,30 @@ impl Core {
             log::warn!("{} isn't responding; bringing the mouse back to {}", self.active, self.me);
             self.go_home();
         }
+    }
+
+    /// This computer's own keyboard and mouse have stopped reaching Edgehop
+    /// while the mouse is on another computer (on Windows: the pointer is
+    /// over a window that runs as administrator, like Task Manager, or one
+    /// is in front). Nothing gets to the other computer any more, and this
+    /// one's pointer moves about hidden: bring it back where it can be seen.
+    pub fn capture_lost(&mut self, seen: &str) -> bool {
+        if !self.is_remote() {
+            return false;
+        }
+        log::warn!(
+            "this computer's keyboard and mouse stopped reaching Edgehop while the mouse was on {}; bringing it back to {}. {seen}",
+            self.active,
+            self.me
+        );
+        if let Some(app) = &self.app {
+            app.set_status(
+                "The mouse came back here: Windows doesn't let Edgehop see the mouse over a window that runs as administrator",
+                true,
+            );
+        }
+        self.go_home();
+        true
     }
 
     pub fn ping_all(&self) {
@@ -1443,6 +1465,8 @@ impl ServerEngine {
                         // Asked before taking the lock the input hook waits on.
                         #[cfg(windows)]
                         let fullscreen = crate::win32::fullscreen_app();
+                        #[cfg(windows)]
+                        capture::refresh_park(&mons);
                         let start = Instant::now();
                         let mut core = loop {
                             match s.core.try_lock() {
@@ -1459,6 +1483,13 @@ impl ServerEngine {
                         core.set_monitors(mons);
                         core.ping_all();
                         core.check_responsive();
+                        if core.is_remote() && capture::look_lost() {
+                            #[cfg(windows)]
+                            let seen = capture::loss_report();
+                            #[cfg(not(windows))]
+                            let seen = String::new();
+                            core.capture_lost(&seen);
+                        }
                         #[cfg(windows)]
                         core.set_fullscreen_app(fullscreen);
                         #[cfg(windows)]
@@ -1671,11 +1702,15 @@ fn handle_client(s: &Arc<Shared>, stream: TcpStream) -> std::io::Result<()> {
     let slot = Slot { id, tx: mtx, bulk: bulk.clone(), last_seen: last_seen.clone(), w: width, h: height, clip_gen: 0 };
     let replaced = lk(&s.core).add_client(&name, slot);
     let placed = lk(&s.core).ensure_placed(&name);
-    if let Some(pos) = placed {
-        log::info!("{name} placed at ({}, {}) scale {:.3}", pos.x, pos.y, pos.scale);
+    if !placed.is_empty() {
+        for pos in &placed {
+            log::info!("{} placed at ({}, {}) scale {:.3}", pos.name, pos.x, pos.y, pos.scale);
+        }
         app.update_config(|c| {
-            c.screens.retain(|p| p.name != pos.name);
-            c.screens.push(pos);
+            for pos in placed {
+                c.screens.retain(|p| p.name != pos.name);
+                c.screens.push(pos);
+            }
         });
     }
     if let Some(old) = replaced {
@@ -1960,14 +1995,55 @@ mod hooks {
         "Could not install keyboard/mouse hooks".into()
     }
 
-    pub struct WinDesktop;
+    pub struct WinDesktop {
+        /// Where the hidden pointer is parked, for as long as the mouse is away.
+        park: Option<(i32, i32)>,
+    }
+
+    /// Where to park the hidden pointer the next time the mouse leaves:
+    /// x in the high half, y in the low half; u64::MAX until first worked out.
+    static PARK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+    fn park_spot() -> (i32, i32) {
+        match PARK.load(Ordering::Relaxed) {
+            u64::MAX => primary_center(),
+            v => ((v >> 32) as u32 as i32, v as u32 as i32),
+        }
+    }
+
+    /// Choose the parking spot: the middle of the main monitor, unless a
+    /// window running as administrator is there. Windows doesn't show our
+    /// mouse hook the mouse while it's over one (Task Manager, say), so a
+    /// pointer parked on it would run loose on this computer, invisible, with
+    /// nothing reaching the other one. Run by the watchdog, never by the
+    /// input hook.
+    pub fn refresh_park(mons: &[Monitor]) {
+        let middle = primary_center();
+        let mut spots = vec![middle];
+        let mut order: Vec<&Monitor> = mons.iter().filter(|m| m.primary).collect();
+        order.extend(mons.iter().filter(|m| !m.primary));
+        for m in order {
+            for (fx, fy) in [(0.5, 0.5), (0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
+                spots.push(((m.rect.l + m.rect.w() * fx) as i32, (m.rect.t + m.rect.h() * fy) as i32));
+            }
+        }
+        let (x, y) = spots.iter().copied().find(|&(x, y)| !elevated_at(x, y)).unwrap_or(middle);
+        let packed = ((x as u32 as u64) << 32) | y as u32 as u64;
+        if PARK.swap(packed, Ordering::Relaxed) != packed && (x, y) != middle {
+            log::info!("a window running as administrator covers the middle of the main monitor; the hidden pointer will wait at ({x}, {y}) instead");
+        }
+    }
 
     impl Desktop for WinDesktop {
         fn monitors(&self) -> Vec<Monitor> {
             crate::platform::monitor_rects()
         }
         fn center(&self) -> (i32, i32) {
-            primary_center()
+            self.park.unwrap_or_else(park_spot)
+        }
+        fn captured(&mut self, remote: bool) {
+            // One spot for the whole time away: movement is measured from it.
+            self.park = remote.then(park_spot);
         }
         fn set_cursor(&mut self, x: i32, y: i32) {
             unsafe {
@@ -2006,7 +2082,7 @@ mod hooks {
     }
 
     pub fn desktop() -> Box<dyn Desktop> {
-        Box::new(WinDesktop)
+        Box::new(WinDesktop { park: None })
     }
 
     fn handle_mouse(msg: u32, ms: &MSLLHOOKSTRUCT) -> bool {
@@ -2612,9 +2688,88 @@ mod tests {
         let mut core = Core::new(&cfg, Box::new(FakeDesk { mons: user_monitors(), cursor }), None);
         let (tx, _rx) = mpsc::channel();
         core.add_client("surface", Slot { id: 1, tx, bulk: Bulk::new(), last_seen: Arc::new(AtomicU64::new(now_ms())), w: 1520, h: 1014, clip_gen: 0 });
-        let p = core.ensure_placed("surface").expect("placed");
-        assert_eq!((p.x, p.y), (0.0, 1080.0));
-        assert!(core.ensure_placed("surface").is_none(), "unchanged second time");
+        let placed = core.ensure_placed("surface");
+        assert_eq!(placed.len(), 1, "placed");
+        assert_eq!((placed[0].x, placed[0].y), (0.0, 1080.0));
+        assert!(core.ensure_placed("surface").is_empty(), "unchanged second time");
+    }
+
+    #[test]
+    fn losing_this_computers_input_while_away_brings_the_mouse_back() {
+        let (mut core, rx, _) = setup(true);
+        assert!(!core.capture_lost(""), "nothing to do while the mouse is here");
+        core.on_mouse_move(500, 1079);
+        assert_eq!(core.active, "surface");
+        assert!(core.capture_lost("test"));
+        assert_eq!(core.active, "pc");
+        assert!(rx.try_iter().any(|m| matches!(m, ToClient::Leave)), "the Surface is told the mouse left");
+    }
+
+    /// A friend's setup: one monitor, "fedora" stretched below it, and
+    /// "delacroix" attached to fedora's left edge (touching no monitor).
+    fn two_laptops() -> (Core, mpsc::Receiver<ToClient>, mpsc::Receiver<ToClient>) {
+        use crate::layout::{attach, snap, Side};
+        let mut cfg = Config::default();
+        cfg.name = "pc".into();
+        cfg.edge_resistance = 0;
+        let mons = vec![Monitor { rect: Rect::new(0.0, 0.0, 3440.0, 1440.0), label: "1".into(), primary: true }];
+        let (x, y, scale) = attach(&mons[0].rect, Side::Bottom, 3072, 1920, true, None);
+        let fedora = ScreenPos { name: "fedora".into(), x, y, scale, w: 3072, h: 1920, fit: true };
+        let dropped = ScreenPos { name: "delacroix".into(), x: -1500.0, y: 1900.0, scale: 1.0, w: 1408, h: 881, fit: true };
+        let delacroix = snap(&mons, &[fedora.rect()], &dropped).expect("fits left of fedora");
+        cfg.screens = vec![fedora, delacroix];
+        let cursor = Arc::new(Mutex::new((0, 0)));
+        let mut core = Core::new(&cfg, Box::new(FakeDesk { mons, cursor }), None);
+        let slot = |id, tx, w, h| Slot { id, tx, bulk: Bulk::new(), last_seen: Arc::new(AtomicU64::new(now_ms())), w, h, clip_gen: 0 };
+        let (ftx, frx) = mpsc::channel();
+        let (dtx, drx) = mpsc::channel();
+        core.add_client("fedora", slot(1, ftx, 3072, 1920));
+        core.add_client("delacroix", slot(2, dtx, 1408, 881));
+        (core, frx, drx)
+    }
+
+    #[test]
+    fn the_pointer_goes_from_one_computer_straight_to_another() {
+        let (mut core, frx, drx) = two_laptops();
+        assert!(!core.on_mouse_move(0, 700), "nothing left of the monitor");
+        assert!(core.on_mouse_move(1720, 1439), "down off the monitor");
+        assert_eq!(core.active, "fedora");
+        let _ = enter_pos(&frx);
+        // Halfway down fedora, then out through its left edge.
+        for _ in 0..6 {
+            assert!(core.on_mouse_move(960, 540 + 160));
+        }
+        for _ in 0..40 {
+            assert!(core.on_mouse_move(960 - 100, 540));
+        }
+        assert_eq!(core.active, "delacroix", "left of fedora is delacroix");
+        assert!(frx.try_iter().any(|m| matches!(m, ToClient::Leave)));
+        let (x, y) = enter_pos(&drx);
+        assert_eq!(x, 1407, "arrives on its right edge");
+        assert!((438..=442).contains(&y), "halfway down fedora is halfway down delacroix, got {y}");
+        // Up from delacroix there is nothing (the monitor is up and to the right).
+        for _ in 0..30 {
+            assert!(core.on_mouse_move(960, 540 - 100));
+        }
+        assert_eq!(core.active, "delacroix");
+        // And back out of its right edge is fedora again, on its left edge.
+        for _ in 0..30 {
+            assert!(core.on_mouse_move(960 + 100, 540));
+        }
+        assert_eq!(core.active, "fedora");
+        assert_eq!(enter_pos(&frx).0, 0);
+    }
+
+    #[test]
+    fn a_computer_behind_one_that_is_gone_is_not_entered() {
+        let (mut core, frx, _drx) = two_laptops();
+        core.on_mouse_move(1720, 1439);
+        let _ = enter_pos(&frx);
+        core.remove_client("delacroix", 2);
+        for _ in 0..40 {
+            assert!(core.on_mouse_move(960 - 100, 540));
+        }
+        assert_eq!(core.active, "fedora", "delacroix isn't connected");
     }
 
     #[test]
