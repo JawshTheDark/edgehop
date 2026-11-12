@@ -3,6 +3,16 @@
 Each release's section below becomes its notes on the
 [Releases page](https://github.com/JawshTheDark/edgehop/releases).
 
+## [0.6.2] - 2026-11-11
+
+### Mac
+- **The Dock icon is the same size as other apps'.** Edgehop replaced its
+  Dock icon with a small edge-to-edge picture when it started, which the Dock
+  drew larger than everything next to it. It now leaves the Dock icon alone,
+  so the Dock shows the app's own icon, as Launchpad and Spotlight already did.
+- The app's icon is drawn on Apple's icon grid, with clear space round the
+  artwork.
+
 ## [0.6.1] - 2026-11-11
 
 ### Windows: the pointer could go invisible

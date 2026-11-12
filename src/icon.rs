@@ -63,10 +63,21 @@ fn shade(x: f32, y: f32) -> Option<[f32; 3]> {
     Some(c)
 }
 
+/// Apple's icon grid: the artwork fills an 824-pixel square in the middle of
+/// a 1024-pixel canvas, with clear space all round. An icon drawn edge to
+/// edge comes out larger than every other app's in the Dock.
+const MAC_MARGIN: f32 = 100.0 / 1024.0;
+
 /// RGBA pixels, `size` x `size` (4x4 supersampled for smooth edges).
 pub fn rgba(size: u32) -> Vec<u8> {
+    rgba_with_margin(size, 0.0)
+}
+
+/// The same, with clear space of `margin` (a fraction of the size) all round.
+fn rgba_with_margin(size: u32, margin: f32) -> Vec<u8> {
     const N: u32 = 4;
     let s = size as f32;
+    let fit = |v: f32| (v - margin) / (1.0 - 2.0 * margin);
     let mut px = vec![0u8; (size * size * 4) as usize];
     for j in 0..size {
         for i in 0..size {
@@ -75,7 +86,7 @@ pub fn rgba(size: u32) -> Vec<u8> {
                 for si in 0..N {
                     let x = (i as f32 + (si as f32 + 0.5) / N as f32) / s;
                     let y = (j as f32 + (sj as f32 + 0.5) / N as f32) / s;
-                    if let Some(c) = shade(x, y) {
+                    if let Some(c) = shade(fit(x), fit(y)) {
                         acc = [acc[0] + c[0], acc[1] + c[1], acc[2] + c[2]];
                         hits += 1;
                     }
@@ -96,6 +107,15 @@ pub fn rgba(size: u32) -> Vec<u8> {
 
 /// Encode the icon as an (uncompressed-deflate) PNG, used for Linux packaging.
 pub fn png(size: u32) -> Vec<u8> {
+    encode_png(size, rgba(size))
+}
+
+/// The icon for a Mac app bundle: on Apple's grid, with clear space round it.
+pub fn png_mac(size: u32) -> Vec<u8> {
+    encode_png(size, rgba_with_margin(size, MAC_MARGIN))
+}
+
+fn encode_png(size: u32, px: Vec<u8>) -> Vec<u8> {
     fn crc32(data: &[u8]) -> u32 {
         let mut c = 0xFFFF_FFFFu32;
         for &b in data {
@@ -113,7 +133,6 @@ pub fn png(size: u32) -> Vec<u8> {
         out.extend_from_slice(&body);
         out.extend_from_slice(&crc32(&body).to_be_bytes());
     }
-    let px = rgba(size);
     let mut raw = Vec::with_capacity(px.len() + size as usize);
     for row in px.chunks((size * 4) as usize) {
         raw.push(0); // filter: none
@@ -166,4 +185,30 @@ pub fn ico() -> Vec<u8> {
         out.extend_from_slice(image);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_mac_icon_keeps_apples_clear_space() {
+        let size = 256u32;
+        let alpha = |px: &[u8], x: u32, y: u32| px[((y * size + x) * 4 + 3) as usize];
+        let plain = rgba(size);
+        let mac = rgba_with_margin(size, MAC_MARGIN);
+        // Edge to edge: solid right up to the middle of each side.
+        assert_eq!(alpha(&plain, 1, size / 2), 255);
+        // On Apple's grid: nothing in the outer 100/1024 of the canvas...
+        let margin = (size as f32 * MAC_MARGIN) as u32; // 25 px
+        for at in [0, margin / 2, margin - 1] {
+            assert_eq!(alpha(&mac, at, size / 2), 0, "left, {at}px in");
+            assert_eq!(alpha(&mac, size - 1 - at, size / 2), 0, "right, {at}px in");
+            assert_eq!(alpha(&mac, size / 2, at), 0, "top, {at}px in");
+            assert_eq!(alpha(&mac, size / 2, size - 1 - at), 0, "bottom, {at}px in");
+        }
+        // ...and solid just inside it.
+        assert_eq!(alpha(&mac, margin + 2, size / 2), 255);
+        assert_eq!(alpha(&mac, size / 2, size - margin - 3), 255);
+    }
 }
